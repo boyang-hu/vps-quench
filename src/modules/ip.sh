@@ -607,6 +607,8 @@ ip_source_safety_arm() {
     [ "${#TOKENS[@]}" -gt 0 ] || return 1
     mkdir -p "$QUENCH_DATA_DIR" || return 1
     SCRIPT="$QUENCH_DATA_DIR/rollback_ip_source_$$_$(date +%s)_${RANDOM}.sh"
+    # shellcheck disable=SC2016 # 这里是在“生成”回滚脚本：$ROLLBACK_SLEEP_PID / $! / $?
+    # 必须原样写进文件、留到那个脚本自己运行时再展开，不能在这里展开。
     {
         echo '#!/bin/bash'
         echo 'ROLLBACK_SLEEP_PID=""'

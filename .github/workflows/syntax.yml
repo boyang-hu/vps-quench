@@ -19,7 +19,10 @@ jobs:
         run: ./build.sh --check
 
       - name: Run ShellCheck
-        run: shellcheck --severity=warning -x vps-quench.sh build-offline-package.sh tests/offline-package.sh
+        # info 级也纳入门禁。SC2015 是唯一例外：仓库里剩余 67 处都是
+        # `cmd && next || cleanup` 这类“失败即清理”惯用法，已逐条审计为良性；
+        # 会导致恢复失败反而删掉配置的危险变体已经修复并有回归测试覆盖。
+        run: shellcheck --severity=info --exclude=SC2015 -x vps-quench.sh build-offline-package.sh tests/offline-package.sh
 
       - name: Verify release checksum
         run: sha256sum -c vps-quench.sh.sha256

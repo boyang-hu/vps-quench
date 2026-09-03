@@ -104,7 +104,7 @@ caddy_lock_acquire() {
     fi
     PID=$(cat "$CADDY_LOCK_DIR/pid" 2>/dev/null || true)
     if [[ "$PID" =~ ^[0-9]+$ ]] && kill -0 "$PID" 2>/dev/null; then
-        error "另一项 Caddy 配置操作正在执行（PID $PID）"
+        error "另一项 Caddy 配置操作正在执行（PID ${PID}）"
         return 1
     fi
     rmdir "$CADDY_LOCK_DIR" 2>/dev/null || {
@@ -913,6 +913,7 @@ caddy_php_gateway_ready() {
             if command -v nc >/dev/null 2>&1; then
                 nc -z -w 3 "$HOST" "$PORT" >/dev/null 2>&1
             elif command -v timeout >/dev/null 2>&1; then
+                # shellcheck disable=SC2016 # $1/$2 由 bash -c 的位置参数提供，不能在外层展开
                 timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$HOST" "$PORT" >/dev/null 2>&1
             else
                 warn "缺少 nc/timeout，无法主动探测 PHP-FPM TCP 网关"
@@ -1574,7 +1575,7 @@ caddy_reload_config() {
 caddy_edit_raw() {
     local BACKUP WAS_ACTIVE=false APPLY_FAILED=false
     print_header "高级：编辑 Caddy 主配置"
-    warn "Quench 管理的站点位于 $CADDY_SITES_DIR；此入口编辑主 Caddyfile。"
+    warn "Quench 管理的站点位于 ${CADDY_SITES_DIR}；此入口编辑主 Caddyfile。"
     ui_continue
     caddy_lock_acquire || return 1
     BACKUP=$(mktemp "$CADDY_STATE_DIR/Caddyfile-edit.XXXXXX") || { caddy_lock_release; return 1; }

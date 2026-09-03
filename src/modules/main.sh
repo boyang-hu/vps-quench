@@ -35,6 +35,7 @@ Quench CLI — VPS 初始化与管理工具
 
 常用命令:
   --help                 显示此帮助
+  --version              显示版本号
   --first-run            首次开荒向导
   --user-menu            用户与 SSH 访问管理
   --fail2ban-menu        Fail2ban 管理
@@ -303,6 +304,19 @@ case "${1:-}" in
     --rollback-center-menu)
         rollback_center_menu
         exit $?
+        ;;
+    --version|-v)
+        printf 'Quench %s\n' "$APP_VERSION"
+        exit 0
+        ;;
+    '')
+        ;;
+    *)
+        # 没有兜底分支时，拼错的参数会静默掉进交互菜单：
+        # 脚本化或 cron 调用会卡在 read 上，而不是报错退出。
+        printf 'Quench: 未知参数 %s\n' "$1" >&2
+        printf "用 '--help' 查看可用命令。\n" >&2
+        exit 2
         ;;
 esac
 

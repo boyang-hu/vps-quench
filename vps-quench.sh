@@ -278,31 +278,11 @@ box_top() { ui_refresh_dimensions; printf '%s' "${BOLD}${CYAN}"; ui_repeat "━"
 box_bot() { printf '%s' "${BOLD}${CYAN}"; ui_repeat "━" "$BOX_W"; printf '%s\n' "$NC"; }
 box_sep() { printf '%s' "${DIM}${CYAN}"; ui_repeat "─" "$BOX_W"; printf '%s\n' "$NC"; }
 
-# 居中标题行（只传纯文本，自动居中）
-box_title() {
-    local TEXT="$1"
-    local LEN; LEN=$(vis_len "$TEXT")
-    local INNER=$((BOX_W - 2))
-    local PAD_TOTAL=$(( INNER - LEN ))
-    [ "$PAD_TOTAL" -lt 0 ] && PAD_TOTAL=0
-    local PAD_L=$(( PAD_TOTAL / 2 ))
-    local PAD_R=$(( PAD_TOTAL - PAD_L ))
-    printf '%*s' "$PAD_L" ''
-    printf "${BOLD}${CYAN}%s${NC}" "$TEXT"
-    printf '%*s' "$PAD_R" ''
-    printf "\n"
-}
-
 # 普通内容行：PLAIN=纯文本(算宽度)  COLORED=带色码(显示用)
 # 用法: box_line "纯文本" "带色码文本"
 box_line() {
     local COLORED="${2:-$1}"
     echo -e "$COLORED"
-}
-
-# 空行
-box_empty() {
-    echo ""
 }
 
 # ── 内层分隔线（与主框线同宽对齐，dim 青，统一替代各处 seq 1 38）──
@@ -335,15 +315,6 @@ menu_pair() {
     printf '  %s' "$L1"
     printf '%*s' "$PAD" ''
     printf '%s%s%s  %s\n' "$COL2$BOLD" "$K2" "$NC" "$L2"
-}
-
-status_dot() {
-    local STATE="$1"
-    case "$STATE" in
-        active|running|yes|on|已启用|运行中) echo -e "${GREEN}●${NC}" ;;
-        inactive|stopped|no|off|已停止) echo -e "${RED}●${NC}" ;;
-        *) echo -e "${YELLOW}●${NC}" ;;
-    esac
 }
 
 status_pair() {
@@ -410,19 +381,6 @@ ensure_sysctl() {
     return 1
 }
 
-
-# 只清理 Quench 用 comment 显式标记的临时 iptables 规则。
-clear_iptables_residue() {
-    command -v iptables >/dev/null 2>&1 || return 0
-    local RULE PORT
-    while RULE=$(iptables -S INPUT 2>/dev/null | grep -m1 -E -- '--comment "?vps-quench-ssh"?' || true); do
-        [ -n "$RULE" ] || break
-        PORT=$(printf '%s\n' "$RULE" | sed -nE 's/.*--dport ([0-9]+).*/\1/p')
-        [ -n "$PORT" ] || break
-        iptables -D INPUT -p tcp --dport "$PORT" -m comment --comment vps-quench-ssh -j ACCEPT 2>/dev/null || break
-    done
-    info "已清理 Quench 显式标记的临时 iptables 规则"
-}
 
 # 统一标题栏
 print_header() {
@@ -634,21 +592,12 @@ svc_daemon_reload() {
     command -v systemctl &>/dev/null && systemctl daemon-reload 2>/dev/null || true
 }
 
-# 获取 OS codename（兼容无 lsb_release 的系统）
-get_codename() {
-    if command -v lsb_release &>/dev/null; then
-        lsb_release -cs 2>/dev/null
-    elif [ -f /etc/os-release ]; then
-        grep VERSION_CODENAME /etc/os-release | cut -d= -f2 | tr -d '"'
-    elif [ -f /etc/debian_version ]; then
-        cat /etc/debian_version | cut -d. -f1
-    else
-        echo "unknown"
-    fi
-}
-
 # ── 权限检查 ──────────────────────────────────────────────
-if [ "$EUID" -ne 0 ] && [ "${QUENCH_TEST_MODE:-0}" != "1" ] && [ "${1:-}" != "--help" ] && [ "${1:-}" != "-h" ] && [ "${1:-}" != "help" ]; then
+case "${1:-}" in
+    --help|-h|help|--version|-v) QUENCH_NO_ROOT_NEEDED=1 ;;
+    *) QUENCH_NO_ROOT_NEEDED=0 ;;
+esac
+if [ "$EUID" -ne 0 ] && [ "${QUENCH_TEST_MODE:-0}" != "1" ] && [ "$QUENCH_NO_ROOT_NEEDED" != "1" ]; then
     echo -e "${RED}[ERROR]${NC} 请使用 root 权限运行：sudo bash $0"
     exit 1
 fi
@@ -771,10 +720,6 @@ set_config_file() {
     } > "$TMP"
     mv "$TMP" "$FILE"
     rm -f "$BODY" "$BLOCK"
-}
-
-set_config() {
-    set_config_file "$SSHD_CONFIG" "$1" "$2"
 }
 
 # 回滚被 Quench 覆盖的配置文件，并接管备份文件的生命周期。
@@ -1644,13 +1589,6 @@ user_shell() {
     user_passwd_entries | awk -F: -v user="$USERNAME" '$1 == user {print $7; exit}'
 }
 
-user_shell_is_login() {
-    case "$1" in
-        ''|*/nologin|*/false|*/sync|*/shutdown|*/halt) return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
 user_list_names() {
     local UID_MIN
     UID_MIN=$(user_uid_min)
@@ -2021,7 +1959,7 @@ user_select() {
         INDEX=$((INDEX + 1))
     done < <(user_list_names)
     [ "${#USERS[@]}" -gt 0 ] || { warn "没有可选择的用户"; return 1; }
-    read -rp "  $PROMPT（回车取消）: " INPUT
+    read -rp "  ${PROMPT}（回车取消）: " INPUT
     [ -n "$INPUT" ] || return 1
     [[ "$INPUT" =~ ^[0-9]+$ ]] || { error "无效编号"; return 1; }
     [ "$INPUT" -ge 1 ] && [ "$INPUT" -le "${#USERS[@]}" ] || { error "编号不存在"; return 1; }
@@ -3243,6 +3181,7 @@ bbr_restore_sysctl() {
     while IFS= read -r f; do
         # stat 兼容：BusyBox stat 用 -c '%y'，但格式有差异，改用 ls -l 更通用
         local FDATE
+        # shellcheck disable=SC2012 # 同上：这里要的正是 ls -l 的列，且文件名由本脚本生成
         FDATE=$(ls -l "$f" 2>/dev/null | awk '{print $6, $7}')
         echo -e "  ${GREEN}[$i]${NC} $(basename "$f")  ${DIM}${FDATE}${NC}"
         i=$(( i + 1 ))
@@ -7221,7 +7160,7 @@ dns_write() {
     fi
 
     info "DNS 已通过 $BACKEND 持久化，且有效上游检查通过 ✓"
-    audit_action "更新 DNS，后端 $BACKEND，上游 $ALL_DNS" SUCCESS
+    audit_action "更新 DNS，后端 ${BACKEND}，上游 $ALL_DNS" SUCCESS
     echo ""
     dns_show_current
     safety_confirm
@@ -7891,7 +7830,7 @@ mirror_apply_apt() {
         echo "SECURITY_URI=$SECURITY_URI"
     } > "$MIRROR_STATE_DIR/apt-current"
     chmod 600 "$MIRROR_STATE_DIR/apt-current" 2>/dev/null || true
-    audit_action "APT 软件源切换为 $LABEL，安全源 $SECURITY_URI" SUCCESS
+    audit_action "APT 软件源切换为 ${LABEL}，安全源 $SECURITY_URI" SUCCESS
     info "软件源切换完成并通过签名/索引验证 ✓"
     info "恢复点：$MIRROR_APT_BACKUP"
 }
@@ -8132,7 +8071,7 @@ mirror_apply_rpm() {
         mirror_rpm_core_id "$RID" || continue
         if ! dnf config-manager --set-disabled "$RID" >/dev/null 2>&1; then
             mirror_rpm_restore_snapshot "$MIRROR_RPM_BACKUP" || error "RPM 仓库自动恢复失败：$MIRROR_RPM_BACKUP"
-            error "无法禁用原仓库 $RID，已恢复原配置"
+            error "无法禁用原仓库 ${RID}，已恢复原配置"
             return 1
         fi
     done < "$MIRROR_RPM_BACKUP/enabled-ids"
@@ -8885,6 +8824,8 @@ ip_source_safety_arm() {
     [ "${#TOKENS[@]}" -gt 0 ] || return 1
     mkdir -p "$QUENCH_DATA_DIR" || return 1
     SCRIPT="$QUENCH_DATA_DIR/rollback_ip_source_$$_$(date +%s)_${RANDOM}.sh"
+    # shellcheck disable=SC2016 # 这里是在“生成”回滚脚本：$ROLLBACK_SLEEP_PID / $! / $?
+    # 必须原样写进文件、留到那个脚本自己运行时再展开，不能在这里展开。
     {
         echo '#!/bin/bash'
         echo 'ROLLBACK_SLEEP_PID=""'
@@ -9216,7 +9157,7 @@ caddy_lock_acquire() {
     fi
     PID=$(cat "$CADDY_LOCK_DIR/pid" 2>/dev/null || true)
     if [[ "$PID" =~ ^[0-9]+$ ]] && kill -0 "$PID" 2>/dev/null; then
-        error "另一项 Caddy 配置操作正在执行（PID $PID）"
+        error "另一项 Caddy 配置操作正在执行（PID ${PID}）"
         return 1
     fi
     rmdir "$CADDY_LOCK_DIR" 2>/dev/null || {
@@ -10025,6 +9966,7 @@ caddy_php_gateway_ready() {
             if command -v nc >/dev/null 2>&1; then
                 nc -z -w 3 "$HOST" "$PORT" >/dev/null 2>&1
             elif command -v timeout >/dev/null 2>&1; then
+                # shellcheck disable=SC2016 # $1/$2 由 bash -c 的位置参数提供，不能在外层展开
                 timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$HOST" "$PORT" >/dev/null 2>&1
             else
                 warn "缺少 nc/timeout，无法主动探测 PHP-FPM TCP 网关"
@@ -10686,7 +10628,7 @@ caddy_reload_config() {
 caddy_edit_raw() {
     local BACKUP WAS_ACTIVE=false APPLY_FAILED=false
     print_header "高级：编辑 Caddy 主配置"
-    warn "Quench 管理的站点位于 $CADDY_SITES_DIR；此入口编辑主 Caddyfile。"
+    warn "Quench 管理的站点位于 ${CADDY_SITES_DIR}；此入口编辑主 Caddyfile。"
     ui_continue
     caddy_lock_acquire || return 1
     BACKUP=$(mktemp "$CADDY_STATE_DIR/Caddyfile-edit.XXXXXX") || { caddy_lock_release; return 1; }
@@ -11793,7 +11735,7 @@ swap_set_swappiness_apply() {
     fi
     rm -f "$BACKUP"
     audit_action "设置 swappiness=$VALUE" SUCCESS
-    info "swappiness 已设置为 $VALUE，并写入独立 sysctl 配置 ✓"
+    info "swappiness 已设置为 ${VALUE}，并写入独立 sysctl 配置 ✓"
 }
 
 swap_set_swappiness() {
@@ -14837,7 +14779,7 @@ self_install() {
     self_install_shortcut v || warn "快捷键 v 创建失败"
     self_install_shortcut V || warn "快捷键 V 创建失败"
     audit_action "安装 Quench 到 $LOCAL_SCRIPT" SUCCESS
-    info "已安装到 $LOCAL_SCRIPT；新终端可输入 v 启动 ✓"
+    info "已安装到 ${LOCAL_SCRIPT}；新终端可输入 v 启动 ✓"
 }
 
 self_update() {
@@ -15106,7 +15048,6 @@ PY
     fi
 }
 
-nft_is_ipv4() { [ "$(nft_ip_family "$1" 2>/dev/null)" = ipv4 ]; }
 nft_is_ipv6() { [ "$(nft_ip_family "$1" 2>/dev/null)" = ipv6 ]; }
 
 nft_is_hostname() {
@@ -15884,8 +15825,6 @@ nft_reconcile() {
 }
 
 # 保留内部函数名，供测试调用；行为已改为完整协调。
-nft_write_and_apply() { nft_reconcile; }
-
 nft_rule_summary() {
     local id="$1" family="$2" proto="$3" lip="$4" ls="$5" le="$6" ttype="$7" thost="$8" tip="$9" \
         ts="${10}" te="${11}" mode="${12}" snat="${13}" acl="${14}" enabled="${15}" comment="${16}"
@@ -15990,6 +15929,7 @@ nft_route_preflight() {
 nft_tcp_probe() {
     local host="$1" port="$2"
     command -v timeout >/dev/null 2>&1 || return 2
+    # shellcheck disable=SC2016 # $1/$2 由 bash -c 的位置参数提供，不能在外层展开
     timeout 3 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$host" "$port" >/dev/null 2>&1
 }
 
@@ -16006,7 +15946,7 @@ nft_rule_preflight() {
     while IFS= read -r p; do
         local_port=$(nft_local_listener_conflicts "$p" "$ls" "$le" || true)
         if [ -n "$local_port" ]; then
-            warn "本机已有 $p 服务监听端口 $local_port；转发会截获外部访问"
+            warn "本机已有 $p 服务监听端口 ${local_port}；转发会截获外部访问"
             read -rp "  仍然继续？(y/N，默认N): " answer
             echo "$answer" | grep -qiE '^y(es)?$' || return 1
         fi
@@ -16437,7 +16377,7 @@ EOF
     rm -f "$tmp"
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable --now quench-nft-target-refresh.timer >/dev/null 2>&1 \
-        && info "域名目标自动刷新已启用（$interval）✓" \
+        && info "域名目标自动刷新已启用（${interval}）✓" \
         || { error "自动刷新启用失败"; return 1; }
 }
 
@@ -16645,6 +16585,7 @@ Quench CLI — VPS 初始化与管理工具
 
 常用命令:
   --help                 显示此帮助
+  --version              显示版本号
   --first-run            首次开荒向导
   --user-menu            用户与 SSH 访问管理
   --fail2ban-menu        Fail2ban 管理
@@ -16913,6 +16854,19 @@ case "${1:-}" in
     --rollback-center-menu)
         rollback_center_menu
         exit $?
+        ;;
+    --version|-v)
+        printf 'Quench %s\n' "$APP_VERSION"
+        exit 0
+        ;;
+    '')
+        ;;
+    *)
+        # 没有兜底分支时，拼错的参数会静默掉进交互菜单：
+        # 脚本化或 cron 调用会卡在 read 上，而不是报错退出。
+        printf 'Quench: 未知参数 %s\n' "$1" >&2
+        printf "用 '--help' 查看可用命令。\n" >&2
+        exit 2
         ;;
 esac
 

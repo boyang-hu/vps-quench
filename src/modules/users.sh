@@ -58,13 +58,6 @@ user_shell() {
     user_passwd_entries | awk -F: -v user="$USERNAME" '$1 == user {print $7; exit}'
 }
 
-user_shell_is_login() {
-    case "$1" in
-        ''|*/nologin|*/false|*/sync|*/shutdown|*/halt) return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
 user_list_names() {
     local UID_MIN
     UID_MIN=$(user_uid_min)
@@ -435,7 +428,7 @@ user_select() {
         INDEX=$((INDEX + 1))
     done < <(user_list_names)
     [ "${#USERS[@]}" -gt 0 ] || { warn "没有可选择的用户"; return 1; }
-    read -rp "  $PROMPT（回车取消）: " INPUT
+    read -rp "  ${PROMPT}（回车取消）: " INPUT
     [ -n "$INPUT" ] || return 1
     [[ "$INPUT" =~ ^[0-9]+$ ]] || { error "无效编号"; return 1; }
     [ "$INPUT" -ge 1 ] && [ "$INPUT" -le "${#USERS[@]}" ] || { error "编号不存在"; return 1; }

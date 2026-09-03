@@ -319,7 +319,7 @@ swap_set_swappiness_apply() {
     fi
     rm -f "$BACKUP"
     audit_action "设置 swappiness=$VALUE" SUCCESS
-    info "swappiness 已设置为 $VALUE，并写入独立 sysctl 配置 ✓"
+    info "swappiness 已设置为 ${VALUE}，并写入独立 sysctl 配置 ✓"
 }
 
 swap_set_swappiness() {

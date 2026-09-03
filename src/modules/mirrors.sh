@@ -600,7 +600,7 @@ mirror_apply_apt() {
         echo "SECURITY_URI=$SECURITY_URI"
     } > "$MIRROR_STATE_DIR/apt-current"
     chmod 600 "$MIRROR_STATE_DIR/apt-current" 2>/dev/null || true
-    audit_action "APT 软件源切换为 $LABEL，安全源 $SECURITY_URI" SUCCESS
+    audit_action "APT 软件源切换为 ${LABEL}，安全源 $SECURITY_URI" SUCCESS
     info "软件源切换完成并通过签名/索引验证 ✓"
     info "恢复点：$MIRROR_APT_BACKUP"
 }
@@ -841,7 +841,7 @@ mirror_apply_rpm() {
         mirror_rpm_core_id "$RID" || continue
         if ! dnf config-manager --set-disabled "$RID" >/dev/null 2>&1; then
             mirror_rpm_restore_snapshot "$MIRROR_RPM_BACKUP" || error "RPM 仓库自动恢复失败：$MIRROR_RPM_BACKUP"
-            error "无法禁用原仓库 $RID，已恢复原配置"
+            error "无法禁用原仓库 ${RID}，已恢复原配置"
             return 1
         fi
     done < "$MIRROR_RPM_BACKUP/enabled-ids"

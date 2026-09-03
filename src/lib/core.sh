@@ -278,31 +278,11 @@ box_top() { ui_refresh_dimensions; printf '%s' "${BOLD}${CYAN}"; ui_repeat "━"
 box_bot() { printf '%s' "${BOLD}${CYAN}"; ui_repeat "━" "$BOX_W"; printf '%s\n' "$NC"; }
 box_sep() { printf '%s' "${DIM}${CYAN}"; ui_repeat "─" "$BOX_W"; printf '%s\n' "$NC"; }
 
-# 居中标题行（只传纯文本，自动居中）
-box_title() {
-    local TEXT="$1"
-    local LEN; LEN=$(vis_len "$TEXT")
-    local INNER=$((BOX_W - 2))
-    local PAD_TOTAL=$(( INNER - LEN ))
-    [ "$PAD_TOTAL" -lt 0 ] && PAD_TOTAL=0
-    local PAD_L=$(( PAD_TOTAL / 2 ))
-    local PAD_R=$(( PAD_TOTAL - PAD_L ))
-    printf '%*s' "$PAD_L" ''
-    printf "${BOLD}${CYAN}%s${NC}" "$TEXT"
-    printf '%*s' "$PAD_R" ''
-    printf "\n"
-}
-
 # 普通内容行：PLAIN=纯文本(算宽度)  COLORED=带色码(显示用)
 # 用法: box_line "纯文本" "带色码文本"
 box_line() {
     local COLORED="${2:-$1}"
     echo -e "$COLORED"
-}
-
-# 空行
-box_empty() {
-    echo ""
 }
 
 # ── 内层分隔线（与主框线同宽对齐，dim 青，统一替代各处 seq 1 38）──
@@ -335,15 +315,6 @@ menu_pair() {
     printf '  %s' "$L1"
     printf '%*s' "$PAD" ''
     printf '%s%s%s  %s\n' "$COL2$BOLD" "$K2" "$NC" "$L2"
-}
-
-status_dot() {
-    local STATE="$1"
-    case "$STATE" in
-        active|running|yes|on|已启用|运行中) echo -e "${GREEN}●${NC}" ;;
-        inactive|stopped|no|off|已停止) echo -e "${RED}●${NC}" ;;
-        *) echo -e "${YELLOW}●${NC}" ;;
-    esac
 }
 
 status_pair() {
@@ -410,19 +381,6 @@ ensure_sysctl() {
     return 1
 }
 
-
-# 只清理 Quench 用 comment 显式标记的临时 iptables 规则。
-clear_iptables_residue() {
-    command -v iptables >/dev/null 2>&1 || return 0
-    local RULE PORT
-    while RULE=$(iptables -S INPUT 2>/dev/null | grep -m1 -E -- '--comment "?vps-quench-ssh"?' || true); do
-        [ -n "$RULE" ] || break
-        PORT=$(printf '%s\n' "$RULE" | sed -nE 's/.*--dport ([0-9]+).*/\1/p')
-        [ -n "$PORT" ] || break
-        iptables -D INPUT -p tcp --dport "$PORT" -m comment --comment vps-quench-ssh -j ACCEPT 2>/dev/null || break
-    done
-    info "已清理 Quench 显式标记的临时 iptables 规则"
-}
 
 # 统一标题栏
 print_header() {
@@ -634,21 +592,12 @@ svc_daemon_reload() {
     command -v systemctl &>/dev/null && systemctl daemon-reload 2>/dev/null || true
 }
 
-# 获取 OS codename（兼容无 lsb_release 的系统）
-get_codename() {
-    if command -v lsb_release &>/dev/null; then
-        lsb_release -cs 2>/dev/null
-    elif [ -f /etc/os-release ]; then
-        grep VERSION_CODENAME /etc/os-release | cut -d= -f2 | tr -d '"'
-    elif [ -f /etc/debian_version ]; then
-        cat /etc/debian_version | cut -d. -f1
-    else
-        echo "unknown"
-    fi
-}
-
 # ── 权限检查 ──────────────────────────────────────────────
-if [ "$EUID" -ne 0 ] && [ "${QUENCH_TEST_MODE:-0}" != "1" ] && [ "${1:-}" != "--help" ] && [ "${1:-}" != "-h" ] && [ "${1:-}" != "help" ]; then
+case "${1:-}" in
+    --help|-h|help|--version|-v) QUENCH_NO_ROOT_NEEDED=1 ;;
+    *) QUENCH_NO_ROOT_NEEDED=0 ;;
+esac
+if [ "$EUID" -ne 0 ] && [ "${QUENCH_TEST_MODE:-0}" != "1" ] && [ "$QUENCH_NO_ROOT_NEEDED" != "1" ]; then
     echo -e "${RED}[ERROR]${NC} 请使用 root 权限运行：sudo bash $0"
     exit 1
 fi
@@ -771,10 +720,6 @@ set_config_file() {
     } > "$TMP"
     mv "$TMP" "$FILE"
     rm -f "$BODY" "$BLOCK"
-}
-
-set_config() {
-    set_config_file "$SSHD_CONFIG" "$1" "$2"
 }
 
 # 回滚被 Quench 覆盖的配置文件，并接管备份文件的生命周期。

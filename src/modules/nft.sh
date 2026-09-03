@@ -84,7 +84,6 @@ PY
     fi
 }
 
-nft_is_ipv4() { [ "$(nft_ip_family "$1" 2>/dev/null)" = ipv4 ]; }
 nft_is_ipv6() { [ "$(nft_ip_family "$1" 2>/dev/null)" = ipv6 ]; }
 
 nft_is_hostname() {
@@ -862,8 +861,6 @@ nft_reconcile() {
 }
 
 # 保留内部函数名，供测试调用；行为已改为完整协调。
-nft_write_and_apply() { nft_reconcile; }
-
 nft_rule_summary() {
     local id="$1" family="$2" proto="$3" lip="$4" ls="$5" le="$6" ttype="$7" thost="$8" tip="$9" \
         ts="${10}" te="${11}" mode="${12}" snat="${13}" acl="${14}" enabled="${15}" comment="${16}"
@@ -968,6 +965,7 @@ nft_route_preflight() {
 nft_tcp_probe() {
     local host="$1" port="$2"
     command -v timeout >/dev/null 2>&1 || return 2
+    # shellcheck disable=SC2016 # $1/$2 由 bash -c 的位置参数提供，不能在外层展开
     timeout 3 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$host" "$port" >/dev/null 2>&1
 }
 
@@ -984,7 +982,7 @@ nft_rule_preflight() {
     while IFS= read -r p; do
         local_port=$(nft_local_listener_conflicts "$p" "$ls" "$le" || true)
         if [ -n "$local_port" ]; then
-            warn "本机已有 $p 服务监听端口 $local_port；转发会截获外部访问"
+            warn "本机已有 $p 服务监听端口 ${local_port}；转发会截获外部访问"
             read -rp "  仍然继续？(y/N，默认N): " answer
             echo "$answer" | grep -qiE '^y(es)?$' || return 1
         fi
@@ -1415,7 +1413,7 @@ EOF
     rm -f "$tmp"
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable --now quench-nft-target-refresh.timer >/dev/null 2>&1 \
-        && info "域名目标自动刷新已启用（$interval）✓" \
+        && info "域名目标自动刷新已启用（${interval}）✓" \
         || { error "自动刷新启用失败"; return 1; }
 }
 

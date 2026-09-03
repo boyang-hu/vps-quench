@@ -750,6 +750,25 @@ BANNER_COMPACT=$(COLUMNS=60 NO_COLOR=1 quench_art_banner)
 # in the parent shell; a bare reset there silently restores three forks per redraw.
 grep -q 'sshd_effective_reload' <(sed -n '/^main_menu() {/,/^}/p' "$ROOT/src/modules/main.sh") \
     || { echo "main_menu no longer primes the sshd cache in the parent shell" >&2; exit 1; }
+
+# CLI entry points. --version must work without root; an unknown argument must fail
+# instead of silently dropping into the interactive menu and blocking on read.
+[ "$(QUENCH_TEST_MODE=0 "$ROOT/vps-quench.sh" --version)" = "Quench $APP_VERSION" ] \
+    || { echo "--version did not report the app version" >&2; exit 1; }
+QUENCH_TEST_MODE=0 "$ROOT/vps-quench.sh" --help >/dev/null 2>&1 \
+    || { echo "--help stopped working" >&2; exit 1; }
+grep -qE '^    \*\)' <(sed -n '/^# CLI 处理/,/^esac/p' "$ROOT/src/modules/main.sh") \
+    || { echo "CLI dispatcher lost its unknown-argument catch-all" >&2; exit 1; }
+
+# An unbraced $VAR directly followed by a multi-byte character loses its first byte on
+# libcs whose UTF-8 locale reports high bytes as alnum (reproducible on macOS), so the
+# variable silently expands to nothing. Every such site must use ${VAR}.
+QUOTE_TAB=$(printf '\t')
+if LC_ALL=C grep -rlE "\\\$[A-Za-z_][A-Za-z0-9_]*[^ -~${QUOTE_TAB}]" "$ROOT/src" | grep -q .; then
+    echo "Unbraced \$VAR is followed by a multi-byte character; use \${VAR}:" >&2
+    LC_ALL=C grep -rnE "\\\$[A-Za-z_][A-Za-z0-9_]*[^ -~${QUOTE_TAB}]" "$ROOT/src" >&2
+    exit 1
+fi
 [[ "$QUENCH_MANIFEST_URL" = 'https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/heads/main/vps-quench.manifest.json' ]] || { echo "Update-check manifest URL points outside vps-quench" >&2; exit 1; }
 [[ "$GITHUB_REF_URL" = 'https://api.github.com/repos/boyang-hu/vps-quench/git/ref/heads/main' ]] || { echo "Self-update GitHub API URL points outside vps-quench" >&2; exit 1; }
 

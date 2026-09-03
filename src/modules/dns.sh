@@ -375,7 +375,7 @@ dns_write() {
     fi
 
     info "DNS 已通过 $BACKEND 持久化，且有效上游检查通过 ✓"
-    audit_action "更新 DNS，后端 $BACKEND，上游 $ALL_DNS" SUCCESS
+    audit_action "更新 DNS，后端 ${BACKEND}，上游 $ALL_DNS" SUCCESS
     echo ""
     dns_show_current
     safety_confirm

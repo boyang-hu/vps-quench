@@ -325,6 +325,7 @@ bbr_restore_sysctl() {
     while IFS= read -r f; do
         # stat 兼容：BusyBox stat 用 -c '%y'，但格式有差异，改用 ls -l 更通用
         local FDATE
+        # shellcheck disable=SC2012 # 同上：这里要的正是 ls -l 的列，且文件名由本脚本生成
         FDATE=$(ls -l "$f" 2>/dev/null | awk '{print $6, $7}')
         echo -e "  ${GREEN}[$i]${NC} $(basename "$f")  ${DIM}${FDATE}${NC}"
         i=$(( i + 1 ))

@@ -153,7 +153,7 @@ self_install() {
     self_install_shortcut v || warn "快捷键 v 创建失败"
     self_install_shortcut V || warn "快捷键 V 创建失败"
     audit_action "安装 Quench 到 $LOCAL_SCRIPT" SUCCESS
-    info "已安装到 $LOCAL_SCRIPT；新终端可输入 v 启动 ✓"
+    info "已安装到 ${LOCAL_SCRIPT}；新终端可输入 v 启动 ✓"
 }
 
 self_update() {
