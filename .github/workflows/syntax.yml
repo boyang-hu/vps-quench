@@ -1,0 +1,34 @@
+name: Syntax check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bash-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Check shell syntax
+        run: bash -n vps-quench.sh build-offline-package.sh tests/offline-package.sh
+
+      - name: Verify generated release
+        run: ./build.sh --check
+
+      - name: Run ShellCheck
+        run: shellcheck --severity=warning -x vps-quench.sh build-offline-package.sh tests/offline-package.sh
+
+      - name: Verify release checksum
+        run: sha256sum -c vps-quench.sh.sha256
+
+      - name: Run smoke tests
+        run: tests/smoke.sh
+
+      - name: Run fault injection tests
+        run: tests/fault-injection.sh
+
+      - name: Test offline package
+        run: tests/offline-package.sh

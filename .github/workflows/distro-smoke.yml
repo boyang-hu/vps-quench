@@ -1,0 +1,41 @@
+name: Distribution smoke tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  distro-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            pm: apt
+            setup: apt-get update && apt-get install -y bash python3
+          - image: ubuntu:24.04
+            pm: apt
+            setup: apt-get update && apt-get install -y bash python3
+          - image: alpine:3.20
+            pm: apk
+            setup: apk add --no-cache bash python3
+          - image: rockylinux:9
+            pm: dnf
+            setup: dnf install -y bash python3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Test ${{ matrix.image }}
+        env:
+          IMAGE: ${{ matrix.image }}
+          EXPECTED_PM: ${{ matrix.pm }}
+          SETUP: ${{ matrix.setup }}
+        run: |
+          docker run --rm \
+            -e EXPECTED_PM="$EXPECTED_PM" \
+            -e SETUP="$SETUP" \
+            -v "$PWD:/repo" -w /repo "$IMAGE" \
+            sh -c 'sh -c "$SETUP" && bash tests/distro-smoke.sh'

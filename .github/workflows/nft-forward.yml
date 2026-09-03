@@ -1,0 +1,19 @@
+name: NFT forwarding integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  network-namespace-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install nftables test dependencies
+        run: sudo apt-get update && sudo apt-get install -y nftables iproute2 python3
+
+      - name: Test TCP and UDP forwarding
+        run: sudo bash tests/nft-forward-integration.sh
