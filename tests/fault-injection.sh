@@ -1396,4 +1396,51 @@ self_reconcile_tc_after_update >/dev/null \
         || { echo "Unknown directive returned a value" >&2; exit 1; }
 )
 
+# Both subsystem locks use fixed descriptors: exec {VAR}> is a bash 4.1 feature and
+# fails outright on the bash 3.2 the interpreter guard still admits. A failed acquire
+# must also give the descriptor back instead of leaking it for the rest of the session.
+(
+    LOCK_DIR="$TMP/fixed-fd-locks"
+    mkdir -p "$LOCK_DIR"
+    NFT_LOCK_FILE="$LOCK_DIR/nft.lock"
+    BBR_CALIBRATION_LOCK_FILE="$LOCK_DIR/bbr.lock"
+    FLOCK_RC=0
+    # shellcheck disable=SC2329 # test stub stands in for the flock binary
+    flock() { case "${1:-}" in -u) return 0 ;; esac; return "$FLOCK_RC"; }
+    # shellcheck disable=SC2329 # test stub avoids touching real nft state
+    nft_ensure_state_dir() { mkdir -p "$LOCK_DIR/nft-state"; }
+
+    NFT_LOCK_HELD=0
+    nft_lock_acquire || { echo "nft lock acquire failed on a free lock" >&2; exit 1; }
+    [ "$NFT_LOCK_HELD" = 1 ] || { echo "nft lock was not marked held" >&2; exit 1; }
+    { : >&8; } 2>/dev/null || { echo "nft lock did not open its descriptor" >&2; exit 1; }
+    nft_lock_release
+    [ "$NFT_LOCK_HELD" = 0 ] || { echo "nft lock stayed held after release" >&2; exit 1; }
+    { : >&8; } 2>/dev/null && { echo "nft lock leaked its descriptor after release" >&2; exit 1; }
+
+    FLOCK_RC=1
+    ! nft_lock_acquire >/dev/null 2>&1 \
+        || { echo "nft lock reported success while another task held it" >&2; exit 1; }
+    { : >&8; } 2>/dev/null && { echo "a failed nft acquire leaked its descriptor" >&2; exit 1; }
+
+    FLOCK_RC=0
+    BBR_CAL_LOCK_HELD=0
+    BBR_CAL_LOCK_MODE=""
+    bbr_calibration_lock_acquire || { echo "bbr lock acquire failed on a free lock" >&2; exit 1; }
+    [ "$BBR_CAL_LOCK_HELD" = 1 ] || { echo "bbr lock was not marked held" >&2; exit 1; }
+    [ "$BBR_CAL_LOCK_MODE" = flock ] || { echo "bbr lock did not take the flock path" >&2; exit 1; }
+    { : >&7; } 2>/dev/null || { echo "bbr lock did not open its descriptor" >&2; exit 1; }
+    bbr_calibration_lock_release
+    [ "$BBR_CAL_LOCK_HELD" = 0 ] || { echo "bbr lock stayed held after release" >&2; exit 1; }
+    { : >&7; } 2>/dev/null && { echo "bbr lock leaked its descriptor after release" >&2; exit 1; }
+
+    FLOCK_RC=1
+    ! bbr_calibration_lock_acquire >/dev/null 2>&1 \
+        || { echo "bbr lock reported success while another task held it" >&2; exit 1; }
+    if { : >&7; } 2>/dev/null; then
+        echo "a failed bbr acquire leaked its descriptor" >&2
+        exit 1
+    fi
+)
+
 echo "Fault injection tests passed."

@@ -34,19 +34,28 @@ nft_ensure_state_dir() {
     chmod 600 "$NFT_RULES_FILE" "$NFT_ACCESS_FILE" "$NFT_FIREWALL_STATE" 2>/dev/null || true
 }
 
+# 固定 fd 8，编号见 core.sh 的 fd 分配表（exec {VAR}> 在 bash 3.2 下不可用）。
+NFT_LOCK_HELD=0
+
 nft_lock_acquire() {
     nft_ensure_state_dir || return 1
     command -v flock >/dev/null 2>&1 || return 0
-    exec {NFT_LOCK_FD}>"$NFT_LOCK_FILE" || return 1
-    flock -w 30 "$NFT_LOCK_FD" || { error "另一个 Quench 转发任务正在运行"; return 1; }
+    [ "$NFT_LOCK_HELD" = 1 ] && return 0
+    exec 8>"$NFT_LOCK_FILE" || return 1
+    if ! flock -w 30 8; then
+        # 原实现在这里直接 return，把已打开的 fd 留着不关。
+        exec 8>&-
+        error "另一个 Quench 转发任务正在运行"
+        return 1
+    fi
+    NFT_LOCK_HELD=1
 }
 
 nft_lock_release() {
-    if [ -n "${NFT_LOCK_FD:-}" ]; then
-        flock -u "$NFT_LOCK_FD" 2>/dev/null || true
-        eval "exec ${NFT_LOCK_FD}>&-"
-        unset NFT_LOCK_FD
-    fi
+    [ "$NFT_LOCK_HELD" = 1 ] || return 0
+    flock -u 8 2>/dev/null || true
+    exec 8>&-
+    NFT_LOCK_HELD=0
 }
 
 nft_install() {

@@ -100,7 +100,12 @@ SAFETY_UNIT=""
 # 两个 Quench 会话同时改 sshd_config / 防火墙会互相覆盖，而且各自的防断联
 # 计时器会回滚掉对方的快照。所有走 safety_arm 的高危变更共用这一把锁。
 # 只在“变更事务”期间持有：只读菜单、状态刷新、后台版本检测都不受影响。
-# 用固定 fd 9：bash 3.2 不支持 exec {VAR}>，而本脚本要兼容老 bash。
+# 用固定 fd：bash 3.2 不支持 exec {VAR}>（实测报 exec: {FD}: not found），
+# 而本脚本的解释器守卫允许在老 bash 上运行。全脚本的 fd 分配集中记在这里，
+# 因为这几把锁可能同时持有，编号不能撞车：
+#   7 = BBR 线路校准锁（bbr.sh）
+#   8 = nft 转发锁（nft.sh）
+#   9 = 配置变更事务锁（本文件）
 # 同一进程重复进入直接复用（Quench 同时只维护一笔事务，不存在真正的嵌套）。
 QUENCH_TXN_LOCK_FILE="${QUENCH_TXN_LOCK_FILE:-/run/lock/quench-config.lock}"
 QUENCH_TXN_LOCK_HELD=0

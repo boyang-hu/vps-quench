@@ -1804,7 +1804,8 @@ BBR_CAL_DEV=""
 BBR_CAL_TC_BIN=""
 BBR_CAL_IPERF_PID=""
 BBR_CAL_TEMP_FILE=""
-BBR_CAL_LOCK_FD=""
+# 固定 fd 7，编号见 core.sh 的 fd 分配表（exec {VAR}> 在 bash 3.2 下不可用）。
+BBR_CAL_LOCK_HELD=0
 BBR_CAL_LOCK_MODE=""
 BBR_CAL_SENDER=""
 BBR_CAL_RECEIVER=""
@@ -1893,13 +1894,13 @@ bbr_calibration_lock_acquire() {
     local LOCK_DIR OWNER ATTEMPT
     mkdir -p "$(dirname "$BBR_CALIBRATION_LOCK_FILE")" 2>/dev/null || return 1
     if command -v flock >/dev/null 2>&1; then
-        exec {BBR_CAL_LOCK_FD}>"$BBR_CALIBRATION_LOCK_FILE" || return 1
-        flock -n "$BBR_CAL_LOCK_FD" || {
-            eval "exec ${BBR_CAL_LOCK_FD}>&-"
-            BBR_CAL_LOCK_FD=""
+        exec 7>"$BBR_CALIBRATION_LOCK_FILE" || return 1
+        if ! flock -n 7; then
+            exec 7>&-
             error "另一个 Quench 线路校准任务正在运行"
             return 1
-        }
+        fi
+        BBR_CAL_LOCK_HELD=1
         BBR_CAL_LOCK_MODE="flock"
     else
         LOCK_DIR="${BBR_CALIBRATION_LOCK_FILE}.d"
@@ -1922,10 +1923,10 @@ bbr_calibration_lock_acquire() {
 }
 
 bbr_calibration_lock_release() {
-    if [ -n "$BBR_CAL_LOCK_FD" ]; then
-        flock -u "$BBR_CAL_LOCK_FD" 2>/dev/null || true
-        eval "exec ${BBR_CAL_LOCK_FD}>&-"
-        BBR_CAL_LOCK_FD=""
+    if [ "$BBR_CAL_LOCK_HELD" = 1 ]; then
+        flock -u 7 2>/dev/null || true
+        exec 7>&-
+        BBR_CAL_LOCK_HELD=0
     fi
     if [ "$BBR_CAL_LOCK_MODE" = mkdir ]; then
         rm -f "${BBR_CALIBRATION_LOCK_FILE}.d/pid"

@@ -100,7 +100,12 @@ SAFETY_UNIT=""
 # 两个 Quench 会话同时改 sshd_config / 防火墙会互相覆盖，而且各自的防断联
 # 计时器会回滚掉对方的快照。所有走 safety_arm 的高危变更共用这一把锁。
 # 只在“变更事务”期间持有：只读菜单、状态刷新、后台版本检测都不受影响。
-# 用固定 fd 9：bash 3.2 不支持 exec {VAR}>，而本脚本要兼容老 bash。
+# 用固定 fd：bash 3.2 不支持 exec {VAR}>（实测报 exec: {FD}: not found），
+# 而本脚本的解释器守卫允许在老 bash 上运行。全脚本的 fd 分配集中记在这里，
+# 因为这几把锁可能同时持有，编号不能撞车：
+#   7 = BBR 线路校准锁（bbr.sh）
+#   8 = nft 转发锁（nft.sh）
+#   9 = 配置变更事务锁（本文件）
 # 同一进程重复进入直接复用（Quench 同时只维护一笔事务，不存在真正的嵌套）。
 QUENCH_TXN_LOCK_FILE="${QUENCH_TXN_LOCK_FILE:-/run/lock/quench-config.lock}"
 QUENCH_TXN_LOCK_HELD=0
@@ -4660,7 +4665,8 @@ BBR_CAL_DEV=""
 BBR_CAL_TC_BIN=""
 BBR_CAL_IPERF_PID=""
 BBR_CAL_TEMP_FILE=""
-BBR_CAL_LOCK_FD=""
+# 固定 fd 7，编号见 core.sh 的 fd 分配表（exec {VAR}> 在 bash 3.2 下不可用）。
+BBR_CAL_LOCK_HELD=0
 BBR_CAL_LOCK_MODE=""
 BBR_CAL_SENDER=""
 BBR_CAL_RECEIVER=""
@@ -4749,13 +4755,13 @@ bbr_calibration_lock_acquire() {
     local LOCK_DIR OWNER ATTEMPT
     mkdir -p "$(dirname "$BBR_CALIBRATION_LOCK_FILE")" 2>/dev/null || return 1
     if command -v flock >/dev/null 2>&1; then
-        exec {BBR_CAL_LOCK_FD}>"$BBR_CALIBRATION_LOCK_FILE" || return 1
-        flock -n "$BBR_CAL_LOCK_FD" || {
-            eval "exec ${BBR_CAL_LOCK_FD}>&-"
-            BBR_CAL_LOCK_FD=""
+        exec 7>"$BBR_CALIBRATION_LOCK_FILE" || return 1
+        if ! flock -n 7; then
+            exec 7>&-
             error "另一个 Quench 线路校准任务正在运行"
             return 1
-        }
+        fi
+        BBR_CAL_LOCK_HELD=1
         BBR_CAL_LOCK_MODE="flock"
     else
         LOCK_DIR="${BBR_CALIBRATION_LOCK_FILE}.d"
@@ -4778,10 +4784,10 @@ bbr_calibration_lock_acquire() {
 }
 
 bbr_calibration_lock_release() {
-    if [ -n "$BBR_CAL_LOCK_FD" ]; then
-        flock -u "$BBR_CAL_LOCK_FD" 2>/dev/null || true
-        eval "exec ${BBR_CAL_LOCK_FD}>&-"
-        BBR_CAL_LOCK_FD=""
+    if [ "$BBR_CAL_LOCK_HELD" = 1 ]; then
+        flock -u 7 2>/dev/null || true
+        exec 7>&-
+        BBR_CAL_LOCK_HELD=0
     fi
     if [ "$BBR_CAL_LOCK_MODE" = mkdir ]; then
         rm -f "${BBR_CALIBRATION_LOCK_FILE}.d/pid"
@@ -14998,19 +15004,28 @@ nft_ensure_state_dir() {
     chmod 600 "$NFT_RULES_FILE" "$NFT_ACCESS_FILE" "$NFT_FIREWALL_STATE" 2>/dev/null || true
 }
 
+# 固定 fd 8，编号见 core.sh 的 fd 分配表（exec {VAR}> 在 bash 3.2 下不可用）。
+NFT_LOCK_HELD=0
+
 nft_lock_acquire() {
     nft_ensure_state_dir || return 1
     command -v flock >/dev/null 2>&1 || return 0
-    exec {NFT_LOCK_FD}>"$NFT_LOCK_FILE" || return 1
-    flock -w 30 "$NFT_LOCK_FD" || { error "另一个 Quench 转发任务正在运行"; return 1; }
+    [ "$NFT_LOCK_HELD" = 1 ] && return 0
+    exec 8>"$NFT_LOCK_FILE" || return 1
+    if ! flock -w 30 8; then
+        # 原实现在这里直接 return，把已打开的 fd 留着不关。
+        exec 8>&-
+        error "另一个 Quench 转发任务正在运行"
+        return 1
+    fi
+    NFT_LOCK_HELD=1
 }
 
 nft_lock_release() {
-    if [ -n "${NFT_LOCK_FD:-}" ]; then
-        flock -u "$NFT_LOCK_FD" 2>/dev/null || true
-        eval "exec ${NFT_LOCK_FD}>&-"
-        unset NFT_LOCK_FD
-    fi
+    [ "$NFT_LOCK_HELD" = 1 ] || return 0
+    flock -u 8 2>/dev/null || true
+    exec 8>&-
+    NFT_LOCK_HELD=0
 }
 
 nft_install() {
