@@ -11,6 +11,57 @@ source "$ROOT/vps-quench.sh"
 confirm_change_preview "test" "reject" <<< "n" >/dev/null 2>&1 && { echo "Preview accepted rejection" >&2; exit 1; }
 confirm_change_preview "test" "accept" <<< "y" >/dev/null 2>&1 || { echo "Preview rejected confirmation" >&2; exit 1; }
 
+# Passwordless sudo must roll back when the effective non-interactive check fails.
+(
+    USER_PASSWD_FILE="$TMP/nopasswd-passwd"
+    USER_GROUP_FILE="$TMP/nopasswd-group"
+    USER_SUDOERS_DIR="$TMP/nopasswd-sudoers"
+    USER_ADMIN_SUDOERS_FILE="$USER_SUDOERS_DIR/90-quench-admins"
+    QUENCH_AUDIT_LOG="$TMP/nopasswd-audit.log"
+    printf '%s\n' \
+        'root:x:0:0:root:/root:/bin/bash' \
+        'admin:x:1000:1000:Admin:/home/admin:/bin/bash' > "$USER_PASSWD_FILE"
+    printf '%s\n' 'root:x:0:' 'sudo:x:27:admin' 'admin:x:1000:' > "$USER_GROUP_FILE"
+    info() { :; }
+    warn() { :; }
+    error() { :; }
+    sudo() { :; }
+    visudo() { return 0; }
+    user_nopasswd_runtime_valid() { return 1; }
+    ! user_nopasswd_enable admin >/dev/null 2>&1 \
+        || { echo "Passwordless sudo accepted a failed runtime verification" >&2; exit 1; }
+    [ ! -e "$(user_nopasswd_file admin)" ] \
+        || { echo "Failed passwordless sudo verification left an active rule" >&2; exit 1; }
+)
+
+# A colliding sudoers file not owned by Quench must never be overwritten or deleted.
+(
+    USER_PASSWD_FILE="$TMP/nopasswd-collision-passwd"
+    USER_GROUP_FILE="$TMP/nopasswd-collision-group"
+    USER_SUDOERS_DIR="$TMP/nopasswd-collision-sudoers"
+    USER_ADMIN_SUDOERS_FILE="$USER_SUDOERS_DIR/90-quench-admins"
+    printf '%s\n' \
+        'root:x:0:0:root:/root:/bin/bash' \
+        'admin:x:1000:1000:Admin:/home/admin:/bin/bash' > "$USER_PASSWD_FILE"
+    printf '%s\n' 'root:x:0:' 'sudo:x:27:admin' 'admin:x:1000:' > "$USER_GROUP_FILE"
+    mkdir -p "$USER_SUDOERS_DIR"
+    COLLISION_FILE=$(user_nopasswd_file admin)
+    printf 'admin ALL=(root) NOPASSWD: /usr/bin/systemctl\n' > "$COLLISION_FILE"
+    chmod 440 "$COLLISION_FILE"
+    info() { :; }
+    warn() { :; }
+    error() { :; }
+    sudo() { :; }
+    visudo() { return 0; }
+    user_nopasswd_runtime_valid() { return 0; }
+    ! user_nopasswd_enable admin >/dev/null 2>&1 \
+        || { echo "Passwordless sudo overwrote a foreign sudoers file" >&2; exit 1; }
+    ! user_nopasswd_disable admin >/dev/null 2>&1 \
+        || { echo "Passwordless sudo deleted a foreign sudoers file" >&2; exit 1; }
+    grep -qx 'admin ALL=(root) NOPASSWD: /usr/bin/systemctl' "$COLLISION_FILE" \
+        || { echo "Foreign sudoers file contents changed" >&2; exit 1; }
+)
+
 # A pending network transaction must roll back before another starts. Newly created
 # DNS drop-ins must also disappear during immediate rollback.
 (

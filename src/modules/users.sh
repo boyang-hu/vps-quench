@@ -4,6 +4,9 @@
 
 USER_PASSWD_FILE="${USER_PASSWD_FILE:-/etc/passwd}"
 USER_GROUP_FILE="${USER_GROUP_FILE:-/etc/group}"
+USER_SUDOERS_DIR="${USER_SUDOERS_DIR:-/etc/sudoers.d}"
+USER_ADMIN_SUDOERS_FILE="${USER_ADMIN_SUDOERS_FILE:-$USER_SUDOERS_DIR/90-quench-admins}"
+USER_NOPASSWD_MARKER="# Managed by Quench: passwordless sudo"
 
 user_passwd_entries() {
     if [ "$USER_PASSWD_FILE" != /etc/passwd ] && [ -r "$USER_PASSWD_FILE" ]; then
@@ -208,8 +211,8 @@ user_ensure_admin_backend() {
         fi
     fi
     command -v sudo >/dev/null 2>&1 || pkg_install sudo || { error "sudo 安装失败"; return 1; }
-    mkdir -p /etc/sudoers.d || return 1
-    SUDOERS_FILE=/etc/sudoers.d/90-quench-admins
+    mkdir -p "$USER_SUDOERS_DIR" || return 1
+    SUDOERS_FILE="$USER_ADMIN_SUDOERS_FILE"
     TMP=$(mktemp) || return 1
     printf '%%%s ALL=(ALL:ALL) ALL\n' "$GROUP" > "$TMP"
     chmod 440 "$TMP"
@@ -221,6 +224,143 @@ user_ensure_admin_backend() {
     mv "$TMP" "$SUDOERS_FILE"
     chmod 440 "$SUDOERS_FILE"
     printf '%s\n' "$GROUP"
+}
+
+user_nopasswd_file() {
+    local USERNAME="$1"
+    user_valid_name "$USERNAME" || return 1
+    printf '%s/91-quench-nopasswd-%s\n' "$USER_SUDOERS_DIR" "$USERNAME"
+}
+
+user_file_mode() {
+    local FILE="$1" MODE
+    MODE=$(stat -c '%a' "$FILE" 2>/dev/null || stat -f '%Lp' "$FILE" 2>/dev/null || true)
+    printf '%s\n' "$MODE"
+}
+
+user_nopasswd_file_valid() {
+    local USERNAME="$1" FILE="${2:-}" EXPECTED COUNT
+    [ -n "$FILE" ] || FILE=$(user_nopasswd_file "$USERNAME") || return 1
+    [ -f "$FILE" ] && [ ! -L "$FILE" ] || return 1
+    EXPECTED="$USERNAME ALL=(ALL:ALL) NOPASSWD: ALL"
+    [ "$(sed -n '1p' "$FILE" 2>/dev/null)" = "$USER_NOPASSWD_MARKER" ] \
+        && [ "$(sed -n '2p' "$FILE" 2>/dev/null)" = "$EXPECTED" ] || return 1
+    COUNT=$(wc -l < "$FILE" 2>/dev/null | tr -d '[:space:]')
+    [ "$COUNT" = 2 ] && [ "$(user_file_mode "$FILE")" = 440 ]
+}
+
+user_nopasswd_enabled() {
+    local FILE
+    FILE=$(user_nopasswd_file "$1") || return 1
+    user_nopasswd_file_valid "$1" "$FILE"
+}
+
+user_nopasswd_path_exists() {
+    local FILE
+    FILE=$(user_nopasswd_file "$1") || return 1
+    [ -e "$FILE" ] || [ -L "$FILE" ]
+}
+
+user_nopasswd_runtime_valid() {
+    local USERNAME="$1"
+    command -v sudo >/dev/null 2>&1 || return 1
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$USERNAME" -- sudo -n true >/dev/null 2>&1
+    else
+        sudo -n -u "$USERNAME" -- sudo -n true >/dev/null 2>&1
+    fi
+}
+
+user_nopasswd_status() {
+    local USERNAME="$1"
+    if user_nopasswd_enabled "$USERNAME"; then
+        echo "已开启（Quench）"
+    elif user_nopasswd_runtime_valid "$USERNAME"; then
+        echo "已开启（其他规则）"
+    else
+        echo "未开启"
+    fi
+}
+
+user_nopasswd_enable() {
+    local USERNAME="$1" TARGET TMP
+    [ "$USERNAME" != root ] || { error "root 不需要免密 sudo"; return 1; }
+    user_valid_name "$USERNAME" && user_exists "$USERNAME" \
+        || { error "用户名无效或用户不存在"; return 1; }
+    user_is_admin "$USERNAME" \
+        || { error "请先授予 $USERNAME sudo/wheel 管理员权限"; return 1; }
+    command -v sudo >/dev/null 2>&1 && command -v visudo >/dev/null 2>&1 \
+        || { error "系统缺少 sudo 或 visudo"; return 1; }
+    TARGET=$(user_nopasswd_file "$USERNAME") || return 1
+    mkdir -p "$USER_SUDOERS_DIR" || return 1
+    if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+        user_nopasswd_file_valid "$USERNAME" "$TARGET" \
+            || { error "$TARGET 已存在且不属于 Quench，拒绝覆盖"; return 1; }
+        if user_nopasswd_runtime_valid "$USERNAME"; then
+            info "$USERNAME 的 Quench 免密 sudo 已经生效"
+            return 0
+        fi
+        error "Quench 免密 sudo 文件存在但未实际生效，请查看最终 sudo 权限"
+        return 1
+    fi
+    TMP=$(mktemp "${TARGET}.tmp.XXXXXX") || return 1
+    {
+        printf '%s\n' "$USER_NOPASSWD_MARKER"
+        printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$USERNAME"
+    } > "$TMP"
+    chmod 440 "$TMP"
+    if ! user_nopasswd_file_valid "$USERNAME" "$TMP" \
+        || ! visudo -cf "$TMP" >/dev/null 2>&1 \
+        || ! mv "$TMP" "$TARGET"; then
+        rm -f "$TMP"
+        error "免密 sudo 配置校验或写入失败"
+        return 1
+    fi
+    if ! chmod 440 "$TARGET" \
+        || ! user_nopasswd_file_valid "$USERNAME" "$TARGET" \
+        || ! user_nopasswd_runtime_valid "$USERNAME"; then
+        rm -f "$TARGET"
+        error "免密 sudo 运行验证失败，已恢复原配置"
+        return 1
+    fi
+    audit_action "为用户 $USERNAME 开启免密 sudo" SUCCESS
+    info "$USERNAME 已获得免密 sudo 权限 ✓"
+    warn "该权限等同完整 root 控制；安装任务结束后可从本菜单关闭"
+}
+
+user_nopasswd_disable() {
+    local USERNAME="$1" TARGET
+    TARGET=$(user_nopasswd_file "$USERNAME") \
+        || { error "用户名不适用于 Quench sudoers 文件"; return 1; }
+    if [ ! -e "$TARGET" ] && [ ! -L "$TARGET" ]; then
+        info "$USERNAME 没有 Quench 管理的免密 sudo 配置"
+        user_nopasswd_runtime_valid "$USERNAME" \
+            && warn "其他 sudoers 规则仍然允许该用户免密提权" || true
+        return 0
+    fi
+    user_nopasswd_file_valid "$USERNAME" "$TARGET" \
+        || { error "$TARGET 不属于 Quench，拒绝删除"; return 1; }
+    rm -f "$TARGET" || { error "无法删除免密 sudo 配置"; return 1; }
+    [ ! -e "$TARGET" ] && [ ! -L "$TARGET" ] \
+        || { error "免密 sudo 配置仍然存在"; return 1; }
+    audit_action "为用户 $USERNAME 关闭免密 sudo" SUCCESS
+    info "$USERNAME 的 Quench 免密 sudo 权限已关闭 ✓"
+    user_nopasswd_runtime_valid "$USERNAME" \
+        && warn "其他 sudoers 规则仍然允许该用户免密提权，请运行权限查看确认来源" || true
+}
+
+user_sudo_permissions_show() {
+    local USERNAME="$1"
+    print_header "$USERNAME · sudo 权限"
+    echo -e "  管理员组：${BOLD}$(user_is_admin "$USERNAME" && echo 是 || echo 否)${NC}"
+    echo -e "  免密 sudo：${BOLD}$(user_nopasswd_status "$USERNAME")${NC}"
+    echo ""
+    if command -v sudo >/dev/null 2>&1; then
+        sudo -l -U "$USERNAME" 2>&1 | sed 's/^/  /' \
+            || warn "无法读取 sudo 的最终权限列表"
+    else
+        warn "sudo 尚未安装"
+    fi
 }
 
 user_grant_admin() {
@@ -252,6 +392,18 @@ user_remove_from_group() {
 
 user_revoke_admin() {
     local USERNAME="$1" ACTOR
+    if user_nopasswd_path_exists "$USERNAME"; then
+        if user_nopasswd_enabled "$USERNAME"; then
+            error "请先关闭 $USERNAME 的免密 sudo，再移除管理员权限"
+        else
+            error "检测到未通过所有权或权限校验的免密 sudo 文件，请先人工检查"
+        fi
+        return 1
+    fi
+    if user_nopasswd_runtime_valid "$USERNAME"; then
+        error "$USERNAME 仍通过其他 sudoers 规则拥有免密 sudo，请先清理该授权"
+        return 1
+    fi
     ACTOR=$(user_current_actor)
     [ "$USERNAME" != "$ACTOR" ] || { error "不能移除当前登录用户 $USERNAME 的管理员权限"; return 1; }
     [ "$(user_admin_count)" -gt 1 ] || { error "不能移除最后一个非 root 管理员"; return 1; }
@@ -408,18 +560,43 @@ user_create() {
 
 user_admin_manage() {
     print_header "管理员权限"
-    local USERNAME CHOICE
+    local USERNAME CHOICE TOKEN CONFIRM
     USERNAME=$(user_select no "选择要管理的用户") || return
     if user_is_admin "$USERNAME"; then
         echo -e "  ${BOLD}$USERNAME${NC} 当前是管理员。"
-        menu_item "1" "移除管理员权限" "$YELLOW"
+        echo -e "  免密 sudo：${BOLD}$(user_nopasswd_status "$USERNAME")${NC}"
+        menu_pair "1" "开启免密 sudo" "2" "关闭免密 sudo" "$YELLOW" "$GREEN"
+        menu_pair "3" "查看实际 sudo 权限" "4" "移除管理员权限" "$CYAN" "$YELLOW"
         menu_item "0" "取消" "$RED"
-        read -rp "$(ui_prompt '选择操作 [0-1]: ')" CHOICE
-        [ "$CHOICE" = 1 ] && user_revoke_admin "$USERNAME"
+        read -rp "$(ui_prompt '选择操作 [0-4]: ')" CHOICE
+        case "$CHOICE" in
+            1)
+                warn "免密 sudo 允许 $USERNAME 无需密码执行任意 root 命令"
+                read -rp "  输入用户名 $USERNAME 确认开启: " TOKEN
+                if [ "$TOKEN" = "$USERNAME" ]; then
+                    user_nopasswd_enable "$USERNAME"
+                else
+                    warn "确认不匹配，已取消"
+                fi
+                ;;
+            2)
+                read -rp "  关闭 $USERNAME 的 Quench 免密 sudo？(Y/n): " CONFIRM
+                CONFIRM="${CONFIRM:-y}"
+                echo "$CONFIRM" | grep -qiE '^y(es)?$' && user_nopasswd_disable "$USERNAME"
+                ;;
+            3) user_sudo_permissions_show "$USERNAME" ;;
+            4) user_revoke_admin "$USERNAME" ;;
+        esac
     else
         echo -e "  ${BOLD}$USERNAME${NC} 当前是普通用户。"
-        read -rp "  授予 sudo/wheel 管理员权限？(y/N): " CHOICE
-        echo "$CHOICE" | grep -qiE '^y(es)?$' && user_grant_admin "$USERNAME"
+        menu_item "1" "授予 sudo/wheel 管理员权限"
+        menu_item "2" "查看实际 sudo 权限" "$CYAN"
+        menu_item "0" "取消" "$RED"
+        read -rp "$(ui_prompt '选择操作 [0-2]: ')" CHOICE
+        case "$CHOICE" in
+            1) user_grant_admin "$USERNAME" ;;
+            2) user_sudo_permissions_show "$USERNAME" ;;
+        esac
     fi
 }
 
@@ -476,6 +653,16 @@ user_delete() {
     else
         error "系统缺少 userdel/deluser"
         return 1
+    fi
+    if user_nopasswd_path_exists "$USERNAME"; then
+        if user_nopasswd_enabled "$USERNAME"; then
+            user_nopasswd_disable "$USERNAME" || {
+                error "用户已删除，但其免密 sudo 文件清理失败，请立即人工检查"
+                return 1
+            }
+        else
+            warn "用户已删除，但同名 sudoers 文件不属于 Quench，已保留并需要人工检查"
+        fi
     fi
     audit_action "删除用户 $USERNAME" SUCCESS
     info "用户 $USERNAME 已删除 ✓"

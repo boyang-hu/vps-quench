@@ -14,6 +14,7 @@ for fn in systemd_available show_cli_help main_menu first_run_wizard first_run_r
     system_package_manager system_auto_updates_supported system_auto_updates_enabled system_enable_auto_security_updates \
     user_management_menu ssh_key_count \
     user_list_names user_count user_is_admin user_admin_count user_ready_admin user_ready_admin_count user_authorized_keys \
+    user_nopasswd_file user_file_mode user_nopasswd_file_valid user_nopasswd_enabled user_nopasswd_path_exists user_nopasswd_runtime_valid user_nopasswd_status user_nopasswd_enable user_nopasswd_disable user_sudo_permissions_show \
     ssh_port_valid ssh_port_number_valid ssh_set_ports_file ssh_write_port_state ssh_read_port_state ssh_security_status \
     fail2ban_menu f2b_config_file f2b_ports_valid f2b_get_section_param f2b_ensure_managed_config f2b_managed_ports_match f2b_runtime_healthy bbr_menu firewall_menu fw_port_spec_normalize fw_ip_family ufw_port_rule_present firewall_port_ready \
     dns_menu dns_backend_detect dns_effective_servers dns_detect_network dns_list_validate dns_probe_server dns_apply_resolved dns_apply_nm dns_apply_resolvconf dns_apply_static dns_effective_matches dns_fail_and_rollback timesync_menu \
@@ -442,6 +443,29 @@ ip_address_valid 6 2001:db8::10 || { echo "Valid IPv6 address was rejected" >&2;
     [[ "$(user_key_count admin)" = 1 ]] || { echo "Per-user SSH key count is wrong" >&2; exit 1; }
     user_ready_admin admin || { echo "Keyed admin was not considered ready" >&2; exit 1; }
     [[ "$(user_ready_admin_count)" = 1 ]] || { echo "Ready admin count is wrong" >&2; exit 1; }
+    USER_SUDOERS_DIR="$TMP/sudoers.d"
+    USER_ADMIN_SUDOERS_FILE="$USER_SUDOERS_DIR/90-quench-admins"
+    QUENCH_AUDIT_LOG="$TMP/user-audit.log"
+    sudo() { :; }
+    visudo() { [ "$1" = -cf ] && [ -f "$2" ]; }
+    user_nopasswd_runtime_valid() { user_nopasswd_enabled "$1"; }
+    user_nopasswd_enable admin >/dev/null \
+        || { echo "Passwordless sudo could not be enabled for an admin" >&2; exit 1; }
+    NOPASSWD_FILE=$(user_nopasswd_file admin)
+    user_nopasswd_file_valid admin "$NOPASSWD_FILE" \
+        || { echo "Passwordless sudo file failed ownership or mode validation" >&2; exit 1; }
+    [ "$(user_file_mode "$NOPASSWD_FILE")" = 440 ] \
+        || { echo "Passwordless sudo file mode is not 0440" >&2; exit 1; }
+    [ "$(user_nopasswd_status admin)" = '已开启（Quench）' ] \
+        || { echo "Passwordless sudo status is wrong" >&2; exit 1; }
+    ! user_nopasswd_enable alice >/dev/null 2>&1 \
+        || { echo "Passwordless sudo was granted to a non-admin" >&2; exit 1; }
+    ! user_revoke_admin admin >/dev/null 2>&1 \
+        || { echo "Admin role was removed while passwordless sudo remained" >&2; exit 1; }
+    user_nopasswd_disable admin >/dev/null \
+        || { echo "Passwordless sudo could not be disabled" >&2; exit 1; }
+    [ ! -e "$NOPASSWD_FILE" ] \
+        || { echo "Passwordless sudo file remains after disable" >&2; exit 1; }
     ! user_revoke_admin admin >/dev/null 2>&1 || { echo "Last non-root admin could be revoked" >&2; exit 1; }
 )
 

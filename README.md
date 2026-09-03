@@ -164,6 +164,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 | 查看用户与权限 | 列出 root 与可登录用户，显示 UID、管理员权限、密码锁定和公钥数量 |
 | 创建用户 | 创建普通用户或 sudo/wheel 管理员，可设置密码并安装用户公钥 |
 | 管理 sudo 权限 | 跨发行版管理 sudo/wheel；禁止移除当前用户、最后一个管理员或最后一个可接管管理员 |
+| 免密 sudo | 为指定非 root 管理员单独开启或关闭 `NOPASSWD`，写入前经 `visudo` 校验并执行 `sudo -n` 验证；不会开放 root SSH |
 | 修改/锁定密码 | 调用系统 `passwd` 修改、锁定或解锁账户，保护当前登录身份 |
 | 管理用户公钥 | 先选择用户，再查看、添加、删除或生成密钥；自动修复 `.ssh` 属主与权限 |
 | 删除用户 | 禁止删除 root、当前登录用户、系统账户和最后一个可用管理员；家目录单独确认 |
@@ -542,6 +543,7 @@ Docker 发布端口可能绕过 UFW 的常规 `INPUT` 规则。诊断入口会�
 | `/var/lib/quench/ssh-port-migration.state` | 尚未完成的 SSH 双端口迁移状态（600） |
 | `/var/log/quench-audit.log` | 脚本操作审计日志（600） |
 | `/etc/sudoers.d/90-quench-admins` | Quench 管理员组授权（440，写入前经 `visudo` 校验） |
+| `/etc/sudoers.d/91-quench-nopasswd-<用户名>` | 按用户管理的免密 sudo 授权（440，写入后执行无密码提权验证） |
 | `vps-quench.sh.sha256` | 自更新完整性校验值 |
 | `/etc/sysctl.d/99-quench-bbr.conf` | BBR TCP 配置 |
 | `/etc/sysctl.d/99-quench-ipv6.conf` | Quench 管理的内核 IPv6 禁用配置 |
