@@ -100,31 +100,42 @@ config_backup_prune() {
     audit_action "自动清理 $REMOVE_COUNT 个旧配置备份" SUCCESS
 }
 
+safety_stop_timer_process() {
+    if [ -n "${SAFETY_UNIT:-}" ]; then
+        systemctl stop "$SAFETY_UNIT" >/dev/null 2>&1 || true
+        systemctl reset-failed "$SAFETY_UNIT" >/dev/null 2>&1 || true
+    elif [ -n "${SAFETY_PID:-}" ]; then
+        kill "$SAFETY_PID" 2>/dev/null || true
+        wait "$SAFETY_PID" 2>/dev/null || true
+    fi
+}
+
 safety_timer_pending() {
-    { [ -n "${SAFETY_PID:-}" ] && kill -0 "$SAFETY_PID" 2>/dev/null; } \
+    { [ -n "${SAFETY_UNIT:-}" ] && systemctl is-active --quiet "$SAFETY_UNIT" 2>/dev/null; } \
+        || { [ -n "${SAFETY_PID:-}" ] && kill -0 "$SAFETY_PID" 2>/dev/null; } \
         || { [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ]; }
 }
 
 cancel_safety_timer() {
-    if [ -n "${SAFETY_PID:-}" ] && [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ]; then
-        kill "$SAFETY_PID" 2>/dev/null || true
-        wait "$SAFETY_PID" 2>/dev/null || true
+    if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ]; then
+        safety_stop_timer_process
     fi
     rm -f "${SAFETY_SCRIPT:-}"
-    SAFETY_PID="" SAFETY_SCRIPT=""
+    SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+    txn_record_end
+    txn_lock_release
 }
 
 safety_rollback_now() {
-    local PID="${SAFETY_PID:-}" SCRIPT="${SAFETY_SCRIPT:-}" RC=0
+    local SCRIPT="${SAFETY_SCRIPT:-}" RC=0
     [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ] || {
-        SAFETY_PID="" SAFETY_SCRIPT=""
+        SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
         return 0
     }
-    if [ -n "$PID" ]; then
-        kill "$PID" 2>/dev/null || true
-        wait "$PID" 2>/dev/null || true
-    fi
-    SAFETY_PID="" SAFETY_SCRIPT=""
+    safety_stop_timer_process
+    SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+    txn_record_end
+    txn_lock_release
     bash "$SCRIPT" --now >/dev/null 2>&1 || RC=$?
     rm -f "$SCRIPT"
     [ "$RC" -eq 0 ] || {
@@ -307,9 +318,112 @@ config_transfer_menu() {
     done
 }
 
+txn_pending_records() {
+    find "$QUENCH_TXN_DIR" -maxdepth 1 -type f -name '*.txn' 2>/dev/null | sort
+}
+
+# 机器可读状态：running=原会话还活着 / armed=回滚脚本仍在 / stale=已失效
+txn_record_state() {
+    local FILE="$1" SCRIPT QPID
+    SCRIPT=$(txn_record_field "$FILE" SCRIPT)
+    QPID=$(txn_record_field "$FILE" QUENCH_PID)
+    if [ -n "$QPID" ] && [ "$QPID" != "$$" ] && kill -0 "$QPID" 2>/dev/null; then
+        echo running
+    elif [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ]; then
+        echo armed
+    else
+        echo stale
+    fi
+}
+
+txn_record_state_label() {
+    case "$1" in
+        running) echo "另一个 Quench 会话仍在运行" ;;
+        armed)   echo "回滚脚本仍在，可能仍会触发" ;;
+        *)       echo "已失效（回滚脚本已消失）" ;;
+    esac
+}
+
+txn_review_menu() {
+    local FILES=() FILE LABEL SCRIPT STARTED STATE INDEX CH SELECTED REMOVED
+    while true; do
+        print_header "未完成的配置变更"
+        FILES=()
+        while IFS= read -r FILE; do
+            [ -n "$FILE" ] && FILES+=("$FILE")
+        done < <(txn_pending_records)
+        if [ "${#FILES[@]}" -eq 0 ]; then
+            info "没有未完成的变更记录"
+            ui_pause
+            return 0
+        fi
+        ui_hint "这些记录来自没有正常收尾的会话（崩溃、断线或被强制结束）"
+        ui_hint "Quench 不会自动删除回滚脚本：它们可能仍会按时正常触发"
+        echo ""
+        INDEX=1
+        for FILE in "${FILES[@]}"; do
+            LABEL=$(txn_record_field "$FILE" LABEL)
+            STARTED=$(txn_record_field "$FILE" STARTED)
+            STATE=$(txn_record_state_label "$(txn_record_state "$FILE")")
+            echo -e "  ${GREEN}[$INDEX]${NC} ${BOLD}${LABEL:-未知}${NC}"
+            echo -e "      ${DIM}开始：${NC}${STARTED:-未知}   ${DIM}状态：${NC}${STATE}"
+            INDEX=$((INDEX + 1))
+        done
+        echo ""; menu_div
+        menu_item "1" "立即执行某条记录的回滚" "$YELLOW"
+        menu_item "2" "清理已失效的记录" "$CYAN"
+        menu_item "0" "返回上级" "$RED"
+        menu_div; echo ""
+        read -rp "$(ui_prompt '选择操作 [0-2]: ')" CH
+        case "$CH" in
+            1)
+                read -rp "  输入要回滚的编号（回车取消）: " SELECTED
+                [ -n "$SELECTED" ] || continue
+                case "$SELECTED" in *[!0-9]*) error "编号无效"; ui_pause; continue ;; esac
+                [ "$SELECTED" -ge 1 ] && [ "$SELECTED" -le "${#FILES[@]}" ] \
+                    || { error "编号不存在"; ui_pause; continue; }
+                FILE="${FILES[$((SELECTED - 1))]}"
+                SCRIPT=$(txn_record_field "$FILE" SCRIPT)
+                if [ -z "$SCRIPT" ] || [ ! -f "$SCRIPT" ]; then
+                    error "该记录的回滚脚本已不存在，无法执行"
+                    ui_pause
+                    continue
+                fi
+                confirm_change_preview "立即执行遗留回滚" \
+                    "记录：$(txn_record_field "$FILE" LABEL)" \
+                    "将恢复该事务开始前保存的配置快照" || continue
+                if bash "$SCRIPT" --now >/dev/null 2>&1; then
+                    rm -f "$FILE"
+                    audit_action "手动执行遗留回滚 $(basename "$FILE")" SUCCESS
+                    info "回滚已执行 ✓"
+                else
+                    audit_action "手动执行遗留回滚 $(basename "$FILE")" FAILED
+                    error "回滚执行失败，请立即人工检查当前配置"
+                fi
+                ui_pause
+                ;;
+            2)
+                REMOVED=0
+                for FILE in "${FILES[@]}"; do
+                    SCRIPT=$(txn_record_field "$FILE" SCRIPT)
+                    if [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ]; then
+                        continue
+                    fi
+                    rm -f "$FILE" && REMOVED=$((REMOVED + 1))
+                done
+                info "已清理 ${REMOVED} 条失效记录"
+                [ "$REMOVED" -eq 0 ] || audit_action "清理 ${REMOVED} 条失效变更记录" SUCCESS
+                ui_pause
+                ;;
+            0) return ;;
+            *) warn "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
 rollback_center_menu() {
     while true; do
-        local BACKUP_COUNT VERSION_COUNT LATEST_BACKUP LATEST_VERSION
+        local BACKUP_COUNT VERSION_COUNT LATEST_BACKUP LATEST_VERSION TXN_COUNT
         BACKUP_COUNT=$(find "$QUENCH_BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' 2>/dev/null | wc -l | tr -d ' ')
         VERSION_COUNT=$(find "$QUENCH_VERSION_DIR" -maxdepth 1 -type f -name '*.sh' 2>/dev/null | wc -l | tr -d ' ')
         LATEST_BACKUP=$(find "$QUENCH_BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' 2>/dev/null | sort -r | head -1)
@@ -319,17 +433,22 @@ rollback_center_menu() {
         [ -n "$LATEST_VERSION" ] && LATEST_VERSION="${LATEST_VERSION##*/}" || LATEST_VERSION="无"
         echo -e "  备份包：${BOLD}${BACKUP_COUNT:-0}${NC}   最新配置：${BOLD}${LATEST_BACKUP}${NC}"
         echo -e "  版本包：${BOLD}${VERSION_COUNT:-0}${NC}   最新脚本：${BOLD}${LATEST_VERSION}${NC}"
+        TXN_COUNT=$(txn_pending_records | wc -l | tr -d ' ')
+        [ "${TXN_COUNT:-0}" -eq 0 ] \
+            || echo -e "  ${YELLOW}未完成的变更记录：${BOLD}${TXN_COUNT}${NC}${YELLOW}（见选项 4）${NC}"
         echo ""; menu_div
         menu_item "1" "配置备份与恢复" "$GREEN"
         menu_item "2" "配置导出 / 导入" "$CYAN"
         menu_item "3" "脚本版本回滚" "$YELLOW"
+        menu_item "4" "检查未完成的变更" "$CYAN"
         menu_item "0" "返回上级" "$RED"
         menu_div; echo ""
-        read -rp "$(ui_prompt '选择操作 [0-3]: ')" CH
+        read -rp "$(ui_prompt '选择操作 [0-4]: ')" CH
         case "$CH" in
             1) config_backup_menu ;;
             2) config_transfer_menu ;;
             3) self_rollback ;;
+            4) txn_review_menu ;;
             0) return ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
@@ -344,6 +463,7 @@ safety_arm() {
     local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q
     shift
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
+    txn_lock_acquire || return 1
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
         safety_rollback_now || return 1
@@ -412,16 +532,18 @@ logger -t quench "未确认连接，已自动恢复 $LABEL_Q 配置"
 rm -f $SCRIPT_Q
 ROLLBACK_EOF
     chmod 700 "$SCRIPT"
-    nohup bash "$SCRIPT" >/dev/null 2>&1 &
-    SAFETY_PID=$!
-    SAFETY_SCRIPT="$SCRIPT"
+    safety_launch_timer "$SCRIPT" \
+        || { rm -f "$SCRIPT"; txn_lock_release; error "无法启动防断联回滚计时器"; return 1; }
+    txn_record_begin "$LABEL" "$SCRIPT"
     audit_action "启动防断联保护 $LABEL" SUCCESS
     warn "防断联保护已启动：${DELAY} 秒内未确认将自动恢复。"
 }
 
 safety_confirm() {
     [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ] || {
-        SAFETY_PID="" SAFETY_SCRIPT=""
+        SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+        txn_record_end
+        txn_lock_release
         warn "自动回滚计时器已结束；请重新检查当前连接与配置状态"
         return 1
     }

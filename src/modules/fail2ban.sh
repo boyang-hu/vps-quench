@@ -213,8 +213,7 @@ f2b_install() {
 
     info "验证 Fail2ban 配置..."
     if ! f2b_validate_config; then
-        [ "$EXISTED" = yes ] && cp "$BACKUP" "$TARGET" || rm -f "$TARGET"
-        rm -f "$BACKUP"
+        restore_backup_or_remove "$BACKUP" "$TARGET" "$EXISTED" || return 1
         error "Fail2ban 配置验证失败，已恢复原配置"
         fail2ban-client -t 2>&1 | sed 's/^/  /' || true
         return 1
@@ -234,8 +233,7 @@ f2b_install() {
         i=$((i + 1))
     done
     if ! f2b_ping || ! fail2ban-client status sshd >/dev/null 2>&1; then
-        [ "$EXISTED" = yes ] && cp "$BACKUP" "$TARGET" || rm -f "$TARGET"
-        rm -f "$BACKUP"
+        restore_backup_or_remove "$BACKUP" "$TARGET" "$EXISTED" || return 1
         if [ "$WAS_RUNNING" = running ]; then
             restart_fail2ban >/dev/null 2>&1 || true
         else
@@ -292,8 +290,7 @@ f2b_set_section_param() {
         EXISTED=yes
     fi
     if ! f2b_write_section_param "$SECTION" "$KEY" "$VAL" || ! f2b_validate_config; then
-        [ "$EXISTED" = yes ] && cp "$BACKUP" "$JAIL_FILE" || rm -f "$JAIL_FILE"
-        rm -f "$BACKUP"
+        restore_backup_or_remove "$BACKUP" "$JAIL_FILE" "$EXISTED" || return 1
         error "Fail2ban 配置验证失败，已恢复原配置"
         return 1
     fi
@@ -318,8 +315,7 @@ f2b_set_param_jail() {
     if ! f2b_write_section_param sshd enabled true \
         || ! f2b_write_section_param sshd "$KEY" "$VAL" \
         || ! f2b_validate_config; then
-        [ "$EXISTED" = yes ] && cp "$BACKUP" "$JAIL_FILE" || rm -f "$JAIL_FILE"
-        rm -f "$BACKUP"
+        restore_backup_or_remove "$BACKUP" "$JAIL_FILE" "$EXISTED" || return 1
         error "Fail2ban 配置验证失败，已恢复原配置"
         return 1
     fi

@@ -2,7 +2,8 @@
 #  脚本自我管理模块
 # ══════════════════════════════════════════════════════════
 
-SCRIPT_URL="https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/heads/main/vps-quench.sh"
+# 后台版本提示只读这份 manifest（几百字节），不再为一行版本号拉整份脚本。
+QUENCH_MANIFEST_URL="${QUENCH_MANIFEST_URL:-https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/heads/main/vps-quench.manifest.json}"
 GITHUB_REF_URL="https://api.github.com/repos/boyang-hu/vps-quench/git/ref/heads/main"
 LOCAL_BIN_DIR="${LOCAL_BIN_DIR:-/usr/local/bin}"
 LOCAL_SCRIPT="${LOCAL_SCRIPT:-${LOCAL_BIN_DIR}/vps-quench}"

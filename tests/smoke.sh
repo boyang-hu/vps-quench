@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# 断言各自用 <<< / < file 提供输入；脚本级 stdin 必须处于 EOF。
+# 否则 fw_install 等会走到交互 read 上无限期阻塞且不输出任何信息
+# （CI 的 stdin 是 /dev/null，所以这个坑一直没暴露）。
+exec < /dev/null
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d)
@@ -27,7 +31,11 @@ for fn in systemd_available show_cli_help main_menu first_run_wizard first_run_r
     ip_config_menu ip_show_status ip_gai_markers_valid ip_gai_strip_managed ip_gai_has_external_precedence ip_gai_render_v4 ip_gai_validate_v4 ip_gai_policy_label ip_prefer_v4 ip_prefer_v6 ip_v6_state_summary ip_v6_external_disable_sources ip_v6_config_managed ip_v6_snapshot_create ip_v6_snapshot_restore ip_v6_rollback_script_create ip_v6_write_runtime ip_v6_runtime_matches ip_apply_v6_state ip_source_switch_menu ip_source_switch_family ip_source_probe ip_source_policy_is_simple ip_source_default_iface ip_source_current ip_source_addresses ip_source_default_route ip_route_token ip_source_route_replace ip_source_route_restore ip_source_safety_arm ip_address_valid ip_source_verify caddy_menu caddy_site_records caddy_site_count caddy_managed_site_count caddy_site_address_parse caddy_backend_valid caddy_webroot_valid caddy_redirect_target_valid caddy_release_checksum_verify caddy_render_proxy_site caddy_render_static_site caddy_render_redirect_site caddy_render_php_site caddy_apply_managed_site caddy_delete_site nft_menu \
     nft_refresh_domain_targets nft_refresh_timer_status nft_refresh_timer_enable nft_refresh_timer_disable \
     system_toolbox_menu \
-    resource_health_check system_update_manager system_hostname_apply config_backup_create config_path_allowed safety_timer_pending safety_rollback_now self_update docker_menu change_port; do
+    resource_health_check system_update_manager system_hostname_apply config_backup_create config_path_allowed safety_timer_pending safety_rollback_now self_update docker_menu change_port \
+    restore_backup_or_remove atomic_replace_file \
+    safety_launch_timer safety_stop_timer_process cancel_safety_timer safety_confirm \
+    txn_lock_acquire txn_lock_release txn_record_begin txn_record_end txn_record_field \
+    txn_record_state txn_record_state_label txn_pending_records txn_review_menu rollback_center_menu; do
     declare -F "$fn" >/dev/null || { echo "Missing function: $fn" >&2; exit 1; }
 done
 
@@ -725,7 +733,24 @@ BANNER_COMPACT=$(COLUMNS=60 NO_COLOR=1 quench_art_banner)
 [[ "$BANNER_COMPACT" = *'██████╗ ██╗   ██╗███████╗'* && "$BANNER_COMPACT" = *'╚══▀▀═╝'* ]] || { echo "Compact QUENCH banner is missing" >&2; exit 1; }
 [[ "$(COLUMNS=40 NO_COLOR=1 quench_art_banner)" = *'QUENCH'* ]] || { echo "Narrow QUENCH banner fallback is missing" >&2; exit 1; }
 [[ "$(app_header_line)" = *'VPS INIT/MANAGEMENT TOOLS  ·  V0.1.0  ·  Boyang'* ]] || { echo "QUENCH header line is wrong" >&2; exit 1; }
-[[ "$SCRIPT_URL" = 'https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/heads/main/vps-quench.sh' ]] || { echo "Self-update script URL points outside vps-quench" >&2; exit 1; }
+
+# Column widths drive every box, menu and dashboard row. They must be right without
+# python3, which Alpine and OpenWrt routinely lack.
+[ "$(vis_len '用户管理')" = 8 ] || { echo "CJK width is wrong" >&2; exit 1; }
+[ "$(vis_len 'abc')" = 3 ] || { echo "ASCII width is wrong" >&2; exit 1; }
+[ "$(vis_len '')" = 0 ] || { echo "Empty string width is wrong" >&2; exit 1; }
+[ "$(vis_len '1  Fail2ban 管理')" = 16 ] || { echo "Mixed CJK/ASCII width is wrong" >&2; exit 1; }
+[ "$(vis_len '中英mix混排')" = 11 ] || { echo "Interleaved CJK/ASCII width is wrong" >&2; exit 1; }
+[ "$(vis_len '带全角标点：，（）')" = 18 ] || { echo "Fullwidth punctuation width is wrong" >&2; exit 1; }
+# Geometric shapes and box drawing are ambiguous-width: one column, not two.
+[ "$(vis_len '●  用户  3')" = 10 ] || { echo "Ambiguous-width symbol counted as wide" >&2; exit 1; }
+! grep -q 'python3' <(sed -n '/^vis_len() {/,/^}/p' "$ROOT/src/lib/core.sh") \
+    || { echo "vis_len still shells out to python3" >&2; exit 1; }
+# The dashboard reads three sshd keys through $(...), so the cache has to be primed
+# in the parent shell; a bare reset there silently restores three forks per redraw.
+grep -q 'sshd_effective_reload' <(sed -n '/^main_menu() {/,/^}/p' "$ROOT/src/modules/main.sh") \
+    || { echo "main_menu no longer primes the sshd cache in the parent shell" >&2; exit 1; }
+[[ "$QUENCH_MANIFEST_URL" = 'https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/heads/main/vps-quench.manifest.json' ]] || { echo "Update-check manifest URL points outside vps-quench" >&2; exit 1; }
 [[ "$GITHUB_REF_URL" = 'https://api.github.com/repos/boyang-hu/vps-quench/git/ref/heads/main' ]] || { echo "Self-update GitHub API URL points outside vps-quench" >&2; exit 1; }
 
 for fn in bbr_preflight bbr_runtime_snapshot bbr_ensure_baseline bbr_restore_runtime_snapshot bbr_restore_initial_baseline bbr_baseline_value bbr_config_has_key bbr_config_value \

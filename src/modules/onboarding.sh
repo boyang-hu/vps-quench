@@ -222,7 +222,7 @@ first_run_ssh_baseline_apply() {
         return 0
     fi
     backup_config || { rm -f "$CANDIDATE"; return 1; }
-    if ! cp "$CANDIDATE" "$SSHD_CONFIG"; then
+    if ! atomic_replace_file "$CANDIDATE" "$SSHD_CONFIG"; then
         rm -f "$CANDIDATE"
         error "SSH 配置写入失败"
         return 1

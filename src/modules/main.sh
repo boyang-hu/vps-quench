@@ -2,10 +2,14 @@
 #  Quench 主菜单与命令行入口
 # ══════════════════════════════════════════════════════════
 # ── 后台版本检测 ────────────────────────────────────────
+# 只为读一行版本号而下载整份 700KB 脚本太浪费，而且每次启动都做。
+# build.sh 会同步生成 vps-quench.manifest.json（几百字节，带 version 字段），
+# 改读它即可。拉不到就直接跳过：这只是个提示，真正的更新走 self_update，
+# 那条路径仍然锁定 commit 并校验 SHA256。
 self_check_update() {
     local REMOTE_VER CUR_VER HINT_DIR HINT_STAGE
-    REMOTE_VER=$(curl -fsSL --max-time 5 "$SCRIPT_URL" 2>/dev/null \
-        | sed -nE 's/^APP_VERSION="(V[0-9]+[.][0-9]+([.][0-9]+)?)".*/\1/p' \
+    REMOTE_VER=$(curl -fsSL --max-time 5 "$QUENCH_MANIFEST_URL" 2>/dev/null \
+        | sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"(V[0-9]+[.][0-9]+([.][0-9]+)?)".*/\1/p' \
         | head -1)
     [ -z "$REMOTE_VER" ] && return
     CUR_VER=$(sed -nE 's/^APP_VERSION="(V[0-9]+[.][0-9]+([.][0-9]+)?)".*/\1/p' "$0" 2>/dev/null \
@@ -61,6 +65,9 @@ EOF
 
 main_menu() {
     while true; do
+        # 每轮在父 shell 里读一次真实状态；本轮内的多次 get_config（都是命令
+        # 替换、跑在子 shell 里）继承这份已装载的缓存，不再各自 fork sshd -T。
+        sshd_effective_reload
         local CUR_PORT CUR_PWD CUR_PUBKEY USER_TOTAL ADMIN_TOTAL
         CUR_PORT=$(get_config "Port")
         CUR_PWD=$(get_config "PasswordAuthentication")
@@ -300,6 +307,8 @@ case "${1:-}" in
 esac
 
 self_check_first_run
+# 终端 resize 后让宽度缓存失效，否则布局会停在旧宽度上。
+trap ui_invalidate_dimensions WINCH
 # 后台检测新版本（不阻塞主菜单）
 self_check_update &
 main_menu

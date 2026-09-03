@@ -113,8 +113,16 @@ generate_key() {
     read -rp "  输入密钥备注（如 mypc@home，直接回车跳过）: " KEY_COMMENT
     KEY_COMMENT="${KEY_COMMENT:-ssh-key-$(date +%Y%m%d)}"
 
-    local TMP_DIR KEY_FILE
-    TMP_DIR=$(mktemp -d 2>/dev/null || { mkdir -p "/tmp/quench_tmp_$$" && echo "/tmp/quench_tmp_$$"; })
+    local TMP_DIR KEY_FILE OLD_UMASK
+    # 私钥只允许落在 mktemp -d 创建的 0700 目录里。
+    # 可预测的 /tmp/quench_tmp_$$ 兜底会让本机攻击者预建目录并读走私钥，故不再保留。
+    OLD_UMASK=$(umask)
+    umask 077
+    if ! TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/quench-keygen.XXXXXX"); then
+        umask "$OLD_UMASK"
+        error "无法创建安全的临时目录，已中止密钥生成。"
+        return 1
+    fi
     KEY_FILE="$TMP_DIR/id_${KEY_TYPE}"
 
     echo ""
@@ -122,7 +130,7 @@ generate_key() {
 
     # shellcheck disable=SC2086 # KEY_BITS intentionally expands to "-b 4096" for RSA only.
     if ! ssh-keygen -t "$KEY_TYPE" $KEY_BITS -C "$KEY_COMMENT" -f "$KEY_FILE" -N "" -q 2>/dev/null; then
-        error "密钥生成失败。"; rm -rf "$TMP_DIR"; return
+        error "密钥生成失败。"; rm -rf "$TMP_DIR"; umask "$OLD_UMASK"; return 1
     fi
 
     local PUBKEY PRIVKEY FINGER
@@ -172,11 +180,12 @@ generate_key() {
     fi
 
     rm -rf "$TMP_DIR"
+    umask "$OLD_UMASK"
 }
 
 ssh_restore_last_backup() {
     [ -n "${LAST_SSHD_BACKUP:-}" ] && [ -f "$LAST_SSHD_BACKUP" ] || return 1
-    cp "$LAST_SSHD_BACKUP" "$SSHD_CONFIG" || return 1
+    atomic_replace_file "$LAST_SSHD_BACKUP" "$SSHD_CONFIG" || return 1
     restart_ssh >/dev/null 2>&1 || true
 }
 
@@ -194,7 +203,7 @@ ssh_apply_policy() {
     fi
     backup_config
     safety_arm ssh_login || { rm -f "$CANDIDATE"; return 1; }
-    if ! cp "$CANDIDATE" "$SSHD_CONFIG"; then
+    if ! atomic_replace_file "$CANDIDATE" "$SSHD_CONFIG"; then
         rm -f "$CANDIDATE"; cancel_safety_timer; error "SSH 配置写入失败"; return 1
     fi
     rm -f "$CANDIDATE"
@@ -330,7 +339,7 @@ ssh_apply_ports() {
         rm -f "$CANDIDATE"; warn "已取消，配置未修改"; return 1
     fi
     backup_config
-    if ! cp "$CANDIDATE" "$SSHD_CONFIG"; then
+    if ! atomic_replace_file "$CANDIDATE" "$SSHD_CONFIG"; then
         rm -f "$CANDIDATE"; error "SSH 配置写入失败"; return 1
     fi
     rm -f "$CANDIDATE"
@@ -380,12 +389,11 @@ ssh_sync_fail2ban_ports() {
         FAILED=true
     fi
     if [ "$FAILED" = true ]; then
-        [ "$EXISTED" = yes ] && cp "$BACKUP" "$JAIL_FILE" || rm -f "$JAIL_FILE"
+        restore_backup_or_remove "$BACKUP" "$JAIL_FILE" "$EXISTED" || return 1
         if [ "$WAS_RUNNING" = running ]; then
             restart_fail2ban >/dev/null 2>&1 && f2b_runtime_healthy \
                 || warn "Fail2ban 原配置恢复后仍未正常运行，请立即检查服务"
         fi
-        rm -f "$BACKUP"
         warn "Fail2ban 端口同步或 sshd jail 验证失败，已恢复原配置"
         return 1
     fi

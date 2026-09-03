@@ -83,6 +83,103 @@ systemd_available() {
     command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
 }
 
+# ── 防断联回滚计时器：启动与句柄 ──────────────────────────
+# 计时器必须活过“当前登录会话消失”，那正是它存在的唯一理由。
+# nohup 只让进程忽略 SIGHUP；systemd-logind 在 KillUserProcesses=yes 时
+# 是按会话 cgroup 整片回收的，非 root 用户 sudo 进来时连 root 进程一起带走
+# （KillExcludeUsers 默认只排除 root 自己登录的会话）。
+# setsid 只改 POSIX 会话、不改 cgroup 归属，挡不住这种回收，因此不作为修复手段；
+# 且 `setsid cmd &` 的 $! 可能是 setsid 自身的 PID，会破坏取消逻辑。
+# 所以：systemd 环境交给 system 级 transient unit（落在 system.slice 自己的
+# cgroup 里，与登录会话无关）；非 systemd 环境没有 logind，nohup 已经足够。
+SAFETY_PID=""
+SAFETY_SCRIPT=""
+SAFETY_UNIT=""
+
+# ── 配置变更事务锁 ────────────────────────────────────────
+# 两个 Quench 会话同时改 sshd_config / 防火墙会互相覆盖，而且各自的防断联
+# 计时器会回滚掉对方的快照。所有走 safety_arm 的高危变更共用这一把锁。
+# 只在“变更事务”期间持有：只读菜单、状态刷新、后台版本检测都不受影响。
+# 用固定 fd 9：bash 3.2 不支持 exec {VAR}>，而本脚本要兼容老 bash。
+# 同一进程重复进入直接复用（Quench 同时只维护一笔事务，不存在真正的嵌套）。
+QUENCH_TXN_LOCK_FILE="${QUENCH_TXN_LOCK_FILE:-/run/lock/quench-config.lock}"
+QUENCH_TXN_LOCK_HELD=0
+
+txn_lock_acquire() {
+    # 系统没有 flock 时退化为不加锁：宁可失去互斥，也不能让高危变更无法进行。
+    command -v flock >/dev/null 2>&1 || return 0
+    [ "$QUENCH_TXN_LOCK_HELD" = 1 ] && return 0
+    mkdir -p "$(dirname "$QUENCH_TXN_LOCK_FILE")" 2>/dev/null || true
+    exec 9>"$QUENCH_TXN_LOCK_FILE" 2>/dev/null || return 0
+    if ! flock -w "${QUENCH_TXN_LOCK_WAIT:-10}" 9 2>/dev/null; then
+        exec 9>&-
+        error "另一个 Quench 会话正在修改配置，请等它结束后重试"
+        return 1
+    fi
+    QUENCH_TXN_LOCK_HELD=1
+}
+
+txn_lock_release() {
+    [ "$QUENCH_TXN_LOCK_HELD" = 1 ] || return 0
+    flock -u 9 2>/dev/null || true
+    exec 9>&-
+    QUENCH_TXN_LOCK_HELD=0
+}
+
+# ── 事务记录（只写盘，不打扰）──────────────────────────────
+# 崩溃或断线的会话不会留下任何进程内线索，新进程也就看不见它布下的回滚计时器。
+# 这里把事务落到磁盘，供“回滚中心 → 检查未完成的变更”事后查看。
+# 启动时不扫描、不提示、不自动删除任何回滚脚本：那些脚本可能仍会正常触发。
+# 记录失败一律不影响事务本身——它是诊断信息，不是安全前提。
+QUENCH_TXN_DIR="${QUENCH_TXN_DIR:-$QUENCH_DATA_DIR/transactions}"
+QUENCH_TXN_FILE=""
+
+txn_record_begin() {
+    local LABEL="$1" SCRIPT="$2"
+    mkdir -p "$QUENCH_TXN_DIR" 2>/dev/null || return 0
+    chmod 700 "$QUENCH_TXN_DIR" 2>/dev/null || true
+    QUENCH_TXN_FILE="$QUENCH_TXN_DIR/$$-$(date +%s)-${RANDOM}.txn"
+    {
+        printf 'LABEL=%s\n' "$LABEL"
+        printf 'SCRIPT=%s\n' "$SCRIPT"
+        printf 'UNIT=%s\n' "${SAFETY_UNIT:-}"
+        printf 'TIMER_PID=%s\n' "${SAFETY_PID:-}"
+        printf 'QUENCH_PID=%s\n' "$$"
+        printf 'STARTED=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$QUENCH_TXN_FILE" 2>/dev/null || { QUENCH_TXN_FILE=""; return 0; }
+    chmod 600 "$QUENCH_TXN_FILE" 2>/dev/null || true
+}
+
+txn_record_end() {
+    [ -n "${QUENCH_TXN_FILE:-}" ] || return 0
+    rm -f "$QUENCH_TXN_FILE" 2>/dev/null || true
+    QUENCH_TXN_FILE=""
+}
+
+txn_record_field() {
+    sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1
+}
+
+safety_launch_timer() {
+    local SCRIPT="$1" UNIT
+    SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+    [ -f "$SCRIPT" ] || return 1
+    if systemd_available && command -v systemd-run >/dev/null 2>&1; then
+        UNIT="quench-rollback-$$-$(date +%s)-${RANDOM}"
+        # --collect 需要 systemd 236+，不支持时退回不带该参数的写法。
+        if systemd-run --quiet --collect --unit="$UNIT" /bin/bash "$SCRIPT" >/dev/null 2>&1 \
+            || systemd-run --quiet --unit="$UNIT" /bin/bash "$SCRIPT" >/dev/null 2>&1; then
+            SAFETY_UNIT="$UNIT"
+            SAFETY_SCRIPT="$SCRIPT"
+            return 0
+        fi
+        warn "systemd-run 启动失败，回退到 nohup；若登录会话被 logind 回收，自动回滚可能不会执行"
+    fi
+    nohup bash "$SCRIPT" >/dev/null 2>&1 &
+    SAFETY_PID=$!
+    SAFETY_SCRIPT="$SCRIPT"
+}
+
 # 主菜单品牌字幅
 quench_art_banner() {
     ui_refresh_dimensions
@@ -104,13 +201,39 @@ BANNER_WIDE_EOF
     printf '%s' "${NC}"
 }
 
-# ── 可见宽度计算（用 python3，中文=2，ASCII=1）────────────
+# ── 可见宽度计算（纯 bash，中文=2，ASCII=1）────────────────
+# 原来每次调用起一个 python3；一屏菜单调 14 次，低配 VPS 上要一两秒。
+# 而 Alpine / OpenWrt 常常没有 python3，旧的退化分支 ${#1} 把中文按 1 列算，
+# 整个界面会错位 —— 恰恰是本脚本主打支持的系统。
+#
+# 这里按 UTF-8 首字节分段判宽，不需要码点（bash 3.2 的 printf %d "'c"
+# 只给首字节而非码点），也不需要 awk 的多字节支持：
+#   <0x80        ASCII                      宽 1
+#   0x80-0xBF    UTF-8 续字节                宽 0（仅在非 UTF-8 locale 按字节
+#                                           遍历时出现，这样两种模式结果一致）
+#   0xC2-0xE2    拉丁/希腊/西里尔、符号、制表、几何图形   宽 1
+#   0xE3-0xED    CJK 标点、假名、汉字、谚文    宽 2
+#   0xEE         私用区                      宽 1
+#   0xEF         全角标点（，：（）等）        宽 2
+#   >=0xF0       四字节（emoji 等）            宽 2
+# 已知近似：BMP 内的 emoji（0xE2 段）和阿拉伯表现形式（0xEF 段）会各差 1 列。
+# 对本脚本实际用到的字符集（ASCII + 汉字 + 全角标点 + ● ✓ ◆ › ━ ─ ×）结果精确。
 vis_len() {
-    python3 -c "
-import unicodedata, sys
-s = sys.argv[1]
-print(sum(2 if unicodedata.east_asian_width(c) in ('W','F') else 1 for c in s))
-" "$1" 2>/dev/null || echo "${#1}"
+    local TEXT="$1" LEN=0 I CH B
+    for ((I=0; I<${#TEXT}; I++)); do
+        CH="${TEXT:I:1}"
+        printf -v B '%d' "'$CH" 2>/dev/null || B=63
+        B=$(( B & 255 ))
+        if [ "$B" -lt 128 ]; then LEN=$((LEN + 1))
+        elif [ "$B" -le 191 ]; then :
+        elif [ "$B" -le 226 ]; then LEN=$((LEN + 1))
+        elif [ "$B" -le 237 ]; then LEN=$((LEN + 2))
+        elif [ "$B" -eq 238 ]; then LEN=$((LEN + 1))
+        elif [ "$B" -eq 239 ]; then LEN=$((LEN + 2))
+        else LEN=$((LEN + 2))
+        fi
+    done
+    printf '%s\n' "$LEN"
 }
 
 # ── 响应式终端布局 ────────────────────────────────────────
@@ -120,11 +243,25 @@ APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
 APP_VERSION="V0.1.0"
 APP_AUTHOR="Boyang"
 
+# 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、
+# 再 fork 一个 tput 取宽度。宽度在两次 SIGWINCH 之间不会变，缓存即可。
+QUENCH_COLS_CACHE=""
+
+ui_invalidate_dimensions() { QUENCH_COLS_CACHE=""; }
+
 ui_refresh_dimensions() {
     local COLS="${COLUMNS:-}"
-    if ! echo "$COLS" | grep -qE '^[0-9]+$'; then
-        COLS=$(tput cols 2>/dev/null || echo 80)
-    fi
+    # COLUMNS 可用就直接用：读变量不 fork，而且调用方（含测试）可以逐次改它。
+    # 只有 COLUMNS 不可用时才退回 tput，并把那次结果缓存到下一个 SIGWINCH。
+    case "$COLS" in
+        ''|*[!0-9]*)
+            if [ -z "$QUENCH_COLS_CACHE" ]; then
+                QUENCH_COLS_CACHE=$(tput cols 2>/dev/null || echo 80)
+                case "$QUENCH_COLS_CACHE" in ''|*[!0-9]*) QUENCH_COLS_CACHE=80 ;; esac
+            fi
+            COLS="$QUENCH_COLS_CACHE"
+            ;;
+    esac
     [ "$COLS" -gt 76 ] && COLS=76
     [ "$COLS" -lt 36 ] && COLS=36
     BOX_W=$COLS
@@ -305,6 +442,7 @@ print_header() {
 # 替代 grep -oE 'initcwnd [0-9]+' | awk '{print $2}'
 # 检测服务管理器并重启 SSH
 restart_ssh() {
+    sshd_effective_reset
     if systemd_available; then
         systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
     elif command -v rc-service &>/dev/null; then
@@ -516,11 +654,37 @@ if [ "$EUID" -ne 0 ] && [ "${QUENCH_TEST_MODE:-0}" != "1" ] && [ "${1:-}" != "--
 fi
 
 # ── 通用工具函数 ──────────────────────────────────────────
+# sshd -T 每次都要解析整份配置，是主菜单最贵的一次 fork，而一屏要问三次
+# （Port / PasswordAuthentication / PubkeyAuthentication）。缓存整份输出，
+# 在改写 sshd_config（restart_ssh）和每轮主菜单开头失效即可。
+QUENCH_SSHD_EFFECTIVE_CACHE=""
+QUENCH_SSHD_CACHE_LOADED=0
+
+sshd_effective_reset() {
+    QUENCH_SSHD_EFFECTIVE_CACHE=""
+    QUENCH_SSHD_CACHE_LOADED=0
+}
+
+# 调用方几乎都是 VALUE=$(get_config X) 这种命令替换，子 shell 里填好的缓存
+# 出了子 shell 就没了。所以热路径必须在父 shell 里先装载一次，之后的子 shell
+# 才能继承到已填好的变量、直接命中。
+sshd_effective_reload() {
+    QUENCH_SSHD_EFFECTIVE_CACHE=""
+    QUENCH_SSHD_CACHE_LOADED=1
+    command -v sshd >/dev/null 2>&1 || return 0
+    QUENCH_SSHD_EFFECTIVE_CACHE=$(sshd -T 2>/dev/null || true)
+}
+
 sshd_effective_value() {
-    local KEY="$1" WANT VALUE
+    local KEY="$1" VALUE
     command -v sshd >/dev/null 2>&1 || return 1
-    WANT=$(printf '%s' "$KEY" | tr '[:upper:]' '[:lower:]')
-    VALUE=$(sshd -T 2>/dev/null | awk -v k="$WANT" '$1 == k {print $2; exit}')
+    if [ "$QUENCH_SSHD_CACHE_LOADED" != 1 ]; then
+        QUENCH_SSHD_EFFECTIVE_CACHE=$(sshd -T 2>/dev/null || true)
+        QUENCH_SSHD_CACHE_LOADED=1
+    fi
+    [ -n "$QUENCH_SSHD_EFFECTIVE_CACHE" ] || return 1
+    VALUE=$(printf '%s\n' "$QUENCH_SSHD_EFFECTIVE_CACHE" \
+        | awk -v k="$KEY" 'tolower($1) == tolower(k) {print $2; exit}')
     [ -n "$VALUE" ] || return 1
     printf '%s\n' "$VALUE"
 }
@@ -613,6 +777,58 @@ set_config() {
     set_config_file "$SSHD_CONFIG" "$1" "$2"
 }
 
+# 回滚被 Quench 覆盖的配置文件，并接管备份文件的生命周期。
+# EXISTED != yes 表示改动前本就没有该文件，删掉新写入的内容即可。
+# 恢复失败时保留备份并明确告警，绝不因为 cp 失败而删掉用户原有配置。
+restore_backup_or_remove() {
+    local BACKUP="$1" TARGET="$2" EXISTED="$3"
+    if [ "$EXISTED" != yes ]; then
+        rm -f "$TARGET" "$BACKUP"
+        return 0
+    fi
+    if cp "$BACKUP" "$TARGET"; then
+        rm -f "$BACKUP"
+        return 0
+    fi
+    error "无法恢复 ${TARGET}，已保留备份：${BACKUP}"
+    error "请立即手动执行：cp ${BACKUP} ${TARGET}"
+    return 1
+}
+
+# 用同目录临时文件 + rename 原子替换目标文件。
+# 直接 cp 覆盖活配置时，写到一半失败会留下被截断的文件（把 sshd_config 写坏 = 断联）；
+# rename(2) 保证目标在任何时刻要么是旧内容、要么是新内容。
+# 临时文件必须与目标同目录：跨文件系统的 mv 会退化成 copy+unlink，重新引入非原子窗口。
+# rename 会换掉 inode，所以显式沿用目标原有权限与属主；目标不存在时用 DEFAULT_MODE。
+# 已知不保留：ACL 与 xattr；SELinux 上下文靠 restorecon 尽力恢复。
+atomic_replace_file() {
+    local SOURCE="$1" TARGET="$2" DEFAULT_MODE="${3:-0644}" DIR TMP MODE OWNER
+    [ -f "$SOURCE" ] || return 1
+    DIR=$(dirname "$TARGET")
+    mkdir -p "$DIR" || return 1
+    TMP=$(mktemp "$DIR/.quench-stage.XXXXXX") || return 1
+    if ! cat "$SOURCE" > "$TMP"; then
+        rm -f "$TMP"
+        return 1
+    fi
+    if [ -e "$TARGET" ]; then
+        MODE=$(stat -c '%a' "$TARGET" 2>/dev/null || stat -f '%Lp' "$TARGET" 2>/dev/null || true)
+        OWNER=$(stat -c '%u:%g' "$TARGET" 2>/dev/null || stat -f '%u:%g' "$TARGET" 2>/dev/null || true)
+    fi
+    chmod "${MODE:-$DEFAULT_MODE}" "$TMP" 2>/dev/null || true
+    if [ -n "${OWNER:-}" ]; then
+        chown "$OWNER" "$TMP" 2>/dev/null || true
+    fi
+    if ! mv "$TMP" "$TARGET"; then
+        rm -f "$TMP"
+        return 1
+    fi
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon "$TARGET" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 backup_config() {
     local BACKUP
     BACKUP="$SSHD_CONFIG.bak.$(date +%Y%m%d_%H%M%S)"
@@ -625,7 +841,10 @@ apply_and_restart() {
     # 失败时自动回滚到最近备份，避免把自己锁在外面
     _ssh_rollback() {
         if [ -n "${LAST_SSHD_BACKUP:-}" ] && [ -f "$LAST_SSHD_BACKUP" ]; then
-            cp "$LAST_SSHD_BACKUP" "$SSHD_CONFIG" 2>/dev/null
+            if ! atomic_replace_file "$LAST_SSHD_BACKUP" "$SSHD_CONFIG"; then
+                error "回滚写入失败，sshd_config 保持原样，请立即手动恢复备份：$LAST_SSHD_BACKUP"
+                return 1
+            fi
             warn "已回滚 sshd_config 到备份：$LAST_SSHD_BACKUP"
             if sshd -t 2>/dev/null && restart_ssh; then
                 info "已用备份配置恢复 SSH 服务 ✓"

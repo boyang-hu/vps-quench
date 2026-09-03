@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# 断言各自用 <<< / < file 提供输入；脚本级 stdin 必须处于 EOF。
+# 否则 fw_install 等会走到交互 read 上无限期阻塞且不输出任何信息
+# （CI 的 stdin 是 /dev/null，所以这个坑一直没暴露）。
+exec < /dev/null
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d)
@@ -125,6 +129,39 @@ docker_compose_url_valid 'https://example.com/path/app.yml?token=1' \
     || { echo "Insecure Compose URL was accepted" >&2; exit 1; }
 ! docker_compose_url_valid 'https://user:secret@example.com/app.yml' \
     || { echo "Credential-bearing Compose URL was accepted" >&2; exit 1; }
+
+# Atomic replacement must preserve the target mode, and must leave the target
+# untouched when staging fails instead of truncating it like a plain cp would.
+(
+    ATOMIC_DIR="$TMP/atomic"
+    mkdir -p "$ATOMIC_DIR"
+    printf 'new\n' > "$ATOMIC_DIR/source"
+    printf 'old\n' > "$ATOMIC_DIR/target"
+    chmod 644 "$ATOMIC_DIR/target"
+    atomic_replace_file "$ATOMIC_DIR/source" "$ATOMIC_DIR/target" \
+        || { echo "Atomic replace failed on a writable target" >&2; exit 1; }
+    grep -qx new "$ATOMIC_DIR/target" \
+        || { echo "Atomic replace did not write the new content" >&2; exit 1; }
+    ATOMIC_MODE=$(stat -c '%a' "$ATOMIC_DIR/target" 2>/dev/null || stat -f '%Lp' "$ATOMIC_DIR/target")
+    [ "$ATOMIC_MODE" = 644 ] \
+        || { echo "Atomic replace leaked the staging mode onto the target: $ATOMIC_MODE" >&2; exit 1; }
+
+    ATOMIC_RO="$ATOMIC_DIR/ro"
+    mkdir -p "$ATOMIC_RO"
+    printf 'keep\n' > "$ATOMIC_RO/target"
+    chmod 500 "$ATOMIC_RO"
+    ATOMIC_RC=0
+    atomic_replace_file "$ATOMIC_DIR/source" "$ATOMIC_RO/target" >/dev/null 2>&1 || ATOMIC_RC=$?
+    chmod 700 "$ATOMIC_RO"
+    [ "$ATOMIC_RC" -ne 0 ] \
+        || { echo "Atomic replace reported success on an unwritable directory" >&2; exit 1; }
+    grep -qx keep "$ATOMIC_RO/target" \
+        || { echo "A failed atomic replace damaged the target file" >&2; exit 1; }
+    if find "$ATOMIC_DIR" -name '.quench-stage.*' 2>/dev/null | grep -q .; then
+        echo "Atomic replace left a staging file behind" >&2
+        exit 1
+    fi
+)
 
 # A broken sshd validation must restore the previous configuration.
 SSHD_CONFIG="$TMP/sshd_config"
@@ -1169,6 +1206,194 @@ self_reconcile_tc_after_update >/dev/null \
         || { echo "NFT partial add lost old firewall ownership" >&2; exit 1; }
     grep -qxF "$NEW1" "$NFT_FIREWALL_STATE" \
         || { echo "NFT orphaned a partially added firewall rule" >&2; exit 1; }
+)
+
+# The rollback timer must outlive the login session: under systemd it has to run as a
+# system-level transient unit, because nohup does not survive a logind session sweep.
+(
+    TIMER_DIR="$TMP/safety-timer"
+    mkdir -p "$TIMER_DIR"
+    TIMER_SCRIPT="$TIMER_DIR/rollback.sh"
+    RUN_LOG="$TIMER_DIR/systemd-run.log"
+    RUN_CALLS=0
+    printf '#!/bin/bash\nsleep 5\n' > "$TIMER_SCRIPT"
+    chmod 700 "$TIMER_SCRIPT"
+
+    # shellcheck disable=SC2329 # test stub overrides the sourced function
+    systemd_available() { return 0; }
+    # shellcheck disable=SC2329 # test stub stands in for the systemd-run binary
+    systemd-run() { RUN_CALLS=$((RUN_CALLS + 1)); printf '%s\n' "$*" >> "$RUN_LOG"; return 0; }
+
+    safety_launch_timer "$TIMER_SCRIPT" >/dev/null 2>&1 \
+        || { echo "Timer launch failed while systemd was available" >&2; exit 1; }
+    [ -n "$SAFETY_UNIT" ] \
+        || { echo "Timer did not register a transient unit under systemd" >&2; exit 1; }
+    [ -z "$SAFETY_PID" ] \
+        || { echo "Timer kept a session-bound background PID under systemd" >&2; exit 1; }
+    grep -q -- "--unit=$SAFETY_UNIT" "$RUN_LOG" \
+        || { echo "systemd-run was not asked for the registered unit" >&2; exit 1; }
+
+    # Older systemd rejects --collect; the launcher must retry without it, not fall back.
+    RUN_CALLS=0
+    : > "$RUN_LOG"
+    # shellcheck disable=SC2329 # test stub stands in for the systemd-run binary
+    systemd-run() {
+        RUN_CALLS=$((RUN_CALLS + 1))
+        printf '%s\n' "$*" >> "$RUN_LOG"
+        case "$*" in *--collect*) return 1 ;; esac
+        return 0
+    }
+    safety_launch_timer "$TIMER_SCRIPT" >/dev/null 2>&1 \
+        || { echo "Timer launch failed when --collect was unsupported" >&2; exit 1; }
+    [ "$RUN_CALLS" = 2 ] \
+        || { echo "Launcher did not retry systemd-run without --collect: $RUN_CALLS" >&2; exit 1; }
+    [ -n "$SAFETY_UNIT" ] \
+        || { echo "Launcher gave up on systemd instead of retrying" >&2; exit 1; }
+
+    # A unit-backed timer must be cancelled through systemctl rather than kill.
+    SYSTEMCTL_LOG="$TIMER_DIR/systemctl.log"
+    # shellcheck disable=SC2329 # test stub stands in for the systemctl binary
+    systemctl() { printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"; return 0; }
+    SAFETY_UNIT=quench-rollback-test
+    SAFETY_PID=""
+    SAFETY_SCRIPT="$TIMER_SCRIPT"
+    cancel_safety_timer
+    grep -qx 'stop quench-rollback-test' "$SYSTEMCTL_LOG" \
+        || { echo "Unit-backed timer was not stopped through systemctl" >&2; exit 1; }
+    [ ! -e "$TIMER_SCRIPT" ] \
+        || { echo "Cancelled timer left its rollback script behind" >&2; exit 1; }
+    [ -z "$SAFETY_UNIT" ] \
+        || { echo "Cancelled timer kept a stale unit handle" >&2; exit 1; }
+
+    # Without systemd there is no logind sweep to defend against, so nohup stays.
+    printf '#!/bin/bash\nsleep 5\n' > "$TIMER_SCRIPT"
+    chmod 700 "$TIMER_SCRIPT"
+    # shellcheck disable=SC2329 # test stub overrides the sourced function
+    systemd_available() { return 1; }
+    safety_launch_timer "$TIMER_SCRIPT" >/dev/null 2>&1 \
+        || { echo "Timer launch failed without systemd" >&2; exit 1; }
+    [ -n "$SAFETY_PID" ] \
+        || { echo "Non-systemd launch did not record a background PID" >&2; exit 1; }
+    [ -z "$SAFETY_UNIT" ] \
+        || { echo "Non-systemd launch invented a transient unit" >&2; exit 1; }
+    kill "$SAFETY_PID" 2>/dev/null || true
+    wait "$SAFETY_PID" 2>/dev/null || true
+)
+
+# Config changes must be mutually exclusive across sessions, and a failed arm must
+# never leave the lock behind — a leaked lock would wedge every later change.
+(
+    QUENCH_TXN_LOCK_FILE="$TMP/txn/quench-config.lock"
+    mkdir -p "$TMP/txn"
+    FLOCK_RC=0
+    FLOCK_CALLS=0
+    # shellcheck disable=SC2329 # test stub stands in for the flock binary
+    flock() {
+        case "${1:-}" in -u) return 0 ;; esac
+        FLOCK_CALLS=$((FLOCK_CALLS + 1))
+        return "$FLOCK_RC"
+    }
+
+    QUENCH_TXN_LOCK_HELD=0
+    txn_lock_acquire || { echo "Lock acquire failed while the lock was free" >&2; exit 1; }
+    [ "$QUENCH_TXN_LOCK_HELD" = 1 ] || { echo "Acquired lock was not marked held" >&2; exit 1; }
+    [ "$FLOCK_CALLS" = 1 ] || { echo "Acquire did not call flock exactly once" >&2; exit 1; }
+
+    txn_lock_acquire || { echo "Re-entrant acquire failed in the same process" >&2; exit 1; }
+    [ "$FLOCK_CALLS" = 1 ] || { echo "Re-entrant acquire tried to take the lock again" >&2; exit 1; }
+
+    txn_lock_release
+    [ "$QUENCH_TXN_LOCK_HELD" = 0 ] || { echo "Lock stayed held after release" >&2; exit 1; }
+
+    FLOCK_RC=1
+    ! txn_lock_acquire >/dev/null 2>&1 \
+        || { echo "Acquire reported success while another session held the lock" >&2; exit 1; }
+    [ "$QUENCH_TXN_LOCK_HELD" = 0 ] || { echo "Busy lock left a stale held flag" >&2; exit 1; }
+
+    # Arming must give the lock back when the rollback timer cannot be started.
+    FLOCK_RC=0
+    QUENCH_TXN_LOCK_HELD=0
+    QUENCH_DATA_DIR="$TMP/txn/data"
+    QUENCH_TXN_DIR="$TMP/txn/records"
+    mkdir -p "$QUENCH_DATA_DIR"
+    # shellcheck disable=SC2329 # test stub avoids touching real system state
+    config_backup_create() { printf '%s\n' "$TMP/txn/snapshot.tar.gz"; }
+    # shellcheck disable=SC2329 # test stub forces the launch failure path
+    safety_launch_timer() { return 1; }
+    : > "$TMP/txn/snapshot.tar.gz"
+    safety_arm lock_release_probe >/dev/null 2>&1 \
+        && { echo "safety_arm succeeded despite a failed timer launch" >&2; exit 1; }
+    [ "$QUENCH_TXN_LOCK_HELD" = 0 ] \
+        || { echo "A failed safety_arm leaked the config transaction lock" >&2; exit 1; }
+)
+
+# A crashed session leaves no in-process trace, so the transaction record on disk is
+# the only way the rollback centre can surface it afterwards.
+(
+    QUENCH_TXN_DIR="$TMP/txn-records"
+    QUENCH_TXN_FILE=""
+    SAFETY_UNIT=quench-rollback-probe
+    SAFETY_PID=4242
+    TXN_SCRIPT="$TMP/txn-rollback.sh"
+    printf '#!/bin/bash\n' > "$TXN_SCRIPT"
+
+    txn_record_begin ssh_login "$TXN_SCRIPT"
+    [ -n "$QUENCH_TXN_FILE" ] && [ -f "$QUENCH_TXN_FILE" ] \
+        || { echo "Transaction record was not written" >&2; exit 1; }
+    [ "$(txn_record_field "$QUENCH_TXN_FILE" LABEL)" = ssh_login ] \
+        || { echo "Transaction record lost its label" >&2; exit 1; }
+    [ "$(txn_record_field "$QUENCH_TXN_FILE" UNIT)" = quench-rollback-probe ] \
+        || { echo "Transaction record lost the timer unit handle" >&2; exit 1; }
+    [ "$(txn_record_field "$QUENCH_TXN_FILE" QUENCH_PID)" = "$$" ] \
+        || { echo "Transaction record lost the owning pid" >&2; exit 1; }
+    TXN_MODE=$(stat -c '%a' "$QUENCH_TXN_FILE" 2>/dev/null || stat -f '%Lp' "$QUENCH_TXN_FILE")
+    [ "$TXN_MODE" = 600 ] \
+        || { echo "Transaction record is world-readable: $TXN_MODE" >&2; exit 1; }
+
+    [ "$(txn_record_state "$QUENCH_TXN_FILE")" = armed ] \
+        || { echo "A record with a live rollback script was not reported as armed" >&2; exit 1; }
+    rm -f "$TXN_SCRIPT"
+    [ "$(txn_record_state "$QUENCH_TXN_FILE")" = stale ] \
+        || { echo "A record whose rollback script is gone was not reported as stale" >&2; exit 1; }
+
+    TXN_RECORD="$QUENCH_TXN_FILE"
+    txn_record_end
+    [ ! -e "$TXN_RECORD" ] || { echo "Completed transaction left its record behind" >&2; exit 1; }
+    [ -z "$QUENCH_TXN_FILE" ] || { echo "Completed transaction kept a stale record handle" >&2; exit 1; }
+)
+
+# sshd -T reparses the whole config and the dashboard asks for three keys per redraw.
+# The cache must collapse those into one call, and must drop on any config rewrite.
+(
+    # The stub logs to a file: real callers use $(...), so a counter variable
+    # bumped inside a subshell would never be visible here.
+    SSHD_LOG="$TMP/sshd-calls.log"
+    : > "$SSHD_LOG"
+    # shellcheck disable=SC2329 # test stub stands in for the sshd binary
+    sshd() {
+        echo call >> "$SSHD_LOG"
+        printf 'port 22\npasswordauthentication no\npubkeyauthentication yes\n'
+    }
+    sshd_calls() { wc -l < "$SSHD_LOG" | tr -d '[:space:]'; }
+
+    sshd_effective_reload
+    [ "$(sshd_calls)" = 1 ] || { echo "Reload did not run sshd -T exactly once" >&2; exit 1; }
+    [ "$(sshd_effective_value Port)" = 22 ] || { echo "Cached sshd lookup lost Port" >&2; exit 1; }
+    [ "$(sshd_effective_value PasswordAuthentication)" = no ] \
+        || { echo "Cached sshd lookup lost PasswordAuthentication" >&2; exit 1; }
+    [ "$(sshd_effective_value PubkeyAuthentication)" = yes ] \
+        || { echo "Cached sshd lookup lost PubkeyAuthentication" >&2; exit 1; }
+    [ "$(sshd_calls)" = 1 ] \
+        || { echo "Subshell lookups re-ran sshd -T $(sshd_calls) times; cache is not inherited" >&2; exit 1; }
+
+    sshd_effective_reset
+    [ "$(sshd_effective_value Port)" = 22 ] || { echo "Lookup broke after a reset" >&2; exit 1; }
+    [ "$(sshd_calls)" = 2 ] \
+        || { echo "Reset did not force a fresh sshd -T: $(sshd_calls)" >&2; exit 1; }
+
+    # An unknown key must still fail rather than return a neighbouring value.
+    ! sshd_effective_value NoSuchDirective >/dev/null 2>&1 \
+        || { echo "Unknown directive returned a value" >&2; exit 1; }
 )
 
 echo "Fault injection tests passed."

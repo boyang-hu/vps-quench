@@ -213,7 +213,9 @@ user_ensure_admin_backend() {
     command -v sudo >/dev/null 2>&1 || pkg_install sudo || { error "sudo 安装失败"; return 1; }
     mkdir -p "$USER_SUDOERS_DIR" || return 1
     SUDOERS_FILE="$USER_ADMIN_SUDOERS_FILE"
-    TMP=$(mktemp) || return 1
+    # 暂存文件建在 sudoers.d 内，mv 才是同文件系统的原子 rename；
+    # 名字带点号，sudo 会忽略它，不会在替换前被当成一条生效规则读入。
+    TMP=$(mktemp "$USER_SUDOERS_DIR/.90-quench-admins.XXXXXX") || return 1
     printf '%%%s ALL=(ALL:ALL) ALL\n' "$GROUP" > "$TMP"
     chmod 440 "$TMP"
     if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$TMP" >/dev/null 2>&1; then
@@ -221,7 +223,11 @@ user_ensure_admin_backend() {
         error "sudoers 语法校验失败"
         return 1
     fi
-    mv "$TMP" "$SUDOERS_FILE"
+    if ! mv "$TMP" "$SUDOERS_FILE"; then
+        rm -f "$TMP"
+        error "sudoers 写入失败"
+        return 1
+    fi
     chmod 440 "$SUDOERS_FILE"
     printf '%s\n' "$GROUP"
 }
