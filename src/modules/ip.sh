@@ -265,44 +265,6 @@ ip_v6_snapshot_create() {
     ip_state_prune
 }
 
-ip_v6_runtime_restore() {
-    local SNAPSHOT="$1" TARGET_IFACE="$2" IFACE VALUE FILE RC=0
-    while IFS='|' read -r IFACE VALUE; do
-        [ "$IFACE" = "$TARGET_IFACE" ] || continue
-        [[ "$IFACE" =~ ^[A-Za-z0-9_.:-]+$ && "$VALUE" =~ ^[01]$ ]] || return 1
-        FILE="$IP_V6_PROC_ROOT/$IFACE/disable_ipv6"
-        if [ ! -f "$FILE" ]; then
-            case "$IFACE" in all|default) return 1 ;; *) return 0 ;; esac
-        fi
-        printf '%s\n' "$VALUE" > "$FILE" 2>/dev/null || RC=1
-    done < "$SNAPSHOT/runtime.state"
-    return "$RC"
-}
-
-ip_v6_snapshot_restore() {
-    local SNAPSHOT="$1" HAD PARENT TEMP IFACE RC=0
-    case "$SNAPSHOT" in "$IP_STATE_DIR"/*) ;; *) return 1 ;; esac
-    [ -f "$SNAPSHOT/runtime.state" ] || return 1
-    HAD=$(cat "$SNAPSHOT/had-managed" 2>/dev/null)
-    [ "$HAD" = yes ] || [ "$HAD" = no ] || return 1
-    PARENT=$(dirname "$IP_V6_SYSCTL_FILE")
-    mkdir -p "$PARENT" || return 1
-    if [ "$HAD" = yes ]; then
-        TEMP=$(mktemp "${IP_V6_SYSCTL_FILE}.restore.XXXXXX") || return 1
-        cp -a "$SNAPSHOT/managed.conf" "$TEMP" || { rm -f "$TEMP"; return 1; }
-        mv "$TEMP" "$IP_V6_SYSCTL_FILE" || { rm -f "$TEMP"; return 1; }
-    else
-        rm -f "$IP_V6_SYSCTL_FILE" || return 1
-    fi
-    ip_v6_runtime_restore "$SNAPSHOT" all || RC=1
-    ip_v6_runtime_restore "$SNAPSHOT" default || RC=1
-    while IFS='|' read -r IFACE _; do
-        case "$IFACE" in all|default) continue ;; esac
-        ip_v6_runtime_restore "$SNAPSHOT" "$IFACE" || RC=1
-    done < "$SNAPSHOT/runtime.state"
-    return "$RC"
-}
-
 ip_v6_rollback_script_create() {
     local SNAPSHOT="$1" SCRIPT="$2" DELAY="$3"
     local SNAPSHOT_Q SCRIPT_Q PROC_Q CONF_Q

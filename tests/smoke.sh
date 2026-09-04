@@ -28,7 +28,7 @@ for fn in systemd_available show_cli_help main_menu first_run_wizard first_run_r
     ts_time_health_inline ts_diagnostics ts_ntp_disable_chrony ts_ntp_disable_timesyncd ts_resolve_ntp_conflict \
     ts_wait_synchronized ts_ntp_request_backend ts_ntp_repair ts_request_sync ts_set_timezone ts_set_custom_timezone \
     ts_https_date_epoch ts_epoch_utc ts_https_fetch_epoch ts_https_consensus ts_pause_backend ts_resume_backend ts_sync_https \
-    ip_config_menu ip_show_status ip_gai_markers_valid ip_gai_strip_managed ip_gai_has_external_precedence ip_gai_render_v4 ip_gai_validate_v4 ip_gai_policy_label ip_prefer_v4 ip_prefer_v6 ip_v6_state_summary ip_v6_external_disable_sources ip_v6_config_managed ip_v6_snapshot_create ip_v6_snapshot_restore ip_v6_rollback_script_create ip_v6_write_runtime ip_v6_runtime_matches ip_apply_v6_state ip_source_switch_menu ip_source_switch_family ip_source_probe ip_source_policy_is_simple ip_source_default_iface ip_source_current ip_source_addresses ip_source_default_route ip_route_token ip_source_route_replace ip_source_route_restore ip_source_safety_arm ip_address_valid ip_source_verify caddy_menu caddy_site_records caddy_site_count caddy_managed_site_count caddy_site_address_parse caddy_backend_valid caddy_webroot_valid caddy_redirect_target_valid caddy_release_checksum_verify caddy_render_proxy_site caddy_render_static_site caddy_render_redirect_site caddy_render_php_site caddy_apply_managed_site caddy_delete_site nft_menu \
+    ip_config_menu ip_show_status ip_gai_markers_valid ip_gai_strip_managed ip_gai_has_external_precedence ip_gai_render_v4 ip_gai_validate_v4 ip_gai_policy_label ip_prefer_v4 ip_prefer_v6 ip_v6_state_summary ip_v6_external_disable_sources ip_v6_config_managed ip_v6_snapshot_create ip_v6_rollback_script_create ip_v6_write_runtime ip_v6_runtime_matches ip_apply_v6_state ip_source_switch_menu ip_source_switch_family ip_source_probe ip_source_policy_is_simple ip_source_default_iface ip_source_current ip_source_addresses ip_source_default_route ip_route_token ip_source_route_replace ip_source_route_restore ip_source_safety_arm ip_address_valid ip_source_verify caddy_menu caddy_site_records caddy_site_count caddy_managed_site_count caddy_site_address_parse caddy_backend_valid caddy_webroot_valid caddy_redirect_target_valid caddy_release_checksum_verify caddy_render_proxy_site caddy_render_static_site caddy_render_redirect_site caddy_render_php_site caddy_apply_managed_site caddy_delete_site nft_menu \
     nft_refresh_domain_targets nft_refresh_timer_status nft_refresh_timer_enable nft_refresh_timer_disable \
     system_toolbox_menu \
     resource_health_check system_update_manager system_hostname_apply config_backup_create config_path_allowed safety_timer_pending safety_rollback_now self_update docker_menu change_port \
@@ -385,7 +385,17 @@ ip_address_valid 6 2001:db8::10 || { echo "Valid IPv6 address was rejected" >&2;
     printf '0\n' > "$IP_V6_PROC_ROOT/eth0/disable_ipv6"
     mkdir -p "$(dirname "$IP_V6_SYSCTL_FILE")"
     printf 'net.ipv6.conf.all.disable_ipv6 = 1\n' > "$IP_V6_SYSCTL_FILE"
-    ip_v6_snapshot_restore "$SNAPSHOT" || { echo "IPv6 exact-state restore failed" >&2; exit 1; }
+    # The rollback that actually runs in production is the standalone script, not a
+    # helper in this process. Exercise that one so the two cannot drift apart.
+    ROLLBACK_SCRIPT="$TMP/rollback-ipv6.sh"
+    ip_v6_rollback_script_create "$SNAPSHOT" "$ROLLBACK_SCRIPT" 180 \
+        || { echo "IPv6 rollback script generation failed" >&2; exit 1; }
+    bash -n "$ROLLBACK_SCRIPT" \
+        || { echo "Generated IPv6 rollback script has invalid syntax" >&2; exit 1; }
+    bash "$ROLLBACK_SCRIPT" --now \
+        || { echo "IPv6 exact-state restore failed" >&2; exit 1; }
+    [ ! -e "$ROLLBACK_SCRIPT" ] \
+        || { echo "A successful IPv6 rollback did not remove its own script" >&2; exit 1; }
     [ ! -e "$IP_V6_SYSCTL_FILE" ] \
         || { echo "IPv6 restore retained a newly-created managed config" >&2; exit 1; }
     [ "$(cat "$IP_V6_PROC_ROOT/all/disable_ipv6")" = 0 ] \
@@ -397,9 +407,6 @@ ip_address_valid 6 2001:db8::10 || { echo "Valid IPv6 address was rejected" >&2;
         || { echo "IPv6 all-interface runtime write verification failed" >&2; exit 1; }
     [ "$(ip_v6_state_summary)" = '所有接口已禁用' ] \
         || { echo "Disabled IPv6 state summary is wrong" >&2; exit 1; }
-    ROLLBACK_SCRIPT="$TMP/rollback-ipv6.sh"
-    ip_v6_rollback_script_create "$SNAPSHOT" "$ROLLBACK_SCRIPT" 180
-    bash -n "$ROLLBACK_SCRIPT" || { echo "Generated IPv6 rollback script has invalid syntax" >&2; exit 1; }
     printf 'net.ipv6.conf.eth0.disable_ipv6 = 1\n' > "$IP_SYSCTL_CONF"
     ip_v6_external_disable_sources | grep -Fq "$IP_SYSCTL_CONF:1:" \
         || { echo "External persistent IPv6 disable was not detected" >&2; exit 1; }
@@ -818,12 +825,12 @@ fi
 [[ "$GITHUB_REF_URL" = 'https://api.github.com/repos/boyang-hu/vps-quench/git/ref/heads/main' ]] || { echo "Self-update GitHub API URL points outside vps-quench" >&2; exit 1; }
 
 for fn in bbr_preflight bbr_runtime_snapshot bbr_ensure_baseline bbr_restore_runtime_snapshot bbr_restore_initial_baseline bbr_baseline_value bbr_config_has_key bbr_config_value \
-    bbr_apply_sysctl bbr_generate_config bbr_physical_memory_mb bbr_effective_memory_mb bbr_buffer_cap_bytes bbr_conntrack_max_for_memory bbr_bdp_mb bbr_buffer_target_mb bbr_buffer_target_bytes bbr_recommend_profile \
+    bbr_apply_sysctl bbr_generate_config bbr_physical_memory_mb bbr_effective_memory_mb bbr_buffer_cap_bytes bbr_conntrack_max_for_memory bbr_bdp_mb bbr_buffer_target_bytes bbr_recommend_profile \
     bbr_kernel_at_least bbr_initial_or_current_value bbr_capacity_floor bbr_port_range_union bbr_tcp_fastopen_value \
     bbr_nft_forwarding_family_active bbr_scene_key_owned_by_nft \
     bbr_tc_qdisc_safe_to_replace bbr_tc_current_rate bbr_tc_owned_rate bbr_tc_rate_token_mbps bbr_tc_rate_mbps_from_output bbr_tc_rate_matches bbr_tc_burst_kb bbr_tc_saved_values bbr_tc_saved_rate_display bbr_tc_rate_display \
     bbr_tc_topology_matches bbr_tc_persistence_current bbr_tc_reconcile_saved \
-    bbr_tc_snapshot_foreign bbr_tc_force_confirm bbr_tc_remove_confirm bbr_tc_apply_runtime bbr_parse_bandwidth_mbps bbr_shaping_rate_mbps bbr_calibration_host_valid bbr_calibration_margin bbr_calibration_estimate_gb bbr_calibration_loss_pct bbr_calibration_is_spike bbr_calibration_parse_iperf bbr_calibration_mq_leaves bbr_calibration_mq_addressable_major bbr_calibration_run bbr_menu_calibration bbr_default_route_info bbr_default_routes bbr_route_token \
+    bbr_tc_snapshot_foreign bbr_tc_force_confirm bbr_tc_remove_confirm bbr_tc_apply_runtime bbr_parse_bandwidth_mbps bbr_shaping_rate_mbps bbr_calibration_host_valid bbr_calibration_margin bbr_calibration_estimate_gb bbr_calibration_loss_pct bbr_calibration_is_spike bbr_calibration_parse_iperf bbr_calibration_mq_leaves bbr_calibration_mq_addressable_major bbr_calibration_run bbr_menu_calibration bbr_default_routes bbr_route_token \
     bbr_route_strip_cwnd bbr_apply_initcwnd_route bbr_restore_initcwnd_route bbr_remove_initcwnd quench_tcp_profile; do
     declare -F "$fn" >/dev/null || { echo "Missing BBR function: $fn" >&2; exit 1; }
 done
@@ -1351,7 +1358,6 @@ EOF
 [[ "$(bbr_shaping_rate_mbps 400 97)" = 388 ]] || { echo "tc smart ratio calculation is wrong" >&2; exit 1; }
 [[ "$(bbr_bdp_mb 100 50)" != "0.00" ]] || { echo "BBR BDP estimate was truncated to zero" >&2; exit 1; }
 [[ "$(bbr_buffer_target_bytes 100 50)" = "3407872" ]] || { echo "BBR exact 2x-BDP plus headroom calculation failed" >&2; exit 1; }
-[[ "$(bbr_buffer_target_mb 100 50)" = "4" ]] || { echo "BBR BDP buffer display rounding failed" >&2; exit 1; }
 [[ "$(bbr_tc_burst_kb 100)" = 49 ]] || { echo "tc 4ms burst calculation is wrong at 100M" >&2; exit 1; }
 [[ "$(bbr_tc_burst_kb 400)" = 196 ]] || { echo "tc 4ms burst calculation is wrong at 400M" >&2; exit 1; }
 [[ "$(bbr_tc_rate_token_mbps 1Gbit)" = 1000.000000 ]] || { echo "tc Gbit rate normalization failed" >&2; exit 1; }

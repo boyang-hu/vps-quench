@@ -1502,12 +1502,6 @@ bbr_bdp_mb() {
     awk -v bw="$1" -v lat="$2" 'BEGIN { printf "%.2f", bw * lat / 8000 }'
 }
 
-bbr_buffer_target_mb() {
-    local BW_MBPS="$1" LAT_MS="$2"
-    local BYTES
-    BYTES=$(bbr_buffer_target_bytes "$BW_MBPS" "$LAT_MS") || return 1
-    printf '%s\n' $(( (BYTES + 1048575) / 1048576 ))
-}
 
 bbr_buffer_target_bytes() {
     local BW_MBPS="$1" LAT_MS="$2" TARGET
@@ -2665,18 +2659,6 @@ is_openvz() {
 
 is_lxc() {
     grep -qa "lxc" /proc/1/environ 2>/dev/null     || [ -f /run/systemd/container ]     || grep -qa "container=lxc" /proc/1/environ 2>/dev/null     || { [ -f /proc/1/cgroup ] && grep -qa "lxc" /proc/1/cgroup 2>/dev/null; }
-}
-
-bbr_default_route_info() {
-    local ROUTE
-    ROUTE=$(ip -4 route show default 2>/dev/null | head -1)
-    if [ -n "$ROUTE" ]; then
-        printf '4|%s\n' "$ROUTE"
-        return 0
-    fi
-    ROUTE=$(ip -6 route show default 2>/dev/null | head -1)
-    [ -n "$ROUTE" ] || return 1
-    printf '6|%s\n' "$ROUTE"
 }
 
 bbr_default_routes() {

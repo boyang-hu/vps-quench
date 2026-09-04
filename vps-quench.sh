@@ -4374,12 +4374,6 @@ bbr_bdp_mb() {
     awk -v bw="$1" -v lat="$2" 'BEGIN { printf "%.2f", bw * lat / 8000 }'
 }
 
-bbr_buffer_target_mb() {
-    local BW_MBPS="$1" LAT_MS="$2"
-    local BYTES
-    BYTES=$(bbr_buffer_target_bytes "$BW_MBPS" "$LAT_MS") || return 1
-    printf '%s\n' $(( (BYTES + 1048575) / 1048576 ))
-}
 
 bbr_buffer_target_bytes() {
     local BW_MBPS="$1" LAT_MS="$2" TARGET
@@ -5537,18 +5531,6 @@ is_openvz() {
 
 is_lxc() {
     grep -qa "lxc" /proc/1/environ 2>/dev/null     || [ -f /run/systemd/container ]     || grep -qa "container=lxc" /proc/1/environ 2>/dev/null     || { [ -f /proc/1/cgroup ] && grep -qa "lxc" /proc/1/cgroup 2>/dev/null; }
-}
-
-bbr_default_route_info() {
-    local ROUTE
-    ROUTE=$(ip -4 route show default 2>/dev/null | head -1)
-    if [ -n "$ROUTE" ]; then
-        printf '4|%s\n' "$ROUTE"
-        return 0
-    fi
-    ROUTE=$(ip -6 route show default 2>/dev/null | head -1)
-    [ -n "$ROUTE" ] || return 1
-    printf '6|%s\n' "$ROUTE"
 }
 
 bbr_default_routes() {
@@ -8497,44 +8479,6 @@ ip_v6_snapshot_create() {
     chmod -R go-rwx "$DEST" 2>/dev/null || true
     IP_V6_SNAPSHOT="$DEST"
     ip_state_prune
-}
-
-ip_v6_runtime_restore() {
-    local SNAPSHOT="$1" TARGET_IFACE="$2" IFACE VALUE FILE RC=0
-    while IFS='|' read -r IFACE VALUE; do
-        [ "$IFACE" = "$TARGET_IFACE" ] || continue
-        [[ "$IFACE" =~ ^[A-Za-z0-9_.:-]+$ && "$VALUE" =~ ^[01]$ ]] || return 1
-        FILE="$IP_V6_PROC_ROOT/$IFACE/disable_ipv6"
-        if [ ! -f "$FILE" ]; then
-            case "$IFACE" in all|default) return 1 ;; *) return 0 ;; esac
-        fi
-        printf '%s\n' "$VALUE" > "$FILE" 2>/dev/null || RC=1
-    done < "$SNAPSHOT/runtime.state"
-    return "$RC"
-}
-
-ip_v6_snapshot_restore() {
-    local SNAPSHOT="$1" HAD PARENT TEMP IFACE RC=0
-    case "$SNAPSHOT" in "$IP_STATE_DIR"/*) ;; *) return 1 ;; esac
-    [ -f "$SNAPSHOT/runtime.state" ] || return 1
-    HAD=$(cat "$SNAPSHOT/had-managed" 2>/dev/null)
-    [ "$HAD" = yes ] || [ "$HAD" = no ] || return 1
-    PARENT=$(dirname "$IP_V6_SYSCTL_FILE")
-    mkdir -p "$PARENT" || return 1
-    if [ "$HAD" = yes ]; then
-        TEMP=$(mktemp "${IP_V6_SYSCTL_FILE}.restore.XXXXXX") || return 1
-        cp -a "$SNAPSHOT/managed.conf" "$TEMP" || { rm -f "$TEMP"; return 1; }
-        mv "$TEMP" "$IP_V6_SYSCTL_FILE" || { rm -f "$TEMP"; return 1; }
-    else
-        rm -f "$IP_V6_SYSCTL_FILE" || return 1
-    fi
-    ip_v6_runtime_restore "$SNAPSHOT" all || RC=1
-    ip_v6_runtime_restore "$SNAPSHOT" default || RC=1
-    while IFS='|' read -r IFACE _; do
-        case "$IFACE" in all|default) continue ;; esac
-        ip_v6_runtime_restore "$SNAPSHOT" "$IFACE" || RC=1
-    done < "$SNAPSHOT/runtime.state"
-    return "$RC"
 }
 
 ip_v6_rollback_script_create() {
