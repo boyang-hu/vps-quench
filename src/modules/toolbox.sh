@@ -100,14 +100,36 @@ config_backup_prune() {
     audit_action "自动清理 $REMOVE_COUNT 个旧配置备份" SUCCESS
 }
 
+# 停止回滚计时器，并且必须确认真的停住了。
+# 返回 0 只代表“已确认停止”——unit 变为 inactive，或进程已不存在。
+# 之前这里把 systemctl stop / kill 的失败一律 || true 吞掉，调用方随后无条件
+# 删除脚本与句柄，于是界面显示“已取消”，后台却仍会在倒计时结束后回滚。
+# 参数可选，便于回滚中心停止别的会话留下的计时器。
 safety_stop_timer_process() {
-    if [ -n "${SAFETY_UNIT:-}" ]; then
-        systemctl stop "$SAFETY_UNIT" >/dev/null 2>&1 || true
-        systemctl reset-failed "$SAFETY_UNIT" >/dev/null 2>&1 || true
-    elif [ -n "${SAFETY_PID:-}" ]; then
-        kill "$SAFETY_PID" 2>/dev/null || true
-        wait "$SAFETY_PID" 2>/dev/null || true
+    local UNIT="${1-${SAFETY_UNIT:-}}" PID="${2-${SAFETY_PID:-}}" I
+    if [ -n "$UNIT" ]; then
+        command -v systemctl >/dev/null 2>&1 || return 1
+        systemctl stop "$UNIT" >/dev/null 2>&1 || true
+        systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+        for I in 1 2 3 4 5; do
+            systemctl is-active --quiet "$UNIT" 2>/dev/null || return 0
+            sleep 1
+        done
+        return 1
     fi
+    if [ -n "$PID" ]; then
+        kill "$PID" 2>/dev/null || true
+        wait "$PID" 2>/dev/null || true
+        for I in 1 2 3; do
+            kill -0 "$PID" 2>/dev/null || return 0
+            sleep 1
+        done
+        kill -9 "$PID" 2>/dev/null || true
+        sleep 1
+        kill -0 "$PID" 2>/dev/null && return 1
+        return 0
+    fi
+    return 0
 }
 
 safety_timer_pending() {
@@ -116,9 +138,17 @@ safety_timer_pending() {
         || { [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ]; }
 }
 
+# 只有确认计时器已停止，才能删除回滚脚本、事务记录并释放锁。
+# 停不掉就如实报错并把全部回滚材料留在原地，让上层据此决定后续动作。
 cancel_safety_timer() {
     if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ]; then
-        safety_stop_timer_process
+        if ! safety_stop_timer_process; then
+            error "无法停止自动回滚计时器（${SAFETY_UNIT:-PID ${SAFETY_PID:-未知}}）"
+            error "回滚脚本与事务记录已保留：$SAFETY_SCRIPT"
+            error "它仍可能在倒计时结束后恢复配置，请立即人工确认"
+            audit_action "取消自动回滚失败，计时器仍在运行" FAILED
+            return 1
+        fi
     fi
     rm -f "${SAFETY_SCRIPT:-}"
     SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
@@ -322,12 +352,18 @@ txn_pending_records() {
     find "$QUENCH_TXN_DIR" -maxdepth 1 -type f -name '*.txn' 2>/dev/null | sort
 }
 
-# 机器可读状态：running=原会话还活着 / armed=回滚脚本仍在 / stale=已失效
+# 机器可读状态：
+#   mine    = 本进程自己的记录（由 safety_confirm / cancel / rollback_now 处理）
+#   running = 另一个 Quench 会话仍活着
+#   armed   = 原会话已消失，但回滚脚本还在，计时器随时可能触发
+#   stale   = 回滚脚本已不存在，记录只剩残骸
 txn_record_state() {
     local FILE="$1" SCRIPT QPID
     SCRIPT=$(txn_record_field "$FILE" SCRIPT)
     QPID=$(txn_record_field "$FILE" QUENCH_PID)
-    if [ -n "$QPID" ] && [ "$QPID" != "$$" ] && kill -0 "$QPID" 2>/dev/null; then
+    if [ -n "$QPID" ] && [ "$QPID" = "$$" ]; then
+        echo mine
+    elif [ -n "$QPID" ] && kill -0 "$QPID" 2>/dev/null; then
         echo running
     elif [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ]; then
         echo armed
@@ -338,10 +374,39 @@ txn_record_state() {
 
 txn_record_state_label() {
     case "$1" in
+        mine)    echo "本次会话进行中" ;;
         running) echo "另一个 Quench 会话仍在运行" ;;
         armed)   echo "回滚脚本仍在，可能仍会触发" ;;
         *)       echo "已失效（回滚脚本已消失）" ;;
     esac
+}
+
+# 开始新事务前核对磁盘上的遗留记录。锁只是进程内的 flock，会话断开即释放，
+# 但那一笔的 systemd 计时器仍在跑。若不核对就放行，新配置写完确认之后，
+# 旧回滚到期会把它覆盖回自己那份旧快照——这是最危险的一种交叉。
+# 只清理 stale（回滚脚本已消失）的记录；running / armed 一律阻断。
+txn_reconcile_stale() {
+    local REC STATE LABEL BLOCKED=0
+    while IFS= read -r REC; do
+        [ -n "$REC" ] || continue
+        STATE=$(txn_record_state "$REC")
+        LABEL=$(txn_record_field "$REC" LABEL)
+        case "$STATE" in
+            mine) ;;
+            stale) rm -f "$REC" ;;
+            running)
+                BLOCKED=1
+                error "另一个 Quench 会话正在修改配置：${LABEL:-未知}"
+                ;;
+            armed)
+                BLOCKED=1
+                error "存在未确认的遗留变更：${LABEL:-未知}"
+                error "它的自动回滚仍武装着，此时改配置会被它覆盖回旧快照"
+                error "请先在「回滚中心 → 检查未完成的变更」中处置"
+                ;;
+        esac
+    done < <(txn_pending_records)
+    [ "$BLOCKED" = 0 ]
 }
 
 txn_review_menu() {
@@ -392,6 +457,14 @@ txn_review_menu() {
                 confirm_change_preview "立即执行遗留回滚" \
                     "记录：$(txn_record_field "$FILE" LABEL)" \
                     "将恢复该事务开始前保存的配置快照" || continue
+                # 必须先停掉这笔事务自己的计时器：否则脚本会被执行两次——
+                # 一次是现在手动跑，一次是原 unit 倒计时到期后自己跑。
+                if ! safety_stop_timer_process \
+                    "$(txn_record_field "$FILE" UNIT)" "$(txn_record_field "$FILE" TIMER_PID)"; then
+                    error "无法停止该记录的回滚计时器，拒绝手动执行以免回滚两次"
+                    ui_pause
+                    continue
+                fi
                 if bash "$SCRIPT" --now >/dev/null 2>&1; then
                     rm -f "$FILE"
                     audit_action "手动执行遗留回滚 $(basename "$FILE")" SUCCESS
@@ -456,14 +529,29 @@ rollback_center_menu() {
 }
 
 
+# 锁与遗留事务核对集中在这里，主体任何一处早退都由这里归还锁。
+# 之前主体里散落着多个 return 1（路径校验、快照失败、脚本生成失败），
+# 走到那些分支锁就永久留在本进程手里，后续所有变更都会被自己挡住。
 safety_arm() {
+    txn_lock_acquire || return 1
+    if ! txn_reconcile_stale; then
+        txn_lock_release
+        return 1
+    fi
+    if safety_arm_locked "$@"; then
+        return 0
+    fi
+    txn_lock_release
+    return 1
+}
+
+safety_arm_locked() {
     local LABEL="$1" SNAP SCRIPT UFW_STATE="inactive" FIREWALLD_STATE="inactive"
     local DELAY="${SAFETY_DELAY_SECONDS:-180}" RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     local RESOLV_IMMUTABLE="inactive" CLEANUP_LINES="" PATH_VALUE TARGET TARGET_Q
     local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q
     shift
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
-    txn_lock_acquire || return 1
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
         safety_rollback_now || return 1
@@ -533,7 +621,7 @@ rm -f $SCRIPT_Q
 ROLLBACK_EOF
     chmod 700 "$SCRIPT"
     safety_launch_timer "$SCRIPT" \
-        || { rm -f "$SCRIPT"; txn_lock_release; error "无法启动防断联回滚计时器"; return 1; }
+        || { rm -f "$SCRIPT"; error "无法启动防断联回滚计时器"; return 1; }
     txn_record_begin "$LABEL" "$SCRIPT"
     audit_action "启动防断联保护 $LABEL" SUCCESS
     warn "防断联保护已启动：${DELAY} 秒内未确认将自动恢复。"
@@ -551,7 +639,7 @@ safety_confirm() {
     warn "请保持当前连接，并用新终端确认 SSH 和网络正常。"
     read -rp "  确认连接正常，取消自动回滚？(y/N): " OK
     if echo "$OK" | grep -qiE '^y(es)?$'; then
-        cancel_safety_timer
+        cancel_safety_timer || return 1
         audit_action "确认连接正常，取消自动回滚" SUCCESS
         info "已取消自动回滚"
     else

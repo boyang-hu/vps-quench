@@ -331,9 +331,21 @@ EOF
 }
 
 ip_v6_safety_arm() {
+    txn_lock_acquire || return 1
+    if ! txn_reconcile_stale; then
+        txn_lock_release
+        return 1
+    fi
+    if ip_v6_safety_arm_locked "$@"; then
+        return 0
+    fi
+    txn_lock_release
+    return 1
+}
+
+ip_v6_safety_arm_locked() {
     local LABEL="$1" DELAY="${SAFETY_DELAY_SECONDS:-180}" SCRIPT
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
-    txn_lock_acquire || return 1
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
         safety_rollback_now || return 1
@@ -342,7 +354,7 @@ ip_v6_safety_arm() {
     SCRIPT="$QUENCH_DATA_DIR/rollback_ipv6_$$_$(date +%s)_${RANDOM}.sh"
     ip_v6_rollback_script_create "$IP_V6_SNAPSHOT" "$SCRIPT" "$DELAY" || { rm -f "$SCRIPT"; return 1; }
     safety_launch_timer "$SCRIPT" \
-        || { rm -f "$SCRIPT"; txn_lock_release; error "无法启动防断联回滚计时器"; return 1; }
+        || { rm -f "$SCRIPT"; error "无法启动防断联回滚计时器"; return 1; }
     txn_record_begin "$LABEL" "$SCRIPT"
     audit_action "启动防断联保护 $LABEL" SUCCESS
     warn "IPv6 精确回滚保护已启动：${DELAY} 秒内未确认将恢复原运行时与配置状态。"
@@ -557,10 +569,22 @@ ip_source_route_restore() {
 }
 
 ip_source_safety_arm() {
+    txn_lock_acquire || return 1
+    if ! txn_reconcile_stale; then
+        txn_lock_release
+        return 1
+    fi
+    if ip_source_safety_arm_locked "$@"; then
+        return 0
+    fi
+    txn_lock_release
+    return 1
+}
+
+ip_source_safety_arm_locked() {
     local FAMILY="$1" ROUTE_LINE="$2" SCRIPT DELAY="${SAFETY_DELAY_SECONDS:-180}" TOKEN
     local TOKENS=()
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
-    txn_lock_acquire || return 1
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
         safety_rollback_now || return 1
@@ -590,7 +614,7 @@ ip_source_safety_arm() {
     } > "$SCRIPT" || { rm -f "$SCRIPT"; return 1; }
     chmod 700 "$SCRIPT" || { rm -f "$SCRIPT"; return 1; }
     safety_launch_timer "$SCRIPT" \
-        || { rm -f "$SCRIPT"; txn_lock_release; error "无法启动防断联回滚计时器"; return 1; }
+        || { rm -f "$SCRIPT"; error "无法启动防断联回滚计时器"; return 1; }
     txn_record_begin "IPv${FAMILY} 源地址切换" "$SCRIPT"
     audit_action "启动防断联保护 IPv${FAMILY} 源地址切换" SUCCESS
     warn "防断联保护已启动：${DELAY} 秒内未确认将自动恢复原默认路由。"

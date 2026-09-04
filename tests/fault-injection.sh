@@ -1414,8 +1414,17 @@ t_fi_051() {
 
     # A unit-backed timer must be cancelled through systemctl rather than kill.
     SYSTEMCTL_LOG="$TIMER_DIR/systemctl.log"
+    UNIT_ACTIVE=1
+    # 必须有状态：cancel 现在会轮询 is-active 确认真的停住了。
     # shellcheck disable=SC2329 # test stub stands in for the systemctl binary
-    systemctl() { printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"; return 0; }
+    systemctl() {
+        printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+        case "${1:-}" in
+            stop) UNIT_ACTIVE=0; return 0 ;;
+            is-active) [ "$UNIT_ACTIVE" = 1 ] && return 0 || return 1 ;;
+        esac
+        return 0
+    }
     SAFETY_UNIT=quench-rollback-test
     SAFETY_PID=""
     SAFETY_SCRIPT="$TIMER_SCRIPT"
@@ -1516,15 +1525,34 @@ t_fi_053() {
     [ "$TXN_MODE" = 600 ] \
         || { echo "Transaction record is world-readable: $TXN_MODE" >&2; exit 1; }
 
-    [ "$(txn_record_state "$QUENCH_TXN_FILE")" = armed ] \
-        || { echo "A record with a live rollback script was not reported as armed" >&2; exit 1; }
-    rm -f "$TXN_SCRIPT"
-    [ "$(txn_record_state "$QUENCH_TXN_FILE")" = stale ] \
-        || { echo "A record whose rollback script is gone was not reported as stale" >&2; exit 1; }
-
+    [ "$(txn_record_state "$QUENCH_TXN_FILE")" = mine ] \
+        || { echo "this process's own record was not reported as mine" >&2; exit 1; }
     TXN_RECORD="$QUENCH_TXN_FILE"
+
+    # 属主进程已消失、回滚脚本还在 => armed。这正是最危险的一种遗留：
+    # 放行新事务的话，那笔回滚到期会把新配置覆盖回它自己的旧快照。
+    ( : ) & DEAD_PID=$!
+    wait "$DEAD_PID" 2>/dev/null || true
+    sed "s/^QUENCH_PID=.*/QUENCH_PID=$DEAD_PID/" "$TXN_RECORD" > "$TXN_RECORD.new"
+    mv "$TXN_RECORD.new" "$TXN_RECORD"
+    [ "$(txn_record_state "$TXN_RECORD")" = armed ] \
+        || { echo "an orphaned record with a live rollback script was not reported as armed" >&2; exit 1; }
+    txn_reconcile_stale >/dev/null 2>&1 \
+        && { echo "reconcile started a new transaction while an armed rollback was pending" >&2; exit 1; }
+    [ -f "$TXN_RECORD" ] \
+        || { echo "reconcile deleted an armed record instead of blocking on it" >&2; exit 1; }
+
+    # 回滚脚本已消失 => stale，只剩残骸，可以清掉并放行
+    rm -f "$TXN_SCRIPT"
+    [ "$(txn_record_state "$TXN_RECORD")" = stale ] \
+        || { echo "A record whose rollback script is gone was not reported as stale" >&2; exit 1; }
+    txn_reconcile_stale >/dev/null 2>&1 \
+        || { echo "reconcile refused to proceed past a stale record" >&2; exit 1; }
+    [ ! -e "$TXN_RECORD" ] \
+        || { echo "reconcile left a stale record behind" >&2; exit 1; }
+
+    QUENCH_TXN_FILE="$TXN_RECORD"
     txn_record_end
-    [ ! -e "$TXN_RECORD" ] || { echo "Completed transaction left its record behind" >&2; exit 1; }
     [ -z "$QUENCH_TXN_FILE" ] || { echo "Completed transaction kept a stale record handle" >&2; exit 1; }
     :
 }
@@ -1682,5 +1710,30 @@ t_tmpreg_004() {
     :
 }
 run_test "A module releasing INT restores the global handler, not the default" t_tmpreg_004
+
+# Cancelling used to swallow a failed systemctl stop and delete the rollback script
+# anyway, so the interface reported "cancelled" while the unit stayed armed and fired
+# minutes later.
+t_cancel_001() {
+    CANCEL_DIR="$TMP/cancel-guard"
+    mkdir -p "$CANCEL_DIR"
+    SAFETY_SCRIPT="$CANCEL_DIR/rollback.sh"
+    printf '#!/bin/bash\n' > "$SAFETY_SCRIPT"
+    SAFETY_UNIT=quench-rollback-stuck
+    SAFETY_PID=""
+    QUENCH_TXN_REGISTRY=""
+    # A unit that refuses to stop: stop reports success, is-active stays true.
+    # shellcheck disable=SC2329 # test stub stands in for the systemctl binary
+    systemctl() { case "${1:-}" in is-active) return 0 ;; esac; return 0; }
+
+    cancel_safety_timer >/dev/null 2>&1 \
+        && { echo "cancel reported success while the timer was still active" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT" ] \
+        || { echo "a failed cancel deleted the rollback script anyway" >&2; exit 1; }
+    [ -n "$SAFETY_UNIT" ] \
+        || { echo "a failed cancel dropped the unit handle, losing the only way to stop it" >&2; exit 1; }
+    :
+}
+run_test "A cancel that cannot stop the timer reports failure and keeps the rollback" t_cancel_001
 
 test_summary "Fault injection"
