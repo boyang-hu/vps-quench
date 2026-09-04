@@ -126,7 +126,7 @@ generate_key() {
     # 可预测的 /tmp/quench_tmp_$$ 兜底会让本机攻击者预建目录并读走私钥，故不再保留。
     OLD_UMASK=$(umask)
     umask 077
-    if ! TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/quench-keygen.XXXXXX"); then
+    if ! TMP_DIR=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-keygen.XXXXXX"); then
         umask "$OLD_UMASK"
         error "无法创建安全的临时目录，已中止密钥生成。"
         return 1
@@ -199,7 +199,7 @@ ssh_restore_last_backup() {
 
 ssh_apply_policy() {
     local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE
-    CANDIDATE=$(mktemp) || return 1
+    CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     set_config_file "$CANDIDATE" PasswordAuthentication "$PASSWORD"
     set_config_file "$CANDIDATE" KbdInteractiveAuthentication "$KEYBOARD"
@@ -307,8 +307,8 @@ ssh_set_ports_file() {
     local FILE="$1" FIRST BODY SETTINGS PORT
     shift
     FIRST="$1"; shift
-    BODY=$(mktemp) || return 1
-    SETTINGS=$(mktemp) || { rm -f "$BODY"; return 1; }
+    BODY=$(quench_mktemp) || return 1
+    SETTINGS=$(quench_mktemp) || { rm -f "$BODY"; return 1; }
     awk -v begin="$SSHD_MANAGED_BEGIN" -v end="$SSHD_MANAGED_END" '
         $0 == begin {managed=1; next}
         $0 == end {managed=0; next}
@@ -340,7 +340,7 @@ ssh_set_ports_file() {
 ssh_apply_ports() {
     local LABEL="$1" CANDIDATE
     shift
-    CANDIDATE=$(mktemp) || return 1
+    CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     ssh_set_ports_file "$CANDIDATE" "$@" || { rm -f "$CANDIDATE"; return 1; }
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "$LABEL"; then
@@ -380,7 +380,7 @@ ssh_sync_fail2ban_ports() {
     declare -F f2b_runtime_healthy >/dev/null 2>&1 || return 1
     f2b_ports_valid "$PORTS" || { warn "Fail2ban 端口列表无效"; return 1; }
     JAIL_FILE=$(f2b_config_file)
-    BACKUP=$(mktemp) || return 1
+    BACKUP=$(quench_mktemp) || return 1
     if [ -f "$JAIL_FILE" ]; then
         cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
         EXISTED=yes

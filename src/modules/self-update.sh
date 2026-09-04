@@ -60,7 +60,7 @@ self_remote_main_sha() {
 
 self_fetch_script() {
     local DEST="$1" WORK REMOTE_SHA SCRIPT_FETCH CHECKSUM_FETCH EXPECTED ACTUAL
-    WORK=$(mktemp -d "${TMPDIR:-/tmp}/quench-fetch.XXXXXX") || return 1
+    WORK=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-fetch.XXXXXX") || return 1
     REMOTE_SHA=$(self_remote_main_sha || true)
     printf '%s\n' "$REMOTE_SHA" | grep -qE '^[0-9a-f]{40}$' \
         || { rm -rf "$WORK"; error "无法锁定 GitHub main commit，已拒绝非原子更新"; return 1; }
@@ -137,7 +137,7 @@ self_install() {
     if [ -n "$SELF" ]; then SOURCE="$SELF"
     else
         info "当前通过管道运行，正在下载并校验完整脚本与 SHA256..."
-        DOWNLOAD_TMP=$(mktemp "${TMPDIR:-/tmp}/quench-install.XXXXXX") || return 1
+        DOWNLOAD_TMP=$(quench_mktemp "${TMPDIR:-/tmp}/quench-install.XXXXXX") || return 1
         self_fetch_script "$DOWNLOAD_TMP" || {
             rm -f "$DOWNLOAD_TMP"; error "下载或 SHA256 校验失败，已拒绝安装"; return 1;
         }
@@ -159,7 +159,7 @@ self_install() {
 self_update() {
     print_header "更新脚本"
     local WORK TMP_FILE CUR_VER NEW_VER SAVED=""
-    WORK=$(mktemp -d "${TMPDIR:-/tmp}/quench-update.XXXXXX") || return 1
+    WORK=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-update.XXXXXX") || return 1
     TMP_FILE="$WORK/vps-quench.sh"
     info "正在从 GitHub 下载同一提交的脚本与 SHA256..."
     if ! self_fetch_script "$TMP_FILE"; then
@@ -229,7 +229,7 @@ self_offline_bundle_create() {
     SOURCE="${LOCAL_SCRIPT:-}"
     [ -f "$SOURCE" ] || SOURCE=$(self_resolve_script_source "$0" 2>/dev/null || true)
     self_script_valid "$SOURCE" || { error "找不到有效的 Quench 脚本"; return 1; }
-    WORK=$(mktemp -d "${TMPDIR:-/tmp}/quench-offline.XXXXXX") || return 1
+    WORK=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-offline.XXXXXX") || return 1
     ARCHIVE="$WORK/vps-quench.sh"
     install -m 755 "$SOURCE" "$ARCHIVE" || { rm -rf "$WORK"; return 1; }
     HASH=$(file_sha256 "$ARCHIVE") || { rm -rf "$WORK"; error "缺少 SHA256 工具"; return 1; }
@@ -247,7 +247,7 @@ self_offline_bundle_create() {
 self_offline_bundle_install() {
     local PACKAGE="$1" WORK SOURCE EXPECTED ACTUAL LISTING
     [ -f "$PACKAGE" ] || { error "离线包不存在"; return 1; }
-    WORK=$(mktemp -d "${TMPDIR:-/tmp}/quench-offline-install.XXXXXX") || return 1
+    WORK=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-offline-install.XXXXXX") || return 1
     case "$PACKAGE" in
         *.tar.gz|*.tgz)
             LISTING=$(tar -tzf "$PACKAGE" 2>/dev/null) || { rm -rf "$WORK"; error "无法读取离线包"; return 1; }

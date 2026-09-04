@@ -199,7 +199,7 @@ f2b_install() {
     TARGET=$(f2b_config_file)
     mkdir -p "$(dirname "$TARGET")" || return 1
     STAGED=$(mktemp "${TARGET}.tmp.XXXXXX") || return 1
-    BACKUP=$(mktemp) || { rm -f "$STAGED"; return 1; }
+    BACKUP=$(quench_mktemp) || { rm -f "$STAGED"; return 1; }
     if [ -f "$TARGET" ]; then
         cp "$TARGET" "$BACKUP" || { rm -f "$STAGED" "$BACKUP"; return 1; }
         EXISTED=yes
@@ -284,7 +284,7 @@ f2b_write_section_param() {
 
 f2b_set_section_param() {
     local SECTION="$1" KEY="$2" VAL="$3" JAIL_FILE="${F2B_JAIL_LOCAL:-$(f2b_config_file)}" BACKUP EXISTED=no
-    BACKUP=$(mktemp) || return 1
+    BACKUP=$(quench_mktemp) || return 1
     if [ -f "$JAIL_FILE" ]; then
         cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
         EXISTED=yes
@@ -307,7 +307,7 @@ f2b_set_param() {
 f2b_set_param_jail() {
     local KEY="$1" VAL="$2" JAIL_FILE BACKUP EXISTED=no
     JAIL_FILE=$(f2b_config_file)
-    BACKUP=$(mktemp) || return 1
+    BACKUP=$(quench_mktemp) || return 1
     if [ -f "$JAIL_FILE" ]; then
         cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
         EXISTED=yes
@@ -391,7 +391,7 @@ f2b_config_params() {
     esac
 
     [ -f "$JAIL_FILE" ] || { error "Quench Fail2ban 配置不存在，请先安装/修复"; return 1; }
-    BACKUP=$(mktemp) || return 1
+    BACKUP=$(quench_mktemp) || return 1
     cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
     WAS_RUNNING=$(f2b_status)
     if { [ -z "$APPLY_BAN" ] || f2b_set_param bantime "$APPLY_BAN"; } \
@@ -427,7 +427,7 @@ f2b_edit_config() {
     JAIL_FILE=$(f2b_config_file)
     mkdir -p "$(dirname "$JAIL_FILE")"
     [ -f "$JAIL_FILE" ] || { warn "请先执行 Fail2ban 安装/修复"; return 1; }
-    BACKUP=$(mktemp) || return 1
+    BACKUP=$(quench_mktemp) || return 1
     cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
     warn "即将编辑 ${JAIL_FILE}；保存后会先验证，失败自动恢复"
     ui_continue

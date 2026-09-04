@@ -312,7 +312,7 @@ bbr_restore_sysctl() {
     print_header "还原 TCP sysctl 配置"
 
     local LIST_FILE
-    LIST_FILE=$(mktemp "${TMPDIR:-/tmp}/quench_bbr_backup.XXXXXX") || { error "无法创建备份列表"; return 1; }
+    LIST_FILE=$(quench_mktemp "${TMPDIR:-/tmp}/quench_bbr_backup.XXXXXX") || { error "无法创建备份列表"; return 1; }
     ls -t "${SYSCTL_FILE}.bak."* 2>/dev/null > "$LIST_FILE"
 
     if [ ! -s "$LIST_FILE" ]; then
@@ -419,7 +419,7 @@ bbr_apply_sysctl() {
     ensure_sysctl || return 1
     bbr_ensure_baseline || return 1
     mkdir -p "$(dirname "$SYSCTL_FILE")" 2>/dev/null || return 1
-    TX_SNAPSHOT=$(mktemp "${TMPDIR:-/tmp}/quench-bbr-transaction.XXXXXX") || {
+    TX_SNAPSHOT=$(quench_mktemp "${TMPDIR:-/tmp}/quench-bbr-transaction.XXXXXX") || {
         error "无法创建 BBR 回滚快照"
         return 1
     }
@@ -2080,7 +2080,7 @@ bbr_calibration_stop_child() {
 }
 
 bbr_calibration_interrupt() {
-    trap - INT TERM HUP
+    quench_restore_signal_traps
     echo ""
     warn "线路实测被中断，正在恢复原 qdisc"
     bbr_calibration_stop_child
@@ -2095,7 +2095,7 @@ bbr_calibration_measure() {
     local RESULT RC
     local -a TIMEOUT_ARGS=()
     BBR_CAL_SENDER=""; BBR_CAL_RECEIVER=""; BBR_CAL_RETRANS=""; BBR_CAL_LOSS=""
-    BBR_CAL_TEMP_FILE=$(mktemp "${TMPDIR:-/tmp}/quench-iperf.XXXXXX") || return 1
+    BBR_CAL_TEMP_FILE=$(quench_mktemp "${TMPDIR:-/tmp}/quench-iperf.XXXXXX") || return 1
     timeout --foreground 1 true >/dev/null 2>&1 && TIMEOUT_ARGS=(--foreground)
     echo -e "  ${CYAN}▸${NC} ${LABEL}：${DURATION}s × ${STREAMS} 流 → ${PEER}:${PORT}"
     LC_ALL=C timeout "${TIMEOUT_ARGS[@]}" $(( DURATION + 25 )) \
@@ -2199,7 +2199,7 @@ bbr_calibration_show_last() {
 }
 
 bbr_calibration_finish() {
-    trap - INT TERM HUP
+    quench_restore_signal_traps
     bbr_calibration_stop_child
     [ -z "$BBR_CAL_TEMP_FILE" ] || rm -f "$BBR_CAL_TEMP_FILE"
     if bbr_calibration_restore_qdisc; then

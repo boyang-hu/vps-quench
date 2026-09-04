@@ -58,7 +58,7 @@ config_archive_validate() {
 config_archive_extract() {
     local FILE="$1" STAGE LINK REL TARGET ROOT SRC DEST RESTORE_ROOT
     RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
-    STAGE=$(mktemp -d) || return 1
+    STAGE=$(quench_mktemp_d) || return 1
     if ! tar -xzf "$FILE" -C "$STAGE" --no-same-owner 2>/dev/null; then
         rm -rf "$STAGE"
         error "导入包解压失败"
@@ -179,7 +179,7 @@ config_backup_create() {
     mkdir -p "$QUENCH_BACKUP_DIR"
     chmod 700 "$QUENCH_DATA_DIR" "$QUENCH_BACKUP_DIR" 2>/dev/null || true
     FILE="$QUENCH_BACKUP_DIR/${TS}_${LABEL}.tar.gz"
-    LIST=$(mktemp)
+    LIST=$(quench_mktemp)
     config_backup_paths > "$LIST"
     if [ ! -s "$LIST" ] || ! tar -czf "$FILE" -C / -T "$LIST" 2>/dev/null; then
         rm -f "$LIST" "$FILE"
@@ -705,7 +705,7 @@ diagnostic_bundle_create() {
     print_header "生成诊断包"
     local OUTDIR TMPDIR BUNDLE
     OUTDIR="$QUENCH_DATA_DIR/diagnostics"
-    TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/quench-diagnostic.XXXXXX") || return 1
+    TMPDIR=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-diagnostic.XXXXXX") || return 1
     mkdir -p "$OUTDIR" 2>/dev/null || { rm -rf "$TMPDIR"; error "无法创建诊断包目录"; return 1; }
     BUNDLE="$OUTDIR/diagnostic_$(date +%Y%m%d_%H%M%S).tar.gz"
 
@@ -915,8 +915,8 @@ system_enable_auto_security_updates() {
         apt)
             pkg_install unattended-upgrades || { error "unattended-upgrades 安装失败"; return 1; }
             mkdir -p "$(dirname "$PERIODIC")" "$(dirname "$REBOOT_CFG")" || return 1
-            TMP1=$(mktemp) || return 1
-            TMP2=$(mktemp) || { rm -f "$TMP1"; return 1; }
+            TMP1=$(quench_mktemp) || return 1
+            TMP2=$(quench_mktemp) || { rm -f "$TMP1"; return 1; }
             printf '%s\n' \
                 'APT::Periodic::Update-Package-Lists "1";' \
                 'APT::Periodic::Unattended-Upgrade "1";' > "$TMP1"

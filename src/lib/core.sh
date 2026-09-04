@@ -83,6 +83,92 @@ systemd_available() {
     command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
 }
 
+# ── 临时资源登记表与信号处理 ──────────────────────────────
+# 主程序原来没有 EXIT trap：Ctrl+C 会把 mktemp 出来的中间文件留在 /tmp，
+# 其中包括 sshd_config 的完整副本。这里登记，退出时兜底清理。
+# 各处原有的显式 rm 一律保留，重复删除无害。
+#
+# 登记表必须落在文件里，不能放变量：调用方几乎都是 X=$(mktemp ...) 这种命令
+# 替换，子 shell 里对变量的追加出了子 shell 就没了；追加到文件则父进程可见。
+QUENCH_TMP_REGISTRY=""
+
+quench_tmp_registry_init() {
+    [ -z "$QUENCH_TMP_REGISTRY" ] || return 0
+    # 登记表自身用裸 mktemp：它就是登记的载体，不能反过来登记自己。
+    QUENCH_TMP_REGISTRY=$(mktemp "${TMPDIR:-/tmp}/.quench-registry.XXXXXX" 2>/dev/null) || {
+        QUENCH_TMP_REGISTRY=""
+        return 1
+    }
+    chmod 600 "$QUENCH_TMP_REGISTRY" 2>/dev/null || true
+}
+
+quench_tmp_register() {
+    [ -n "$QUENCH_TMP_REGISTRY" ] || return 0
+    local ENTRY
+    for ENTRY in "$@"; do
+        [ -n "$ENTRY" ] || continue
+        printf '%s\n' "$ENTRY" >> "$QUENCH_TMP_REGISTRY" 2>/dev/null || true
+    done
+}
+
+# 只清理确实位于临时目录下的路径，绝不按登记表盲删：
+# 登记表里可能混入同目录暂存文件（/etc、/var/lib 下），那些由各自的显式 rm 负责。
+quench_tmp_cleanup() {
+    local ENTRY BASE REGISTRY="$QUENCH_TMP_REGISTRY"
+    [ -n "$REGISTRY" ] && [ -f "$REGISTRY" ] || return 0
+    BASE="${TMPDIR:-/tmp}"; BASE="${BASE%/}"
+    QUENCH_TMP_REGISTRY=""
+    while IFS= read -r ENTRY; do
+        [ -n "$ENTRY" ] || continue
+        case "$ENTRY" in
+            *'..'*) continue ;;
+            "$BASE"/*|/tmp/*|/var/tmp/*) ;;
+            *) continue ;;
+        esac
+        rm -rf -- "$ENTRY" 2>/dev/null || true
+    done < "$REGISTRY"
+    rm -f "$REGISTRY" 2>/dev/null || true
+}
+
+# mktemp 包装：创建并登记。参数与 mktemp 一致。
+quench_mktemp() {
+    local PATH_VALUE
+    PATH_VALUE=$(mktemp "$@") || return 1
+    quench_tmp_register "$PATH_VALUE"
+    printf '%s\n' "$PATH_VALUE"
+}
+
+quench_mktemp_d() {
+    local PATH_VALUE
+    PATH_VALUE=$(mktemp -d "$@") || return 1
+    quench_tmp_register "$PATH_VALUE"
+    printf '%s\n' "$PATH_VALUE"
+}
+
+# 信号处理。安装一次，模块临时接管 INT 后必须用 quench_restore_signal_traps
+# 恢复，而不是 `trap - INT`——后者会重置成默认动作，把兜底清理一起丢掉。
+QUENCH_TRAPS_INSTALLED=0
+
+quench_signal_cleanup() {
+    quench_tmp_cleanup
+    exit 130
+}
+
+quench_install_signal_traps() {
+    quench_tmp_registry_init || return 0
+    trap quench_tmp_cleanup EXIT
+    trap quench_signal_cleanup INT TERM HUP
+    QUENCH_TRAPS_INSTALLED=1
+}
+
+quench_restore_signal_traps() {
+    if [ "$QUENCH_TRAPS_INSTALLED" = 1 ]; then
+        trap quench_signal_cleanup INT TERM HUP
+    else
+        trap - INT TERM HUP
+    fi
+}
+
 # ── 防断联回滚计时器：启动与句柄 ──────────────────────────
 # 计时器必须活过“当前登录会话消失”，那正是它存在的唯一理由。
 # nohup 只让进程忽略 SIGHUP；systemd-logind 在 KillUserProcesses=yes 时
@@ -697,9 +783,9 @@ set_config_file() {
     local FILE="$1" KEY="$2" VALUE="$3"
     local BODY BLOCK TMP
     [ -f "$FILE" ] || : > "$FILE"
-    BODY=$(mktemp) || return 1
-    BLOCK=$(mktemp) || { rm -f "$BODY"; return 1; }
-    TMP=$(mktemp) || { rm -f "$BODY" "$BLOCK"; return 1; }
+    BODY=$(quench_mktemp) || return 1
+    BLOCK=$(quench_mktemp) || { rm -f "$BODY"; return 1; }
+    TMP=$(quench_mktemp) || { rm -f "$BODY" "$BLOCK"; return 1; }
 
     awk -v begin="$SSHD_MANAGED_BEGIN" -v end="$SSHD_MANAGED_END" '
         $0 == begin {in_block=1; next}

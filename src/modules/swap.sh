@@ -176,7 +176,7 @@ swap_create_apply() {
         error "$TARGET 不是可安全替换的普通文件"
         return 1
     fi
-    FSTAB_BACKUP=$(mktemp "${TMPDIR:-/tmp}/quench-fstab-before.XXXXXX") || { rm -f "$STAGE"; return 1; }
+    FSTAB_BACKUP=$(quench_mktemp "${TMPDIR:-/tmp}/quench-fstab-before.XXXXXX") || { rm -f "$STAGE"; return 1; }
     if [ -f "$QUENCH_SWAP_FSTAB" ]; then cp -p "$QUENCH_SWAP_FSTAB" "$FSTAB_BACKUP" || FAILED=true
     else : > "$FSTAB_BACKUP.absent"; fi
     if [ "$FAILED" = false ] && swap_is_active "$TARGET"; then
@@ -267,7 +267,7 @@ swap_delete() {
         "不会删除其他 Swap 分区、文件或 zram" || return 0
     read -rp "  输入 DELETE-SWAP 确认删除: " CONFIRM
     [ "$CONFIRM" = DELETE-SWAP ] || { warn "确认短语不匹配，已取消"; return 0; }
-    FSTAB_BACKUP=$(mktemp "${TMPDIR:-/tmp}/quench-fstab-before.XXXXXX") || return 1
+    FSTAB_BACKUP=$(quench_mktemp "${TMPDIR:-/tmp}/quench-fstab-before.XXXXXX") || return 1
     if [ -f "$QUENCH_SWAP_FSTAB" ]; then cp -p "$QUENCH_SWAP_FSTAB" "$FSTAB_BACKUP" || FAILED=true
     else : > "$FSTAB_BACKUP.absent"; fi
     if [ "$FAILED" = false ] && swap_is_active "$TARGET"; then
@@ -303,7 +303,7 @@ swap_set_swappiness_apply() {
     chmod 644 "$STAGE" || { rm -f "$STAGE"; return 1; }
     if [ -f "$QUENCH_SWAP_SYSCTL_FILE" ]; then
         HAD_FILE=true
-        BACKUP=$(mktemp "${TMPDIR:-/tmp}/quench-swap-sysctl.XXXXXX") || { rm -f "$STAGE"; return 1; }
+        BACKUP=$(quench_mktemp "${TMPDIR:-/tmp}/quench-swap-sysctl.XXXXXX") || { rm -f "$STAGE"; return 1; }
         cp -p "$QUENCH_SWAP_SYSCTL_FILE" "$BACKUP" || { rm -f "$STAGE" "$BACKUP"; return 1; }
     fi
     if ! mv "$STAGE" "$QUENCH_SWAP_SYSCTL_FILE" \

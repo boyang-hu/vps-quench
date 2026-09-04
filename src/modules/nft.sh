@@ -254,7 +254,7 @@ nft_validate_record() {
 nft_validate_database() {
     local id family proto lip ls le ttype thost tip ts te mode snat acl enabled comment entry_id entry_family entry rule_family
     local seen
-    seen=$(mktemp "${TMPDIR:-/tmp}/quench-nft-ids.XXXXXX") || return 1
+    seen=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-ids.XXXXXX") || return 1
     while IFS='|' read -r id family proto lip ls le ttype thost tip ts te mode snat acl enabled comment; do
         [ -z "$id" ] && continue
         nft_validate_record "$id" "$family" "$proto" "$lip" "$ls" "$le" "$ttype" \
@@ -432,7 +432,7 @@ nft_build_apply_batch() {
 
 nft_apply_config_file() {
     local config="$1" batch
-    batch=$(mktemp "${TMPDIR:-/tmp}/quench-nft-batch.XXXXXX") || return 1
+    batch=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-batch.XXXXXX") || return 1
     nft_build_apply_batch "$config" "$batch" || { rm -f "$batch"; return 1; }
     if ! nft -c -f "$batch"; then
         rm -f "$batch"; error "nftables 规则语法或内核兼容性校验失败"; return 1
@@ -445,7 +445,7 @@ nft_apply_config_file() {
 
 nft_check_config_file() {
     local config="$1" batch
-    batch=$(mktemp "${TMPDIR:-/tmp}/quench-nft-check.XXXXXX") || return 1
+    batch=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-check.XXXXXX") || return 1
     nft_build_apply_batch "$config" "$batch" || { rm -f "$batch"; return 1; }
     nft -c -f "$batch"
     local rc=$?
@@ -455,8 +455,8 @@ nft_check_config_file() {
 
 nft_write_managed_file() {
     local candidate backup existed=no
-    candidate=$(mktemp "${TMPDIR:-/tmp}/quench-nft-config.XXXXXX") || return 1
-    backup=$(mktemp "${TMPDIR:-/tmp}/quench-nft-backup.XXXXXX") || { rm -f "$candidate"; return 1; }
+    candidate=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-config.XXXXXX") || return 1
+    backup=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-backup.XXXXXX") || { rm -f "$candidate"; return 1; }
     nft_generate_config > "$candidate" || { rm -f "$candidate" "$backup"; return 1; }
     nft_check_config_file "$candidate" \
         || { rm -f "$candidate" "$backup"; error "nftables 候选规则校验失败"; return 1; }
@@ -483,7 +483,7 @@ nft_write_apply_helper() {
     local nft_bin tmp
     nft_bin=$(command -v nft) || return 1
     mkdir -p "$(dirname "$NFT_APPLY_HELPER")" || return 1
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-helper.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-helper.XXXXXX") || return 1
     cat > "$tmp" <<EOF
 #!/bin/sh
 set -eu
@@ -509,7 +509,7 @@ nft_install_persistence_service() {
     nft_write_apply_helper || return 1
     if systemd_available; then
         local tmp
-        tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-service.XXXXXX") || return 1
+        tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-service.XXXXXX") || return 1
         cat > "$tmp" <<EOF
 [Unit]
 Description=Quench four-layer port forwarding
@@ -531,7 +531,7 @@ EOF
         systemctl enable quench-nft-forward.service >/dev/null 2>&1 || return 1
     elif command -v rc-update >/dev/null 2>&1 && [ -d /etc/init.d ]; then
         local tmp
-        tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-openrc.XXXXXX") || return 1
+        tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-openrc.XXXXXX") || return 1
         cat > "$tmp" <<EOF
 #!/sbin/openrc-run
 description="Quench four-layer port forwarding"
@@ -589,7 +589,7 @@ nft_sysctl_capture_baseline() {
     [ -s "$NFT_SYSCTL_BASELINE" ] && return 0
     local iface tmp
     iface=$(nft_ipv6_default_iface)
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-sysctl.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-sysctl.XXXXXX") || return 1
     {
         printf 'ipv4=%s\n' "$(nft_sysctl_get net.ipv4.ip_forward || echo 0)"
         printf 'ipv6=%s\n' "$(nft_sysctl_get net.ipv6.conf.all.forwarding || echo 0)"
@@ -636,7 +636,7 @@ nft_sysctl_reconcile() {
     if [ "$need4" = yes ] || [ "$need6" = yes ]; then
         nft_sysctl_capture_baseline || { error "无法记录内核转发参数基线"; return 1; }
     fi
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-sysctl-file.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-sysctl-file.XXXXXX") || return 1
     {
         echo '# Managed by Quench four-layer port forwarding'
         [ "$need4" = yes ] && echo 'net.ipv4.ip_forward = 1'
@@ -789,7 +789,7 @@ nft_firewall_add_line() {
 
 nft_firewall_preserve_retry_state() {
     local additions="$1" retry line remove_failed
-    retry=$(mktemp "${TMPDIR:-/tmp}/quench-nft-fw-retry.XXXXXX") || return 1
+    retry=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-fw-retry.XXXXXX") || return 1
     cp "$NFT_FIREWALL_STATE" "$retry" || { rm -f "$retry"; return 1; }
     while IFS= read -r line; do
         [ -n "$line" ] || continue
@@ -809,8 +809,8 @@ nft_firewall_reconcile() {
     backend=$(nft_firewall_backend)
     [ "$backend" != conflict ] || { error "UFW 与 firewalld 同时存在且状态冲突，拒绝写入转发规则"; return 1; }
     if [ "$backend" = firewalld ]; then zone=$(fw_firewalld_zone); fi
-    desired=$(mktemp "${TMPDIR:-/tmp}/quench-nft-fw-desired.XXXXXX") || return 1
-    new_state=$(mktemp "${TMPDIR:-/tmp}/quench-nft-fw-state.XXXXXX") || { rm -f "$desired"; return 1; }
+    desired=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-fw-desired.XXXXXX") || return 1
+    new_state=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-fw-state.XXXXXX") || { rm -f "$desired"; return 1; }
     if [ "$backend" != none ]; then nft_firewall_specs "$backend" "$zone" > "$desired"; else : > "$desired"; fi
 
     # 先添加新规则，全部成功后再删除旧规则，避免修改时先中断现有线路。
@@ -943,7 +943,7 @@ nft_prompt_acl() {
     echo -e "  ${DIM}多个 IP/CIDR 用空格或逗号分隔；名单只作用于这条转发规则${NC}"
     read -rp "  来源 IP/CIDR: " raw
     [ -n "$raw" ] || return 1
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-acl.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-acl.XXXXXX") || return 1
     for entry in $(tr ',' ' ' <<< "$raw"); do
         nft_validate_access_entry "$entry" "$family" || { error "来源地址无效或协议族不一致：$entry"; rm -f "$tmp"; return 1; }
         grep -qxF "$id|$family|$entry" "$tmp" || { echo "$id|$family|$entry" >> "$tmp"; count=$((count + 1)); }
@@ -1005,7 +1005,7 @@ nft_rule_preflight() {
 
 nft_rule_record_replace() {
     local id="$1" record="$2" tmp rc=0
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-rules.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-rules.XXXXXX") || return 1
     awk -F'|' -v id="$id" '$1 != id' "$NFT_RULES_FILE" > "$tmp" || rc=1
     [ "$rc" -ne 0 ] || echo "$record" >> "$tmp" || rc=1
     [ "$rc" -ne 0 ] || install -m 600 "$tmp" "$NFT_RULES_FILE" || rc=1
@@ -1097,7 +1097,7 @@ nft_add_rule() {
         || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; warn "已取消"; return; }
 
     nft_lock_acquire || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     if ! echo "$id|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$map_mode|$snat|$acl|yes|$comment" \
@@ -1206,7 +1206,7 @@ nft_edit_rule() {
     echo "$confirm" | grep -qiE '^y(es)?$' || return
 
     nft_lock_acquire || return 1
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     nft_rule_record_replace "$id" "$record" \
@@ -1235,7 +1235,7 @@ nft_delete_rule() {
     read -rp "  确认删除？(y/N，默认N): " confirm
     echo "$confirm" | grep -qiE '^y(es)?$' || return
     nft_lock_acquire || return 1
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     if ! awk -F'|' -v id="$id" '$1 != id' "$NFT_RULES_FILE" > "${rules_backup}.new" \
@@ -1271,7 +1271,7 @@ nft_toggle_rule() {
     fi
     record="$rid|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment"
     nft_lock_acquire || return 1
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     nft_rule_record_replace "$id" "$record" \
@@ -1285,7 +1285,7 @@ nft_toggle_rule() {
 
 nft_replace_access_for_rule() {
     local id="$1" replacement="$2" tmp rc=0
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-access-db.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-access-db.XXXXXX") || return 1
     awk -F'|' -v id="$id" '$1 != id' "$NFT_ACCESS_FILE" > "$tmp" || rc=1
     if [ "$rc" -eq 0 ] && [ -n "$replacement" ]; then
         cat "$replacement" >> "$tmp" || rc=1
@@ -1310,7 +1310,7 @@ nft_edit_access() {
     acl="$NFT_PROMPT_ACL"
     record="$rid|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment"
     nft_lock_acquire || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; rm -f "$rules_backup" "$access_backup" "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     if ! nft_rule_record_replace "$id" "$record" \
@@ -1332,7 +1332,7 @@ nft_refresh_domain_targets() {
     local id family proto lip ls le ttype thost tip ts te mode snat acl enabled comment new_ip
     nft_ensure_state_dir || return 1
     nft_lock_acquire || return 1
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-refresh.XXXXXX") || { nft_lock_release; return 1; }
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-refresh.XXXXXX") || { nft_lock_release; return 1; }
     while IFS='|' read -r id family proto lip ls le ttype thost tip ts te mode snat acl enabled comment; do
         [ -n "$id" ] || continue
         if [ "$ttype" = domain ]; then
@@ -1352,7 +1352,7 @@ nft_refresh_domain_targets() {
         [ "$domains" -eq 0 ] && warn "没有域名目标" || info "域名目标没有变化"
         rm -f "$tmp"; nft_lock_release; return 0
     fi
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { rm -f "$tmp" "$rules_backup" "$access_backup"; nft_lock_release; return 1; }
     install -m 600 "$tmp" "$NFT_RULES_FILE" \
@@ -1394,7 +1394,7 @@ nft_refresh_timer_enable() {
     read -rp "  刷新间隔（10s～24h，默认 5m）: " interval
     [ -n "$interval" ] || interval=5m
     nft_refresh_interval_valid "$interval" || { error "间隔格式无效，例如 30s、5m、2h"; return 1; }
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-refresh-service.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-refresh-service.XXXXXX") || return 1
     cat > "$tmp" <<EOF
 [Unit]
 Description=Quench NFT domain target refresh
@@ -1493,7 +1493,7 @@ nft_clear_all_rules() {
     read -rp "  输入 CLEAR 确认: " confirm
     [ "$confirm" = CLEAR ] || return
     nft_lock_acquire || return 1
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     if ! : > "$NFT_RULES_FILE" || ! : > "$NFT_ACCESS_FILE"; then

@@ -213,7 +213,7 @@ first_run_ssh_baseline_apply() {
     command -v sshd >/dev/null 2>&1 || { error "未找到 sshd，无法应用 SSH 基线"; return 1; }
     [ -f "$SSHD_CONFIG" ] || { error "SSH 主配置不存在：$SSHD_CONFIG"; return 1; }
     local CANDIDATE
-    CANDIDATE=$(mktemp) || return 1
+    CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     first_run_ssh_baseline_render "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "SSH 基础加固"; then
@@ -256,9 +256,9 @@ first_run_network_security_apply() {
     ensure_sysctl || return 1
     has_sysctl_write || { error "当前容器或宿主机不允许写入 sysctl"; return 1; }
     local CANDIDATE RUNTIME BACKUP EXISTED=no KEY EXPECTED CURRENT COUNT=0
-    CANDIDATE=$(mktemp) || return 1
-    RUNTIME=$(mktemp) || { rm -f "$CANDIDATE"; return 1; }
-    BACKUP=$(mktemp) || { rm -f "$CANDIDATE" "$RUNTIME"; return 1; }
+    CANDIDATE=$(quench_mktemp) || return 1
+    RUNTIME=$(quench_mktemp) || { rm -f "$CANDIDATE"; return 1; }
+    BACKUP=$(quench_mktemp) || { rm -f "$CANDIDATE" "$RUNTIME"; return 1; }
     {
         echo "# Managed by Quench first-run network security baseline."
         echo "# Performance tuning remains in /etc/sysctl.d/99-quench-bbr.conf."

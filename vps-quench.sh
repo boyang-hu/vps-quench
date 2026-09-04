@@ -83,6 +83,92 @@ systemd_available() {
     command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
 }
 
+# ── 临时资源登记表与信号处理 ──────────────────────────────
+# 主程序原来没有 EXIT trap：Ctrl+C 会把 mktemp 出来的中间文件留在 /tmp，
+# 其中包括 sshd_config 的完整副本。这里登记，退出时兜底清理。
+# 各处原有的显式 rm 一律保留，重复删除无害。
+#
+# 登记表必须落在文件里，不能放变量：调用方几乎都是 X=$(mktemp ...) 这种命令
+# 替换，子 shell 里对变量的追加出了子 shell 就没了；追加到文件则父进程可见。
+QUENCH_TMP_REGISTRY=""
+
+quench_tmp_registry_init() {
+    [ -z "$QUENCH_TMP_REGISTRY" ] || return 0
+    # 登记表自身用裸 mktemp：它就是登记的载体，不能反过来登记自己。
+    QUENCH_TMP_REGISTRY=$(mktemp "${TMPDIR:-/tmp}/.quench-registry.XXXXXX" 2>/dev/null) || {
+        QUENCH_TMP_REGISTRY=""
+        return 1
+    }
+    chmod 600 "$QUENCH_TMP_REGISTRY" 2>/dev/null || true
+}
+
+quench_tmp_register() {
+    [ -n "$QUENCH_TMP_REGISTRY" ] || return 0
+    local ENTRY
+    for ENTRY in "$@"; do
+        [ -n "$ENTRY" ] || continue
+        printf '%s\n' "$ENTRY" >> "$QUENCH_TMP_REGISTRY" 2>/dev/null || true
+    done
+}
+
+# 只清理确实位于临时目录下的路径，绝不按登记表盲删：
+# 登记表里可能混入同目录暂存文件（/etc、/var/lib 下），那些由各自的显式 rm 负责。
+quench_tmp_cleanup() {
+    local ENTRY BASE REGISTRY="$QUENCH_TMP_REGISTRY"
+    [ -n "$REGISTRY" ] && [ -f "$REGISTRY" ] || return 0
+    BASE="${TMPDIR:-/tmp}"; BASE="${BASE%/}"
+    QUENCH_TMP_REGISTRY=""
+    while IFS= read -r ENTRY; do
+        [ -n "$ENTRY" ] || continue
+        case "$ENTRY" in
+            *'..'*) continue ;;
+            "$BASE"/*|/tmp/*|/var/tmp/*) ;;
+            *) continue ;;
+        esac
+        rm -rf -- "$ENTRY" 2>/dev/null || true
+    done < "$REGISTRY"
+    rm -f "$REGISTRY" 2>/dev/null || true
+}
+
+# mktemp 包装：创建并登记。参数与 mktemp 一致。
+quench_mktemp() {
+    local PATH_VALUE
+    PATH_VALUE=$(mktemp "$@") || return 1
+    quench_tmp_register "$PATH_VALUE"
+    printf '%s\n' "$PATH_VALUE"
+}
+
+quench_mktemp_d() {
+    local PATH_VALUE
+    PATH_VALUE=$(mktemp -d "$@") || return 1
+    quench_tmp_register "$PATH_VALUE"
+    printf '%s\n' "$PATH_VALUE"
+}
+
+# 信号处理。安装一次，模块临时接管 INT 后必须用 quench_restore_signal_traps
+# 恢复，而不是 `trap - INT`——后者会重置成默认动作，把兜底清理一起丢掉。
+QUENCH_TRAPS_INSTALLED=0
+
+quench_signal_cleanup() {
+    quench_tmp_cleanup
+    exit 130
+}
+
+quench_install_signal_traps() {
+    quench_tmp_registry_init || return 0
+    trap quench_tmp_cleanup EXIT
+    trap quench_signal_cleanup INT TERM HUP
+    QUENCH_TRAPS_INSTALLED=1
+}
+
+quench_restore_signal_traps() {
+    if [ "$QUENCH_TRAPS_INSTALLED" = 1 ]; then
+        trap quench_signal_cleanup INT TERM HUP
+    else
+        trap - INT TERM HUP
+    fi
+}
+
 # ── 防断联回滚计时器：启动与句柄 ──────────────────────────
 # 计时器必须活过“当前登录会话消失”，那正是它存在的唯一理由。
 # nohup 只让进程忽略 SIGHUP；systemd-logind 在 KillUserProcesses=yes 时
@@ -697,9 +783,9 @@ set_config_file() {
     local FILE="$1" KEY="$2" VALUE="$3"
     local BODY BLOCK TMP
     [ -f "$FILE" ] || : > "$FILE"
-    BODY=$(mktemp) || return 1
-    BLOCK=$(mktemp) || { rm -f "$BODY"; return 1; }
-    TMP=$(mktemp) || { rm -f "$BODY" "$BLOCK"; return 1; }
+    BODY=$(quench_mktemp) || return 1
+    BLOCK=$(quench_mktemp) || { rm -f "$BODY"; return 1; }
+    TMP=$(quench_mktemp) || { rm -f "$BODY" "$BLOCK"; return 1; }
 
     awk -v begin="$SSHD_MANAGED_BEGIN" -v end="$SSHD_MANAGED_END" '
         $0 == begin {in_block=1; next}
@@ -1091,7 +1177,7 @@ generate_key() {
     # 可预测的 /tmp/quench_tmp_$$ 兜底会让本机攻击者预建目录并读走私钥，故不再保留。
     OLD_UMASK=$(umask)
     umask 077
-    if ! TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/quench-keygen.XXXXXX"); then
+    if ! TMP_DIR=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-keygen.XXXXXX"); then
         umask "$OLD_UMASK"
         error "无法创建安全的临时目录，已中止密钥生成。"
         return 1
@@ -1164,7 +1250,7 @@ ssh_restore_last_backup() {
 
 ssh_apply_policy() {
     local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE
-    CANDIDATE=$(mktemp) || return 1
+    CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     set_config_file "$CANDIDATE" PasswordAuthentication "$PASSWORD"
     set_config_file "$CANDIDATE" KbdInteractiveAuthentication "$KEYBOARD"
@@ -1272,8 +1358,8 @@ ssh_set_ports_file() {
     local FILE="$1" FIRST BODY SETTINGS PORT
     shift
     FIRST="$1"; shift
-    BODY=$(mktemp) || return 1
-    SETTINGS=$(mktemp) || { rm -f "$BODY"; return 1; }
+    BODY=$(quench_mktemp) || return 1
+    SETTINGS=$(quench_mktemp) || { rm -f "$BODY"; return 1; }
     awk -v begin="$SSHD_MANAGED_BEGIN" -v end="$SSHD_MANAGED_END" '
         $0 == begin {managed=1; next}
         $0 == end {managed=0; next}
@@ -1305,7 +1391,7 @@ ssh_set_ports_file() {
 ssh_apply_ports() {
     local LABEL="$1" CANDIDATE
     shift
-    CANDIDATE=$(mktemp) || return 1
+    CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     ssh_set_ports_file "$CANDIDATE" "$@" || { rm -f "$CANDIDATE"; return 1; }
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "$LABEL"; then
@@ -1345,7 +1431,7 @@ ssh_sync_fail2ban_ports() {
     declare -F f2b_runtime_healthy >/dev/null 2>&1 || return 1
     f2b_ports_valid "$PORTS" || { warn "Fail2ban 端口列表无效"; return 1; }
     JAIL_FILE=$(f2b_config_file)
-    BACKUP=$(mktemp) || return 1
+    BACKUP=$(quench_mktemp) || return 1
     if [ -f "$JAIL_FILE" ]; then
         cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
         EXISTED=yes
@@ -2459,7 +2545,7 @@ f2b_install() {
     TARGET=$(f2b_config_file)
     mkdir -p "$(dirname "$TARGET")" || return 1
     STAGED=$(mktemp "${TARGET}.tmp.XXXXXX") || return 1
-    BACKUP=$(mktemp) || { rm -f "$STAGED"; return 1; }
+    BACKUP=$(quench_mktemp) || { rm -f "$STAGED"; return 1; }
     if [ -f "$TARGET" ]; then
         cp "$TARGET" "$BACKUP" || { rm -f "$STAGED" "$BACKUP"; return 1; }
         EXISTED=yes
@@ -2544,7 +2630,7 @@ f2b_write_section_param() {
 
 f2b_set_section_param() {
     local SECTION="$1" KEY="$2" VAL="$3" JAIL_FILE="${F2B_JAIL_LOCAL:-$(f2b_config_file)}" BACKUP EXISTED=no
-    BACKUP=$(mktemp) || return 1
+    BACKUP=$(quench_mktemp) || return 1
     if [ -f "$JAIL_FILE" ]; then
         cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
         EXISTED=yes
@@ -2567,7 +2653,7 @@ f2b_set_param() {
 f2b_set_param_jail() {
     local KEY="$1" VAL="$2" JAIL_FILE BACKUP EXISTED=no
     JAIL_FILE=$(f2b_config_file)
-    BACKUP=$(mktemp) || return 1
+    BACKUP=$(quench_mktemp) || return 1
     if [ -f "$JAIL_FILE" ]; then
         cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
         EXISTED=yes
@@ -2651,7 +2737,7 @@ f2b_config_params() {
     esac
 
     [ -f "$JAIL_FILE" ] || { error "Quench Fail2ban 配置不存在，请先安装/修复"; return 1; }
-    BACKUP=$(mktemp) || return 1
+    BACKUP=$(quench_mktemp) || return 1
     cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
     WAS_RUNNING=$(f2b_status)
     if { [ -z "$APPLY_BAN" ] || f2b_set_param bantime "$APPLY_BAN"; } \
@@ -2687,7 +2773,7 @@ f2b_edit_config() {
     JAIL_FILE=$(f2b_config_file)
     mkdir -p "$(dirname "$JAIL_FILE")"
     [ -f "$JAIL_FILE" ] || { warn "请先执行 Fail2ban 安装/修复"; return 1; }
-    BACKUP=$(mktemp) || return 1
+    BACKUP=$(quench_mktemp) || return 1
     cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
     warn "即将编辑 ${JAIL_FILE}；保存后会先验证，失败自动恢复"
     ui_continue
@@ -3184,7 +3270,7 @@ bbr_restore_sysctl() {
     print_header "还原 TCP sysctl 配置"
 
     local LIST_FILE
-    LIST_FILE=$(mktemp "${TMPDIR:-/tmp}/quench_bbr_backup.XXXXXX") || { error "无法创建备份列表"; return 1; }
+    LIST_FILE=$(quench_mktemp "${TMPDIR:-/tmp}/quench_bbr_backup.XXXXXX") || { error "无法创建备份列表"; return 1; }
     ls -t "${SYSCTL_FILE}.bak."* 2>/dev/null > "$LIST_FILE"
 
     if [ ! -s "$LIST_FILE" ]; then
@@ -3291,7 +3377,7 @@ bbr_apply_sysctl() {
     ensure_sysctl || return 1
     bbr_ensure_baseline || return 1
     mkdir -p "$(dirname "$SYSCTL_FILE")" 2>/dev/null || return 1
-    TX_SNAPSHOT=$(mktemp "${TMPDIR:-/tmp}/quench-bbr-transaction.XXXXXX") || {
+    TX_SNAPSHOT=$(quench_mktemp "${TMPDIR:-/tmp}/quench-bbr-transaction.XXXXXX") || {
         error "无法创建 BBR 回滚快照"
         return 1
     }
@@ -4952,7 +5038,7 @@ bbr_calibration_stop_child() {
 }
 
 bbr_calibration_interrupt() {
-    trap - INT TERM HUP
+    quench_restore_signal_traps
     echo ""
     warn "线路实测被中断，正在恢复原 qdisc"
     bbr_calibration_stop_child
@@ -4967,7 +5053,7 @@ bbr_calibration_measure() {
     local RESULT RC
     local -a TIMEOUT_ARGS=()
     BBR_CAL_SENDER=""; BBR_CAL_RECEIVER=""; BBR_CAL_RETRANS=""; BBR_CAL_LOSS=""
-    BBR_CAL_TEMP_FILE=$(mktemp "${TMPDIR:-/tmp}/quench-iperf.XXXXXX") || return 1
+    BBR_CAL_TEMP_FILE=$(quench_mktemp "${TMPDIR:-/tmp}/quench-iperf.XXXXXX") || return 1
     timeout --foreground 1 true >/dev/null 2>&1 && TIMEOUT_ARGS=(--foreground)
     echo -e "  ${CYAN}▸${NC} ${LABEL}：${DURATION}s × ${STREAMS} 流 → ${PEER}:${PORT}"
     LC_ALL=C timeout "${TIMEOUT_ARGS[@]}" $(( DURATION + 25 )) \
@@ -5071,7 +5157,7 @@ bbr_calibration_show_last() {
 }
 
 bbr_calibration_finish() {
-    trap - INT TERM HUP
+    quench_restore_signal_traps
     bbr_calibration_stop_child
     [ -z "$BBR_CAL_TEMP_FILE" ] || rm -f "$BBR_CAL_TEMP_FILE"
     if bbr_calibration_restore_qdisc; then
@@ -9273,7 +9359,7 @@ caddy_install_binary() {
     ARCHIVE="caddy_${PLAIN}_linux_${ARCH}.tar.gz"
     CHECKSUMS="caddy_${PLAIN}_checksums.txt"
     BASE="https://github.com/caddyserver/caddy/releases/download/$VERSION"
-    TMP=$(mktemp -d) || return 1
+    TMP=$(quench_mktemp_d) || return 1
     if ! curl --proto '=https' --tlsv1.2 -fL --retry 2 --max-time 120 "$BASE/$ARCHIVE" -o "$TMP/$ARCHIVE" \
         || ! curl --proto '=https' --tlsv1.2 -fL --retry 2 --max-time 30 "$BASE/$CHECKSUMS" -o "$TMP/$CHECKSUMS"; then
         rm -rf "$TMP"
@@ -9315,7 +9401,7 @@ caddy_install_package() {
         fi
         apt-get update -qq || return 1
         apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg || return 1
-        TMP=$(mktemp -d) || return 1
+        TMP=$(quench_mktemp_d) || return 1
         curl --proto '=https' --tlsv1.2 -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key -o "$TMP/caddy.gpg.key" \
             && curl --proto '=https' --tlsv1.2 -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o "$TMP/caddy.list" \
             && gpg --dearmor --yes -o "$TMP/caddy.gpg" "$TMP/caddy.gpg.key" \
@@ -10549,9 +10635,9 @@ caddy_show_log_file() {
     menu_item "0" "返回" "$RED"
     read -rp "$(ui_prompt '选择操作: ')" CH
     [ "$CH" = 1 ] || return 0
-    trap 'echo ""; trap - INT' INT
+    trap 'echo ""; quench_restore_signal_traps' INT
     tail -f "$FILE"
-    trap - INT
+    quench_restore_signal_traps
 }
 
 caddy_view_logs() {
@@ -11553,7 +11639,7 @@ swap_create_apply() {
         error "$TARGET 不是可安全替换的普通文件"
         return 1
     fi
-    FSTAB_BACKUP=$(mktemp "${TMPDIR:-/tmp}/quench-fstab-before.XXXXXX") || { rm -f "$STAGE"; return 1; }
+    FSTAB_BACKUP=$(quench_mktemp "${TMPDIR:-/tmp}/quench-fstab-before.XXXXXX") || { rm -f "$STAGE"; return 1; }
     if [ -f "$QUENCH_SWAP_FSTAB" ]; then cp -p "$QUENCH_SWAP_FSTAB" "$FSTAB_BACKUP" || FAILED=true
     else : > "$FSTAB_BACKUP.absent"; fi
     if [ "$FAILED" = false ] && swap_is_active "$TARGET"; then
@@ -11644,7 +11730,7 @@ swap_delete() {
         "不会删除其他 Swap 分区、文件或 zram" || return 0
     read -rp "  输入 DELETE-SWAP 确认删除: " CONFIRM
     [ "$CONFIRM" = DELETE-SWAP ] || { warn "确认短语不匹配，已取消"; return 0; }
-    FSTAB_BACKUP=$(mktemp "${TMPDIR:-/tmp}/quench-fstab-before.XXXXXX") || return 1
+    FSTAB_BACKUP=$(quench_mktemp "${TMPDIR:-/tmp}/quench-fstab-before.XXXXXX") || return 1
     if [ -f "$QUENCH_SWAP_FSTAB" ]; then cp -p "$QUENCH_SWAP_FSTAB" "$FSTAB_BACKUP" || FAILED=true
     else : > "$FSTAB_BACKUP.absent"; fi
     if [ "$FAILED" = false ] && swap_is_active "$TARGET"; then
@@ -11680,7 +11766,7 @@ swap_set_swappiness_apply() {
     chmod 644 "$STAGE" || { rm -f "$STAGE"; return 1; }
     if [ -f "$QUENCH_SWAP_SYSCTL_FILE" ]; then
         HAD_FILE=true
-        BACKUP=$(mktemp "${TMPDIR:-/tmp}/quench-swap-sysctl.XXXXXX") || { rm -f "$STAGE"; return 1; }
+        BACKUP=$(quench_mktemp "${TMPDIR:-/tmp}/quench-swap-sysctl.XXXXXX") || { rm -f "$STAGE"; return 1; }
         cp -p "$QUENCH_SWAP_SYSCTL_FILE" "$BACKUP" || { rm -f "$STAGE" "$BACKUP"; return 1; }
     fi
     if ! mv "$STAGE" "$QUENCH_SWAP_SYSCTL_FILE" \
@@ -12381,7 +12467,7 @@ config_archive_validate() {
 config_archive_extract() {
     local FILE="$1" STAGE LINK REL TARGET ROOT SRC DEST RESTORE_ROOT
     RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
-    STAGE=$(mktemp -d) || return 1
+    STAGE=$(quench_mktemp_d) || return 1
     if ! tar -xzf "$FILE" -C "$STAGE" --no-same-owner 2>/dev/null; then
         rm -rf "$STAGE"
         error "导入包解压失败"
@@ -12502,7 +12588,7 @@ config_backup_create() {
     mkdir -p "$QUENCH_BACKUP_DIR"
     chmod 700 "$QUENCH_DATA_DIR" "$QUENCH_BACKUP_DIR" 2>/dev/null || true
     FILE="$QUENCH_BACKUP_DIR/${TS}_${LABEL}.tar.gz"
-    LIST=$(mktemp)
+    LIST=$(quench_mktemp)
     config_backup_paths > "$LIST"
     if [ ! -s "$LIST" ] || ! tar -czf "$FILE" -C / -T "$LIST" 2>/dev/null; then
         rm -f "$LIST" "$FILE"
@@ -13028,7 +13114,7 @@ diagnostic_bundle_create() {
     print_header "生成诊断包"
     local OUTDIR TMPDIR BUNDLE
     OUTDIR="$QUENCH_DATA_DIR/diagnostics"
-    TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/quench-diagnostic.XXXXXX") || return 1
+    TMPDIR=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-diagnostic.XXXXXX") || return 1
     mkdir -p "$OUTDIR" 2>/dev/null || { rm -rf "$TMPDIR"; error "无法创建诊断包目录"; return 1; }
     BUNDLE="$OUTDIR/diagnostic_$(date +%Y%m%d_%H%M%S).tar.gz"
 
@@ -13238,8 +13324,8 @@ system_enable_auto_security_updates() {
         apt)
             pkg_install unattended-upgrades || { error "unattended-upgrades 安装失败"; return 1; }
             mkdir -p "$(dirname "$PERIODIC")" "$(dirname "$REBOOT_CFG")" || return 1
-            TMP1=$(mktemp) || return 1
-            TMP2=$(mktemp) || { rm -f "$TMP1"; return 1; }
+            TMP1=$(quench_mktemp) || return 1
+            TMP2=$(quench_mktemp) || { rm -f "$TMP1"; return 1; }
             printf '%s\n' \
                 'APT::Periodic::Update-Package-Lists "1";' \
                 'APT::Periodic::Unattended-Upgrade "1";' > "$TMP1"
@@ -13620,7 +13706,7 @@ first_run_ssh_baseline_apply() {
     command -v sshd >/dev/null 2>&1 || { error "未找到 sshd，无法应用 SSH 基线"; return 1; }
     [ -f "$SSHD_CONFIG" ] || { error "SSH 主配置不存在：$SSHD_CONFIG"; return 1; }
     local CANDIDATE
-    CANDIDATE=$(mktemp) || return 1
+    CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     first_run_ssh_baseline_render "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "SSH 基础加固"; then
@@ -13663,9 +13749,9 @@ first_run_network_security_apply() {
     ensure_sysctl || return 1
     has_sysctl_write || { error "当前容器或宿主机不允许写入 sysctl"; return 1; }
     local CANDIDATE RUNTIME BACKUP EXISTED=no KEY EXPECTED CURRENT COUNT=0
-    CANDIDATE=$(mktemp) || return 1
-    RUNTIME=$(mktemp) || { rm -f "$CANDIDATE"; return 1; }
-    BACKUP=$(mktemp) || { rm -f "$CANDIDATE" "$RUNTIME"; return 1; }
+    CANDIDATE=$(quench_mktemp) || return 1
+    RUNTIME=$(quench_mktemp) || { rm -f "$CANDIDATE"; return 1; }
+    BACKUP=$(quench_mktemp) || { rm -f "$CANDIDATE" "$RUNTIME"; return 1; }
     {
         echo "# Managed by Quench first-run network security baseline."
         echo "# Performance tuning remains in /etc/sysctl.d/99-quench-bbr.conf."
@@ -14647,7 +14733,7 @@ self_remote_main_sha() {
 
 self_fetch_script() {
     local DEST="$1" WORK REMOTE_SHA SCRIPT_FETCH CHECKSUM_FETCH EXPECTED ACTUAL
-    WORK=$(mktemp -d "${TMPDIR:-/tmp}/quench-fetch.XXXXXX") || return 1
+    WORK=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-fetch.XXXXXX") || return 1
     REMOTE_SHA=$(self_remote_main_sha || true)
     printf '%s\n' "$REMOTE_SHA" | grep -qE '^[0-9a-f]{40}$' \
         || { rm -rf "$WORK"; error "无法锁定 GitHub main commit，已拒绝非原子更新"; return 1; }
@@ -14724,7 +14810,7 @@ self_install() {
     if [ -n "$SELF" ]; then SOURCE="$SELF"
     else
         info "当前通过管道运行，正在下载并校验完整脚本与 SHA256..."
-        DOWNLOAD_TMP=$(mktemp "${TMPDIR:-/tmp}/quench-install.XXXXXX") || return 1
+        DOWNLOAD_TMP=$(quench_mktemp "${TMPDIR:-/tmp}/quench-install.XXXXXX") || return 1
         self_fetch_script "$DOWNLOAD_TMP" || {
             rm -f "$DOWNLOAD_TMP"; error "下载或 SHA256 校验失败，已拒绝安装"; return 1;
         }
@@ -14746,7 +14832,7 @@ self_install() {
 self_update() {
     print_header "更新脚本"
     local WORK TMP_FILE CUR_VER NEW_VER SAVED=""
-    WORK=$(mktemp -d "${TMPDIR:-/tmp}/quench-update.XXXXXX") || return 1
+    WORK=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-update.XXXXXX") || return 1
     TMP_FILE="$WORK/vps-quench.sh"
     info "正在从 GitHub 下载同一提交的脚本与 SHA256..."
     if ! self_fetch_script "$TMP_FILE"; then
@@ -14816,7 +14902,7 @@ self_offline_bundle_create() {
     SOURCE="${LOCAL_SCRIPT:-}"
     [ -f "$SOURCE" ] || SOURCE=$(self_resolve_script_source "$0" 2>/dev/null || true)
     self_script_valid "$SOURCE" || { error "找不到有效的 Quench 脚本"; return 1; }
-    WORK=$(mktemp -d "${TMPDIR:-/tmp}/quench-offline.XXXXXX") || return 1
+    WORK=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-offline.XXXXXX") || return 1
     ARCHIVE="$WORK/vps-quench.sh"
     install -m 755 "$SOURCE" "$ARCHIVE" || { rm -rf "$WORK"; return 1; }
     HASH=$(file_sha256 "$ARCHIVE") || { rm -rf "$WORK"; error "缺少 SHA256 工具"; return 1; }
@@ -14834,7 +14920,7 @@ self_offline_bundle_create() {
 self_offline_bundle_install() {
     local PACKAGE="$1" WORK SOURCE EXPECTED ACTUAL LISTING
     [ -f "$PACKAGE" ] || { error "离线包不存在"; return 1; }
-    WORK=$(mktemp -d "${TMPDIR:-/tmp}/quench-offline-install.XXXXXX") || return 1
+    WORK=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-offline-install.XXXXXX") || return 1
     case "$PACKAGE" in
         *.tar.gz|*.tgz)
             LISTING=$(tar -tzf "$PACKAGE" 2>/dev/null) || { rm -rf "$WORK"; error "无法读取离线包"; return 1; }
@@ -15179,7 +15265,7 @@ nft_validate_record() {
 nft_validate_database() {
     local id family proto lip ls le ttype thost tip ts te mode snat acl enabled comment entry_id entry_family entry rule_family
     local seen
-    seen=$(mktemp "${TMPDIR:-/tmp}/quench-nft-ids.XXXXXX") || return 1
+    seen=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-ids.XXXXXX") || return 1
     while IFS='|' read -r id family proto lip ls le ttype thost tip ts te mode snat acl enabled comment; do
         [ -z "$id" ] && continue
         nft_validate_record "$id" "$family" "$proto" "$lip" "$ls" "$le" "$ttype" \
@@ -15357,7 +15443,7 @@ nft_build_apply_batch() {
 
 nft_apply_config_file() {
     local config="$1" batch
-    batch=$(mktemp "${TMPDIR:-/tmp}/quench-nft-batch.XXXXXX") || return 1
+    batch=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-batch.XXXXXX") || return 1
     nft_build_apply_batch "$config" "$batch" || { rm -f "$batch"; return 1; }
     if ! nft -c -f "$batch"; then
         rm -f "$batch"; error "nftables 规则语法或内核兼容性校验失败"; return 1
@@ -15370,7 +15456,7 @@ nft_apply_config_file() {
 
 nft_check_config_file() {
     local config="$1" batch
-    batch=$(mktemp "${TMPDIR:-/tmp}/quench-nft-check.XXXXXX") || return 1
+    batch=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-check.XXXXXX") || return 1
     nft_build_apply_batch "$config" "$batch" || { rm -f "$batch"; return 1; }
     nft -c -f "$batch"
     local rc=$?
@@ -15380,8 +15466,8 @@ nft_check_config_file() {
 
 nft_write_managed_file() {
     local candidate backup existed=no
-    candidate=$(mktemp "${TMPDIR:-/tmp}/quench-nft-config.XXXXXX") || return 1
-    backup=$(mktemp "${TMPDIR:-/tmp}/quench-nft-backup.XXXXXX") || { rm -f "$candidate"; return 1; }
+    candidate=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-config.XXXXXX") || return 1
+    backup=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-backup.XXXXXX") || { rm -f "$candidate"; return 1; }
     nft_generate_config > "$candidate" || { rm -f "$candidate" "$backup"; return 1; }
     nft_check_config_file "$candidate" \
         || { rm -f "$candidate" "$backup"; error "nftables 候选规则校验失败"; return 1; }
@@ -15408,7 +15494,7 @@ nft_write_apply_helper() {
     local nft_bin tmp
     nft_bin=$(command -v nft) || return 1
     mkdir -p "$(dirname "$NFT_APPLY_HELPER")" || return 1
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-helper.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-helper.XXXXXX") || return 1
     cat > "$tmp" <<EOF
 #!/bin/sh
 set -eu
@@ -15434,7 +15520,7 @@ nft_install_persistence_service() {
     nft_write_apply_helper || return 1
     if systemd_available; then
         local tmp
-        tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-service.XXXXXX") || return 1
+        tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-service.XXXXXX") || return 1
         cat > "$tmp" <<EOF
 [Unit]
 Description=Quench four-layer port forwarding
@@ -15456,7 +15542,7 @@ EOF
         systemctl enable quench-nft-forward.service >/dev/null 2>&1 || return 1
     elif command -v rc-update >/dev/null 2>&1 && [ -d /etc/init.d ]; then
         local tmp
-        tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-openrc.XXXXXX") || return 1
+        tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-openrc.XXXXXX") || return 1
         cat > "$tmp" <<EOF
 #!/sbin/openrc-run
 description="Quench four-layer port forwarding"
@@ -15514,7 +15600,7 @@ nft_sysctl_capture_baseline() {
     [ -s "$NFT_SYSCTL_BASELINE" ] && return 0
     local iface tmp
     iface=$(nft_ipv6_default_iface)
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-sysctl.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-sysctl.XXXXXX") || return 1
     {
         printf 'ipv4=%s\n' "$(nft_sysctl_get net.ipv4.ip_forward || echo 0)"
         printf 'ipv6=%s\n' "$(nft_sysctl_get net.ipv6.conf.all.forwarding || echo 0)"
@@ -15561,7 +15647,7 @@ nft_sysctl_reconcile() {
     if [ "$need4" = yes ] || [ "$need6" = yes ]; then
         nft_sysctl_capture_baseline || { error "无法记录内核转发参数基线"; return 1; }
     fi
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-sysctl-file.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-sysctl-file.XXXXXX") || return 1
     {
         echo '# Managed by Quench four-layer port forwarding'
         [ "$need4" = yes ] && echo 'net.ipv4.ip_forward = 1'
@@ -15714,7 +15800,7 @@ nft_firewall_add_line() {
 
 nft_firewall_preserve_retry_state() {
     local additions="$1" retry line remove_failed
-    retry=$(mktemp "${TMPDIR:-/tmp}/quench-nft-fw-retry.XXXXXX") || return 1
+    retry=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-fw-retry.XXXXXX") || return 1
     cp "$NFT_FIREWALL_STATE" "$retry" || { rm -f "$retry"; return 1; }
     while IFS= read -r line; do
         [ -n "$line" ] || continue
@@ -15734,8 +15820,8 @@ nft_firewall_reconcile() {
     backend=$(nft_firewall_backend)
     [ "$backend" != conflict ] || { error "UFW 与 firewalld 同时存在且状态冲突，拒绝写入转发规则"; return 1; }
     if [ "$backend" = firewalld ]; then zone=$(fw_firewalld_zone); fi
-    desired=$(mktemp "${TMPDIR:-/tmp}/quench-nft-fw-desired.XXXXXX") || return 1
-    new_state=$(mktemp "${TMPDIR:-/tmp}/quench-nft-fw-state.XXXXXX") || { rm -f "$desired"; return 1; }
+    desired=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-fw-desired.XXXXXX") || return 1
+    new_state=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-fw-state.XXXXXX") || { rm -f "$desired"; return 1; }
     if [ "$backend" != none ]; then nft_firewall_specs "$backend" "$zone" > "$desired"; else : > "$desired"; fi
 
     # 先添加新规则，全部成功后再删除旧规则，避免修改时先中断现有线路。
@@ -15868,7 +15954,7 @@ nft_prompt_acl() {
     echo -e "  ${DIM}多个 IP/CIDR 用空格或逗号分隔；名单只作用于这条转发规则${NC}"
     read -rp "  来源 IP/CIDR: " raw
     [ -n "$raw" ] || return 1
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-acl.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-acl.XXXXXX") || return 1
     for entry in $(tr ',' ' ' <<< "$raw"); do
         nft_validate_access_entry "$entry" "$family" || { error "来源地址无效或协议族不一致：$entry"; rm -f "$tmp"; return 1; }
         grep -qxF "$id|$family|$entry" "$tmp" || { echo "$id|$family|$entry" >> "$tmp"; count=$((count + 1)); }
@@ -15930,7 +16016,7 @@ nft_rule_preflight() {
 
 nft_rule_record_replace() {
     local id="$1" record="$2" tmp rc=0
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-rules.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-rules.XXXXXX") || return 1
     awk -F'|' -v id="$id" '$1 != id' "$NFT_RULES_FILE" > "$tmp" || rc=1
     [ "$rc" -ne 0 ] || echo "$record" >> "$tmp" || rc=1
     [ "$rc" -ne 0 ] || install -m 600 "$tmp" "$NFT_RULES_FILE" || rc=1
@@ -16022,7 +16108,7 @@ nft_add_rule() {
         || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; warn "已取消"; return; }
 
     nft_lock_acquire || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     if ! echo "$id|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$map_mode|$snat|$acl|yes|$comment" \
@@ -16131,7 +16217,7 @@ nft_edit_rule() {
     echo "$confirm" | grep -qiE '^y(es)?$' || return
 
     nft_lock_acquire || return 1
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     nft_rule_record_replace "$id" "$record" \
@@ -16160,7 +16246,7 @@ nft_delete_rule() {
     read -rp "  确认删除？(y/N，默认N): " confirm
     echo "$confirm" | grep -qiE '^y(es)?$' || return
     nft_lock_acquire || return 1
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     if ! awk -F'|' -v id="$id" '$1 != id' "$NFT_RULES_FILE" > "${rules_backup}.new" \
@@ -16196,7 +16282,7 @@ nft_toggle_rule() {
     fi
     record="$rid|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment"
     nft_lock_acquire || return 1
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     nft_rule_record_replace "$id" "$record" \
@@ -16210,7 +16296,7 @@ nft_toggle_rule() {
 
 nft_replace_access_for_rule() {
     local id="$1" replacement="$2" tmp rc=0
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-access-db.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-access-db.XXXXXX") || return 1
     awk -F'|' -v id="$id" '$1 != id' "$NFT_ACCESS_FILE" > "$tmp" || rc=1
     if [ "$rc" -eq 0 ] && [ -n "$replacement" ]; then
         cat "$replacement" >> "$tmp" || rc=1
@@ -16235,7 +16321,7 @@ nft_edit_access() {
     acl="$NFT_PROMPT_ACL"
     record="$rid|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment"
     nft_lock_acquire || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; rm -f "$rules_backup" "$access_backup" "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     if ! nft_rule_record_replace "$id" "$record" \
@@ -16257,7 +16343,7 @@ nft_refresh_domain_targets() {
     local id family proto lip ls le ttype thost tip ts te mode snat acl enabled comment new_ip
     nft_ensure_state_dir || return 1
     nft_lock_acquire || return 1
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-refresh.XXXXXX") || { nft_lock_release; return 1; }
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-refresh.XXXXXX") || { nft_lock_release; return 1; }
     while IFS='|' read -r id family proto lip ls le ttype thost tip ts te mode snat acl enabled comment; do
         [ -n "$id" ] || continue
         if [ "$ttype" = domain ]; then
@@ -16277,7 +16363,7 @@ nft_refresh_domain_targets() {
         [ "$domains" -eq 0 ] && warn "没有域名目标" || info "域名目标没有变化"
         rm -f "$tmp"; nft_lock_release; return 0
     fi
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { rm -f "$tmp" "$rules_backup" "$access_backup"; nft_lock_release; return 1; }
     install -m 600 "$tmp" "$NFT_RULES_FILE" \
@@ -16319,7 +16405,7 @@ nft_refresh_timer_enable() {
     read -rp "  刷新间隔（10s～24h，默认 5m）: " interval
     [ -n "$interval" ] || interval=5m
     nft_refresh_interval_valid "$interval" || { error "间隔格式无效，例如 30s、5m、2h"; return 1; }
-    tmp=$(mktemp "${TMPDIR:-/tmp}/quench-nft-refresh-service.XXXXXX") || return 1
+    tmp=$(quench_mktemp "${TMPDIR:-/tmp}/quench-nft-refresh-service.XXXXXX") || return 1
     cat > "$tmp" <<EOF
 [Unit]
 Description=Quench NFT domain target refresh
@@ -16418,7 +16504,7 @@ nft_clear_all_rules() {
     read -rp "  输入 CLEAR 确认: " confirm
     [ "$confirm" = CLEAR ] || return
     nft_lock_acquire || return 1
-    rules_backup=$(mktemp); access_backup=$(mktemp)
+    rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     if ! : > "$NFT_RULES_FILE" || ! : > "$NFT_ACCESS_FILE"; then
@@ -16718,6 +16804,10 @@ if [ "${QUENCH_TEST_MODE:-0}" = "1" ]; then
     # shellcheck disable=SC2317 # exit fallback is used when the script is executed instead of sourced
     return 0 2>/dev/null || exit 0
 fi
+
+# 安装兜底清理：Ctrl+C / kill 时删掉登记过的临时文件。
+# 放在 CLI 分发之前，命令行入口同样受保护。
+quench_install_signal_traps
 
 # CLI 处理：菜单入口
 case "${1:-}" in

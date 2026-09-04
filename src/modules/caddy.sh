@@ -259,7 +259,7 @@ caddy_install_binary() {
     ARCHIVE="caddy_${PLAIN}_linux_${ARCH}.tar.gz"
     CHECKSUMS="caddy_${PLAIN}_checksums.txt"
     BASE="https://github.com/caddyserver/caddy/releases/download/$VERSION"
-    TMP=$(mktemp -d) || return 1
+    TMP=$(quench_mktemp_d) || return 1
     if ! curl --proto '=https' --tlsv1.2 -fL --retry 2 --max-time 120 "$BASE/$ARCHIVE" -o "$TMP/$ARCHIVE" \
         || ! curl --proto '=https' --tlsv1.2 -fL --retry 2 --max-time 30 "$BASE/$CHECKSUMS" -o "$TMP/$CHECKSUMS"; then
         rm -rf "$TMP"
@@ -301,7 +301,7 @@ caddy_install_package() {
         fi
         apt-get update -qq || return 1
         apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg || return 1
-        TMP=$(mktemp -d) || return 1
+        TMP=$(quench_mktemp_d) || return 1
         curl --proto '=https' --tlsv1.2 -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key -o "$TMP/caddy.gpg.key" \
             && curl --proto '=https' --tlsv1.2 -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o "$TMP/caddy.list" \
             && gpg --dearmor --yes -o "$TMP/caddy.gpg" "$TMP/caddy.gpg.key" \
@@ -1535,9 +1535,9 @@ caddy_show_log_file() {
     menu_item "0" "返回" "$RED"
     read -rp "$(ui_prompt '选择操作: ')" CH
     [ "$CH" = 1 ] || return 0
-    trap 'echo ""; trap - INT' INT
+    trap 'echo ""; quench_restore_signal_traps' INT
     tail -f "$FILE"
-    trap - INT
+    quench_restore_signal_traps
 }
 
 caddy_view_logs() {

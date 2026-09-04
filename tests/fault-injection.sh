@@ -1615,4 +1615,72 @@ t_fi_055() {
 }
 run_test "Both subsystem locks use fixed descriptors: exec {VAR}> is a bash 4.1 feature and fails…" t_fi_055
 
+# Ctrl+C used to leave every mktemp file behind, including full copies of
+# sshd_config. Registered temporaries must be swept on exit, and the sweep must
+# refuse to touch anything outside a temp directory.
+t_tmpreg_001() {
+    quench_tmp_registry_init || fail "temp registry could not be initialised"
+    REG_FILE=$(quench_mktemp) || fail "quench_mktemp failed"
+    REG_DIR=$(quench_mktemp_d) || fail "quench_mktemp_d failed"
+    [ -f "$REG_FILE" ] || fail "quench_mktemp did not create a file"
+    [ -d "$REG_DIR" ] || fail "quench_mktemp_d did not create a directory"
+    quench_tmp_cleanup
+    [ ! -e "$REG_FILE" ] || fail "cleanup left a registered file behind"
+    [ ! -e "$REG_DIR" ] || fail "cleanup left a registered directory behind"
+    :
+}
+run_test "Registered temporaries are swept on exit" t_tmpreg_001
+
+t_tmpreg_002() {
+    # $TMP itself lives under TMPDIR, so an "outside" path has to come from
+    # somewhere else entirely; the repository working directory always qualifies.
+    GUARD_DIR="$ROOT/.quench-tmpguard-$$"
+    mkdir -p "$GUARD_DIR" || fail "could not create the guard fixture"
+    printf 'keep\n' > "$GUARD_DIR/must-survive"
+    quench_tmp_registry_init || fail "temp registry could not be initialised"
+    quench_tmp_register "$GUARD_DIR/must-survive"
+    quench_tmp_register "/tmp/../etc/quench-traversal-probe"
+    INSIDE=$(quench_mktemp) || fail "quench_mktemp failed"
+    quench_tmp_cleanup
+    SURVIVED=0
+    [ -f "$GUARD_DIR/must-survive" ] && SURVIVED=1
+    rm -rf "$GUARD_DIR"
+    [ "$SURVIVED" = 1 ] || fail "cleanup deleted a path outside every temp directory"
+    [ ! -e "$INSIDE" ] || fail "cleanup skipped a genuine temp file"
+    :
+}
+run_test "Exit sweep never deletes outside a temp directory" t_tmpreg_002
+
+t_tmpreg_003() {
+    # Callers all write X=$(quench_mktemp ...), which runs in a subshell. A registry
+    # kept in a variable would lose those entries; it has to live in a file.
+    quench_tmp_registry_init || fail "temp registry could not be initialised"
+    SUBSHELL_FILE=$( quench_mktemp ) || fail "quench_mktemp failed"
+    grep -qxF "$SUBSHELL_FILE" "$QUENCH_TMP_REGISTRY" \
+        || fail "a temp file created in a subshell was not registered for the parent"
+    quench_tmp_cleanup
+    [ ! -e "$SUBSHELL_FILE" ] || fail "cleanup missed the subshell-created file"
+    :
+}
+run_test "Temporaries created inside a subshell are still registered" t_tmpreg_003
+
+t_tmpreg_004() {
+    # bbr and caddy take over INT for a while. Releasing it with `trap - INT` would
+    # reset to the default action and silently drop the exit sweep.
+    quench_install_signal_traps || fail "signal traps could not be installed"
+    case "$(trap -p EXIT)" in
+        *quench_tmp_cleanup*) ;;
+        *) fail "EXIT handler was not installed" ;;
+    esac
+    trap 'echo module-handler' INT
+    quench_restore_signal_traps
+    case "$(trap -p INT)" in
+        *quench_signal_cleanup*) ;;
+        *) fail "restoring after a module handler did not bring back the global one" ;;
+    esac
+    quench_tmp_cleanup
+    :
+}
+run_test "A module releasing INT restores the global handler, not the default" t_tmpreg_004
+
 test_summary "Fault injection"

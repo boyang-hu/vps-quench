@@ -199,6 +199,10 @@ if [ "${QUENCH_TEST_MODE:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
 
+# 安装兜底清理：Ctrl+C / kill 时删掉登记过的临时文件。
+# 放在 CLI 分发之前，命令行入口同样受保护。
+quench_install_signal_traps
+
 # CLI 处理：菜单入口
 case "${1:-}" in
     --help|-h|help)
