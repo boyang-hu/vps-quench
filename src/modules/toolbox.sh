@@ -703,10 +703,10 @@ config_health_check() {
 
 diagnostic_bundle_create() {
     print_header "生成诊断包"
-    local OUTDIR TMPDIR BUNDLE
+    local OUTDIR DIAG_DIR BUNDLE
     OUTDIR="$QUENCH_DATA_DIR/diagnostics"
-    TMPDIR=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-diagnostic.XXXXXX") || return 1
-    mkdir -p "$OUTDIR" 2>/dev/null || { rm -rf "$TMPDIR"; error "无法创建诊断包目录"; return 1; }
+    DIAG_DIR=$(quench_mktemp_d "${TMPDIR:-/tmp}/quench-diagnostic.XXXXXX") || return 1
+    mkdir -p "$OUTDIR" 2>/dev/null || { rm -rf "$DIAG_DIR"; error "无法创建诊断包目录"; return 1; }
     BUNDLE="$OUTDIR/diagnostic_$(date +%Y%m%d_%H%M%S).tar.gz"
 
     {
@@ -755,24 +755,24 @@ diagnostic_bundle_create() {
         echo
         echo "[Recent audit]"
         tail -100 "$QUENCH_AUDIT_LOG" 2>/dev/null || true
-    } > "$TMPDIR/summary.txt"
+    } > "$DIAG_DIR/summary.txt"
 
-    [ -f "$SSHD_CONFIG" ] && cp "$SSHD_CONFIG" "$TMPDIR/sshd_config" 2>/dev/null || true
-    [ -d /etc/ssh/sshd_config.d ] && { mkdir -p "$TMPDIR/ssh" && cp -a /etc/ssh/sshd_config.d "$TMPDIR/ssh/" 2>/dev/null || true; }
-    [ -f /etc/caddy/Caddyfile ] && cp /etc/caddy/Caddyfile "$TMPDIR/" 2>/dev/null || true
-    [ -d /etc/caddy/sites.d ] && { mkdir -p "$TMPDIR/caddy" && cp -a /etc/caddy/sites.d "$TMPDIR/caddy/" 2>/dev/null || true; }
-    [ -f /etc/nftables.conf ] && cp /etc/nftables.conf "$TMPDIR/" 2>/dev/null || true
-    [ -f /etc/sysctl.d/98-vps-quench-network-security.conf ] && cp /etc/sysctl.d/98-vps-quench-network-security.conf "$TMPDIR/" 2>/dev/null || true
-    [ -f /etc/sysctl.d/99-quench-bbr.conf ] && cp /etc/sysctl.d/99-quench-bbr.conf "$TMPDIR/" 2>/dev/null || true
-    [ -d "$QUENCH_VERSION_DIR" ] && ls -1 "$QUENCH_VERSION_DIR" > "$TMPDIR/version-files.txt" 2>/dev/null || true
-    [ -d "$QUENCH_BACKUP_DIR" ] && ls -1 "$QUENCH_BACKUP_DIR" > "$TMPDIR/backup-files.txt" 2>/dev/null || true
-    if [ -f "$TMPDIR/summary.txt" ]; then
-        sed -E 's/((PASSWORD|SECRET|PRIVATE_KEY|API_TOKEN)[[:space:]]*[:=][[:space:]]*).*/\1[REDACTED]/I' "$TMPDIR/summary.txt" > "$TMPDIR/summary.redacted" 2>/dev/null || cp "$TMPDIR/summary.txt" "$TMPDIR/summary.redacted"
-        mv "$TMPDIR/summary.redacted" "$TMPDIR/summary.txt"
+    [ -f "$SSHD_CONFIG" ] && cp "$SSHD_CONFIG" "$DIAG_DIR/sshd_config" 2>/dev/null || true
+    [ -d /etc/ssh/sshd_config.d ] && { mkdir -p "$DIAG_DIR/ssh" && cp -a /etc/ssh/sshd_config.d "$DIAG_DIR/ssh/" 2>/dev/null || true; }
+    [ -f /etc/caddy/Caddyfile ] && cp /etc/caddy/Caddyfile "$DIAG_DIR/" 2>/dev/null || true
+    [ -d /etc/caddy/sites.d ] && { mkdir -p "$DIAG_DIR/caddy" && cp -a /etc/caddy/sites.d "$DIAG_DIR/caddy/" 2>/dev/null || true; }
+    [ -f /etc/nftables.conf ] && cp /etc/nftables.conf "$DIAG_DIR/" 2>/dev/null || true
+    [ -f /etc/sysctl.d/98-vps-quench-network-security.conf ] && cp /etc/sysctl.d/98-vps-quench-network-security.conf "$DIAG_DIR/" 2>/dev/null || true
+    [ -f /etc/sysctl.d/99-quench-bbr.conf ] && cp /etc/sysctl.d/99-quench-bbr.conf "$DIAG_DIR/" 2>/dev/null || true
+    [ -d "$QUENCH_VERSION_DIR" ] && ls -1 "$QUENCH_VERSION_DIR" > "$DIAG_DIR/version-files.txt" 2>/dev/null || true
+    [ -d "$QUENCH_BACKUP_DIR" ] && ls -1 "$QUENCH_BACKUP_DIR" > "$DIAG_DIR/backup-files.txt" 2>/dev/null || true
+    if [ -f "$DIAG_DIR/summary.txt" ]; then
+        sed -E 's/((PASSWORD|SECRET|PRIVATE_KEY|API_TOKEN)[[:space:]]*[:=][[:space:]]*).*/\1[REDACTED]/I' "$DIAG_DIR/summary.txt" > "$DIAG_DIR/summary.redacted" 2>/dev/null || cp "$DIAG_DIR/summary.txt" "$DIAG_DIR/summary.redacted"
+        mv "$DIAG_DIR/summary.redacted" "$DIAG_DIR/summary.txt"
     fi
 
-    tar -czf "$BUNDLE" -C "$TMPDIR" . >/dev/null 2>&1 || { rm -rf "$TMPDIR"; error "诊断包打包失败"; return 1; }
-    rm -rf "$TMPDIR"
+    tar -czf "$BUNDLE" -C "$DIAG_DIR" . >/dev/null 2>&1 || { rm -rf "$DIAG_DIR"; error "诊断包打包失败"; return 1; }
+    rm -rf "$DIAG_DIR"
     chmod 600 "$BUNDLE" 2>/dev/null || true
     audit_action "生成诊断包 $(basename "$BUNDLE")" SUCCESS
     info "诊断包已生成：$BUNDLE"

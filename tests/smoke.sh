@@ -2164,4 +2164,45 @@ t_top_055() {
 }
 run_test "Wide terminal did not enable two-column layout" t_top_055
 
+# The diagnostic bundle used to declare `local TMPDIR` and then build its work
+# directory from ${TMPDIR:-/tmp}. The local shadow made that expansion always /tmp,
+# and every helper called from the function saw the work directory as TMPDIR.
+t_diag_001() {
+    DIAG_ROOT=$(mktemp -d)
+    export TMPDIR="$DIAG_ROOT/mytmp"
+    mkdir -p "$TMPDIR"
+    QUENCH_DATA_DIR="$DIAG_ROOT/data"
+    QUENCH_VERSION_DIR="$DIAG_ROOT/data/versions"
+    QUENCH_BACKUP_DIR="$DIAG_ROOT/data/backups"
+    quench_tmp_registry_init || fail "temp registry could not be initialised"
+    diagnostic_bundle_create >/dev/null 2>&1 || fail "diagnostic bundle creation failed"
+    find "$DIAG_ROOT/data/diagnostics" -name 'diagnostic_*.tar.gz' 2>/dev/null | grep -q . \
+        || fail "no diagnostic archive was produced"
+    grep -q "^$TMPDIR/quench-diagnostic" "$QUENCH_TMP_REGISTRY" \
+        || fail "the diagnostic work directory ignored the caller's TMPDIR"
+    quench_tmp_cleanup
+    rm -rf "$DIAG_ROOT"
+    :
+}
+run_test "The diagnostic bundle honours the caller's TMPDIR" t_diag_001
+
+# Rebuilding unchanged sources must not rewrite the manifest, or every build dirties
+# the working tree with a generated_at that is the only thing to have moved.
+t_build_001() {
+    BUILD_COPY=$(mktemp -d)
+    cp -a "$ROOT/src" "$ROOT/build.sh" "$ROOT/vps-quench.sh" \
+          "$ROOT/vps-quench.sh.sha256" "$ROOT/vps-quench.manifest.json" "$BUILD_COPY/" \
+        || fail "could not stage a build copy"
+    ( cd "$BUILD_COPY" && ./build.sh ) >/dev/null || fail "first build failed"
+    cp "$BUILD_COPY/vps-quench.manifest.json" "$BUILD_COPY/manifest.first"
+    sleep 1
+    ( cd "$BUILD_COPY" && ./build.sh ) >/dev/null || fail "second build failed"
+    IDENTICAL=0
+    cmp -s "$BUILD_COPY/manifest.first" "$BUILD_COPY/vps-quench.manifest.json" && IDENTICAL=1
+    rm -rf "$BUILD_COPY"
+    [ "$IDENTICAL" = 1 ] || fail "rebuilding unchanged sources rewrote the manifest"
+    :
+}
+run_test "Rebuilding unchanged sources leaves the manifest untouched" t_build_001
+
 test_summary "Smoke ($OS)"

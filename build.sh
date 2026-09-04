@@ -63,13 +63,22 @@ fi
 
 HASH=$(awk 'NR==1{print $1}' "$CHECKSUM")
 VERSION=$(grep -oE 'V[0-9]+\.[0-9]+\.[0-9]+|V[0-9]+\.[0-9]+' "$OUTPUT" | head -1)
+
+# 只有产物真的变了才刷新时间戳。否则每次构建都会生成一个仅 generated_at 不同
+# 的 diff，把工作区弄脏，也在版本历史里留下无意义的改动。
+GENERATED_AT=""
+if [ -f "$MANIFEST" ] && grep -Fq "\"sha256\": \"$HASH\"" "$MANIFEST"; then
+    GENERATED_AT=$(sed -n 's/.*"generated_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MANIFEST" | head -1)
+fi
+[ -n "$GENERATED_AT" ] || GENERATED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
 cat > "$MANIFEST" <<EOF
 {
   "name": "vps-quench",
   "version": "${VERSION:-unknown}",
   "file": "vps-quench.sh",
   "sha256": "$HASH",
-  "generated_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "generated_at": "$GENERATED_AT",
   "urls": [
     "https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/heads/main/vps-quench.sh",
     "https://github.com/boyang-hu/vps-quench/raw/refs/heads/main/vps-quench.sh",
