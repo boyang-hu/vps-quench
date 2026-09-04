@@ -431,6 +431,7 @@ first_run_recommended_flow() {
     echo "$ANSWER" | grep -qiE '^y(es)?$' || return 0
 
     first_run_preflight || { warn "预检未通过，推荐流程已停止"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     BACKUP=$(config_backup_create first_run_wizard true) \
         && info "配置快照已创建：$BACKUP" \
         || { error "配置备份失败，推荐流程已停止"; return 1; }
@@ -485,6 +486,7 @@ first_run_wizard() {
         case "$CHOICE" in
             1) first_run_preflight; ui_pause ;;
             2)
+                # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
                 BACKUP=$(config_backup_create first_run_wizard true) \
                     && info "配置快照已创建：$BACKUP" \
                     || error "配置备份失败"

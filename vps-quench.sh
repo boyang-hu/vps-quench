@@ -659,16 +659,23 @@ pkg_remove() {
 }
 
 # 通用服务启用（开机自启）
+# 返回真实状态。systemd 分支原来把 enable 的失败 || true 吞掉，于是
+# “当前能跑但重启后不会自启”的服务被当成安装成功。
 svc_enable() {
     local SVC="$1"
     if systemd_available; then
         systemctl unmask "$SVC" 2>/dev/null || true
-        systemctl enable "$SVC" --quiet 2>/dev/null || true
+        systemctl enable "$SVC" --quiet 2>/dev/null || return 1
+        return 0
     elif command -v rc-update &>/dev/null; then
-        rc-update add "$SVC" default 2>/dev/null
+        rc-update add "$SVC" default 2>/dev/null || return 1
+        return 0
     elif command -v update-rc.d &>/dev/null; then
-        update-rc.d "$SVC" enable 2>/dev/null
+        update-rc.d "$SVC" enable 2>/dev/null || return 1
+        return 0
     fi
+    # 没有任何服务管理器：调用方自行决定要不要在意
+    return 1
 }
 
 svc_disable() {
@@ -1544,6 +1551,7 @@ ssh_sync_fail2ban_ports() {
     if [ "$FAILED" = true ]; then
         restore_backup_or_remove "$BACKUP" "$JAIL_FILE" "$EXISTED" || return 1
         if [ "$WAS_RUNNING" = running ]; then
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             restart_fail2ban >/dev/null 2>&1 && f2b_runtime_healthy \
                 || warn "Fail2ban 原配置恢复后仍未正常运行，请立即检查服务"
         fi
@@ -1551,6 +1559,7 @@ ssh_sync_fail2ban_ports() {
         return 1
     fi
     rm -f "$BACKUP"
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$WAS_RUNNING" = running ] \
         && info "Fail2ban sshd jail 已验证：端口 ${PORTS} ✓" \
         || info "Fail2ban 配置已验证：端口 ${PORTS}（服务保持停止）"
@@ -1724,6 +1733,7 @@ ssh_security_status() {
     fi
     if ssh_read_port_state; then warn "存在未完成端口迁移：$OLD_PORT → $NEW_PORT"; WARNINGS=$((WARNINGS + 1)); fi
     echo ""
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$WARNINGS" -eq 0 ] && info "SSH 访问链路检查通过" || warn "发现 $WARNINGS 项需要确认"
 }
 # ══════════════════════════════════════════════════════════
@@ -2012,10 +2022,12 @@ user_nopasswd_status() {
 user_nopasswd_enable() {
     local USERNAME="$1" TARGET TMP
     [ "$USERNAME" != root ] || { error "root 不需要免密 sudo"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     user_valid_name "$USERNAME" && user_exists "$USERNAME" \
         || { error "用户名无效或用户不存在"; return 1; }
     user_is_admin "$USERNAME" \
         || { error "请先授予 $USERNAME sudo/wheel 管理员权限"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     command -v sudo >/dev/null 2>&1 && command -v visudo >/dev/null 2>&1 \
         || { error "系统缺少 sudo 或 visudo"; return 1; }
     TARGET=$(user_nopasswd_file "$USERNAME") || return 1
@@ -2949,6 +2961,7 @@ f2b_unban() {
         done
         read -rp "  输入要解封的 IP（回车返回）: " UNBAN_IP
         [ -n "$UNBAN_IP" ] || return
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         fail2ban-client set "$JAIL" unbanip "$UNBAN_IP" >/dev/null 2>&1 \
             && info "IP $UNBAN_IP 已解封 ✓" || error "解封失败"
         sleep 1
@@ -3023,6 +3036,7 @@ fail2ban_menu() {
         menu_pair "3" "实时日志" "4" "SSH 防护参数"
         menu_pair "5" "编辑 Quench 配置" "6" "卸载 Fail2ban" "$GREEN" "$YELLOW"
         menu_item "u" "安装 / 修复 / 更新 Fail2ban" "$CYAN"
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$F2B_ST" = running ] && menu_item "7" "停止服务" "$YELLOW" || menu_item "7" "启动服务"
         menu_pair "0" "返回主菜单" "00" "退出脚本" "$RED" "$RED"
         box_bot
@@ -3037,8 +3051,10 @@ fail2ban_menu() {
             u|U) f2b_install ;;
             7)
                 if [ "$F2B_ST" = running ]; then
+                    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
                     stop_fail2ban && info "Fail2ban 已停止" || error "停止失败"
                 else
+                    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
                     f2b_validate_config && start_fail2ban && f2b_ping \
                         && info "Fail2ban 已启动 ✓" || error "启动失败，请检查配置和日志"
                 fi
@@ -3207,6 +3223,7 @@ bbr_ensure_baseline() {
         rm -f "$TMP"
         return 0
     fi
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 600 "$TMP" && mv "$TMP" "$BBR_BASELINE_FILE" || {
         rm -f "$TMP"
         error "无法保存 BBR 应用前运行参数基线"
@@ -3827,6 +3844,7 @@ bbr_tc_snapshot_foreign() {
         printf '\n[filter-json]\n'
         "$TC_BIN" -j filter show dev "$DEV" 2>&1 || true
     } > "$TMP" || { rm -f "$TMP"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 600 "$TMP" && mv "$TMP" "$SNAPSHOT" || { rm -f "$TMP"; return 1; }
     printf '%s\n' "$SNAPSHOT"
 }
@@ -4058,6 +4076,7 @@ bbr_tc_write_persistence() {
         rm -f "$TMP"
         return 1
     }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 600 "$TMP" && mv "$TMP" "$TC_STATE_FILE" || { rm -f "$TMP"; return 1; }
 
     TMP=$(mktemp "${TC_HELPER}.tmp.XXXXXX") || return 1
@@ -4128,6 +4147,7 @@ awk -v actual="$ACTUAL" -v expected="$RATE" 'BEGIN {
     exit !(delta<=tolerance)
 }'
 TC_HELPER_EOF
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 700 "$TMP" && mv "$TMP" "$TC_HELPER" || { rm -f "$TMP"; return 1; }
 
     if systemd_available; then
@@ -4146,6 +4166,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
         mv "$TMP" "$SERVICE_TC" || { rm -f "$TMP"; return 1; }
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         systemctl daemon-reload >/dev/null 2>&1 \
             && systemctl enable tc-fq --quiet >/dev/null 2>&1 \
             && systemctl restart tc-fq >/dev/null 2>&1 || {
@@ -4154,6 +4175,7 @@ EOF
             }
     elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_TC_INIT" "$TC_HELPER" openrc || return 1
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         rc-update add tc-fq default >/dev/null 2>&1 \
             && rc-service tc-fq restart >/dev/null 2>&1 || {
                 error "tc 已立即生效，但 OpenRC 持久化失败"
@@ -4161,6 +4183,7 @@ EOF
             }
     elif command -v update-rc.d >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_TC_INIT" "$TC_HELPER" sysv || return 1
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         update-rc.d tc-fq defaults >/dev/null 2>&1 \
             && service tc-fq restart >/dev/null 2>&1 || {
                 error "tc 已立即生效，但 SysV 持久化失败"
@@ -4203,6 +4226,7 @@ case "\${1:-start}" in
 esac
 EOF
     fi
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 755 "$TMP" && mv "$TMP" "$DEST" || { rm -f "$TMP"; return 1; }
 }
 
@@ -5229,6 +5253,7 @@ bbr_calibration_write_result() {
         [ -z "$KNEE" ] || printf 'KNEE_MBPS=%s\n' "$KNEE"
         [ -z "$RECOMMEND" ] || printf 'RECOMMEND_MBPS=%s\n' "$RECOMMEND"
     } > "$TMP"
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 600 "$TMP" && mv "$TMP" "$BBR_CALIBRATION_RESULT_FILE" || { rm -f "$TMP"; return 1; }
 }
 
@@ -5769,6 +5794,7 @@ bbr_cwnd_write_persistence() {
         rm -f "$TMP"
         return 1
     }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 600 "$TMP" && mv "$TMP" "$CWND_STATE_FILE" || { rm -f "$TMP"; return 1; }
 
     TMP=$(mktemp "${CWND_HELPER}.tmp.XXXXXX") || return 1
@@ -5834,6 +5860,7 @@ case "${1:-apply}" in
     *) exit 2 ;;
 esac
 CWND_HELPER_EOF
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 700 "$TMP" && mv "$TMP" "$CWND_HELPER" || { rm -f "$TMP"; return 1; }
 
     if systemd_available; then
@@ -5852,6 +5879,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
         mv "$TMP" "$SERVICE_CWND" || { rm -f "$TMP"; return 1; }
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         systemctl daemon-reload >/dev/null 2>&1 \
             && systemctl enable initcwnd --quiet >/dev/null 2>&1 \
             && systemctl restart initcwnd >/dev/null 2>&1 || {
@@ -5860,6 +5888,7 @@ EOF
             }
     elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_CWND_INIT" "$CWND_HELPER" openrc || return 1
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         rc-update add initcwnd default >/dev/null 2>&1 \
             && rc-service initcwnd restart >/dev/null 2>&1 || {
                 error "initcwnd 已立即生效，但 OpenRC 持久化失败"
@@ -5867,6 +5896,7 @@ EOF
             }
     elif command -v update-rc.d >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_CWND_INIT" "$CWND_HELPER" sysv || return 1
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         update-rc.d initcwnd defaults >/dev/null 2>&1 \
             && service initcwnd restart >/dev/null 2>&1 || {
                 error "initcwnd 已立即生效，但 SysV 持久化失败"
@@ -6525,6 +6555,7 @@ fw_install() {
     safety_arm "${TYPE}_install" || return 1
     case "$TYPE" in
         ufw)
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             ufw default deny incoming >/dev/null 2>&1 \
                 && ufw default allow outgoing >/dev/null 2>&1 \
                 && ufw logging low >/dev/null 2>&1 \
@@ -6558,7 +6589,7 @@ fw_install() {
                 error "HTTP/HTTPS 放行失败，未启用 firewalld"
                 return 1
             fi
-            svc_enable firewalld
+            svc_enable firewalld || warn "firewalld 开机自启设置失败：重启后防火墙不会自动生效"
             if [ "$MODE" != online ] && ! svc_start firewalld; then
                 safety_rollback_after_failure
                 error "firewalld 启动失败"
@@ -6594,6 +6625,7 @@ ufw_add_port() {
     read -rp "  方向 [in/out，默认 in]: " DIR
     DIR="${DIR:-in}"
     [[ "$DIR" =~ ^(in|out)$ ]] || { error "方向只能是 in 或 out"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     ufw allow "$DIR" "$SPEC" >/dev/null 2>&1 && info "已放行 $DIR $SPEC ✓" || error "添加失败"
 }
 
@@ -6605,6 +6637,7 @@ ufw_delete_numbered_rule() {
         read -rp "  输入规则编号（回车返回）: " NUM
         [ -n "$NUM" ] || return
         [[ "$NUM" =~ ^[0-9]+$ ]] || { error "无效编号"; continue; }
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         echo y | ufw delete "$NUM" >/dev/null 2>&1 && info "规则 [$NUM] 已删除 ✓" || error "删除失败"
         sleep 1
     done
@@ -6619,6 +6652,7 @@ ufw_block_ip() {
     read -rp "  IP 或 CIDR: " IP
     [ -n "$IP" ] || return
     FAMILY=$(fw_ip_family "$IP") || { error "IP/CIDR 格式无效"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     ufw deny from "$IP" to any >/dev/null 2>&1 \
         && info "已拉黑 ${IP}（${FAMILY}）✓" || error "操作失败"
 }
@@ -6664,6 +6698,7 @@ ufw_allow_ip() {
         BASE="${SCOPE%/*}"; PROTO="${SCOPE##*/}"
         ufw allow from "$IP" to any port "$BASE" proto "$PROTO" >/dev/null 2>&1 || FAILED=true
     fi
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$FAILED" = false ] && info "已放行 ${IP}（${FAMILY}，范围 ${SCOPE}）✓" || error "操作失败"
 }
 
@@ -6673,6 +6708,7 @@ ufw_quick_allow() {
     echo -e "  将保证 SSH $(ssh_effective_ports_csv)/tcp，并放行 80/tcp、443/tcp"
     read -rp "  确认？(y/N): " CONFIRM
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || return
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     fw_ufw_allow_ssh && fw_allow_web_ports ufw \
         && info "SSH / HTTP / HTTPS 已放行 ✓" || error "放行失败"
 }
@@ -6691,6 +6727,7 @@ fwd_add_port() {
     [ -n "$INPUT" ] || return
     SPEC=$(fw_port_spec_normalize "$INPUT" firewalld) || { error "端口或协议格式无效"; return 1; }
     ZONE=$(fw_firewalld_zone)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     firewall-cmd --permanent --zone="$ZONE" --add-port="$SPEC" >/dev/null 2>&1 \
         && firewall-cmd --reload >/dev/null 2>&1 \
         && info "已放行 $SPEC ✓" || error "添加失败"
@@ -6704,6 +6741,7 @@ fwd_del_port() {
     read -rp "  输入要删除的端口/协议: " INPUT
     [ -n "$INPUT" ] || return
     SPEC=$(fw_port_spec_normalize "$INPUT" firewalld) || { error "格式无效"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     firewall-cmd --permanent --zone="$ZONE" --remove-port="$SPEC" >/dev/null 2>&1 \
         && firewall-cmd --reload >/dev/null 2>&1 \
         && info "端口 $SPEC 已删除 ✓" || error "删除失败"
@@ -6717,6 +6755,7 @@ fwd_block_ip() {
     FAMILY=$(fw_ip_family "$IP") || { error "IP/CIDR 格式无效"; return 1; }
     ZONE=$(fw_firewalld_zone)
     RULE="rule family='${FAMILY}' source address='${IP}' reject"
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     firewall-cmd --permanent --zone="$ZONE" --add-rich-rule="$RULE" >/dev/null 2>&1 \
         && firewall-cmd --reload >/dev/null 2>&1 \
         && info "已拉黑 $IP ✓" || error "操作失败"
@@ -6746,6 +6785,7 @@ fwd_allow_ip() {
         RULE="rule family='${FAMILY}' source address='${IP}' port port='${BASE}' protocol='${PROTO}' accept"
         firewall-cmd --permanent --zone="$ZONE" --add-rich-rule="$RULE" >/dev/null 2>&1 || FAILED=true
     fi
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$FAILED" = false ] && firewall-cmd --reload >/dev/null 2>&1 \
         && info "已放行 ${IP}（范围 ${SCOPE}）✓" || error "操作失败"
 }
@@ -6761,6 +6801,7 @@ fwd_del_ip() {
     read -rp "  输入要删除的规则编号: " NUM
     [[ "$NUM" =~ ^[0-9]+$ ]] && [ "$NUM" -ge 1 ] && [ "$NUM" -le "${#RULES[@]}" ] \
         || { error "无效编号"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     firewall-cmd --permanent --zone="$ZONE" --remove-rich-rule="${RULES[$((NUM - 1))]}" >/dev/null 2>&1 \
         && firewall-cmd --reload >/dev/null 2>&1 \
         && info "规则 [$NUM] 已删除 ✓" || error "删除失败"
@@ -6773,6 +6814,7 @@ fwd_quick_allow() {
     read -rp "  确认？(y/N): " CONFIRM
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || return
     ZONE=$(fw_firewalld_zone)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     fw_firewalld_allow_ssh online "$ZONE" && fw_allow_web_ports firewalld online "$ZONE" \
         && info "SSH / HTTP / HTTPS 已放行 ✓" || error "放行失败"
 }
@@ -6806,6 +6848,7 @@ ufw_menu() {
         STATUS=$(fw_running ufw); [ "$STATUS" = active ] && ST_COLOR="$GREEN" || ST_COLOR="$RED"
         print_header "防火墙管理 — UFW"
         echo -e "  服务状态: ${ST_COLOR}${BOLD}${STATUS}${NC}"
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$STATUS" = active ] && menu_item "1" "关闭防火墙" "$YELLOW" || menu_item "1" "开启防火墙"
         menu_pair "2" "查看规则" "3" "添加端口"
         menu_pair "4" "删除端口" "5" "拉黑 IP"
@@ -6847,6 +6890,7 @@ fwd_menu() {
         STATUS=$(fw_running firewalld); [ "$STATUS" = active ] && ST_COLOR="$GREEN" || ST_COLOR="$RED"
         print_header "防火墙管理 — firewalld"
         echo -e "  服务状态: ${ST_COLOR}${BOLD}${STATUS}${NC}"
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$STATUS" = active ] && menu_item "1" "关闭防火墙" "$YELLOW" || menu_item "1" "开启防火墙"
         menu_pair "2" "查看规则" "3" "添加端口"
         menu_pair "4" "删除端口" "5" "拉黑 IP"
@@ -8227,7 +8271,13 @@ mirror_apply_rpm() {
         "只在新仓库独立验证成功后禁用原核心仓库" || return 1
 
     if mirror_url_probe "$PROBE_URL"; then info "候选 RPM 元数据可访问 ✓"; else
-        RC=$?; [ "$RC" -eq 2 ] && warn "缺少 curl/wget，跳过 HTTP 预检" || { error "候选 RPM 仓库不可访问"; return 1; }
+        RC=$?
+        if [ "$RC" -eq 2 ]; then
+            warn "缺少 curl/wget，跳过 HTTP 预检"
+        else
+            error "候选 RPM 仓库不可访问"
+            return 1
+        fi
     fi
     command -v dnf >/dev/null 2>&1 || { error "当前系统缺少 dnf"; return 1; }
     if ! dnf config-manager --help >/dev/null 2>&1; then
@@ -9271,7 +9321,7 @@ caddy_service_enable() {
         && ! command -v update-rc.d >/dev/null 2>&1 && [ -x /etc/init.d/caddy ]; then
         /etc/init.d/caddy enable >/dev/null 2>&1
     else
-        svc_enable caddy
+        svc_enable caddy || warn "Caddy 开机自启设置失败：重启后需要手动启动"
     fi
 }
 
@@ -9520,11 +9570,13 @@ caddy_install_package() {
         apt-get update -qq || return 1
         apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg || return 1
         TMP=$(quench_mktemp_d) || return 1
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         curl --proto '=https' --tlsv1.2 -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key -o "$TMP/caddy.gpg.key" \
             && curl --proto '=https' --tlsv1.2 -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o "$TMP/caddy.list" \
             && gpg --dearmor --yes -o "$TMP/caddy.gpg" "$TMP/caddy.gpg.key" \
             && grep -Fq 'https://dl.cloudsmith.io/public/caddy/stable/deb/debian' "$TMP/caddy.list" \
             || { rm -rf "$TMP"; return 1; }
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         install -m 644 "$TMP/caddy.gpg" /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
             && install -m 644 "$TMP/caddy.list" /etc/apt/sources.list.d/caddy-stable.list \
             || { rm -rf "$TMP"; return 1; }
@@ -9700,6 +9752,7 @@ caddy_backup_before_change() {
     local LABEL="$1"
     case "$CADDYFILE" in
         /etc/caddy/*)
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             declare -F config_backup_create >/dev/null 2>&1 \
                 && config_backup_create "caddy_${LABEL}" true >/dev/null \
                 || warn "无法建立统一配置备份；仍保留本次即时文件回滚"
@@ -9779,6 +9832,7 @@ caddy_post_install() {
     local MODE="${1:-install}" WAS_ACTIVE="${2:-false}" REPLACE_FRESH="${3:-false}"
     command -v caddy >/dev/null 2>&1 || { error "Caddy 可执行文件不存在"; return 1; }
     caddy_service_available || {
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$(caddy_detect_install_method)" = binary ] \
             && caddy_binary_service_install "$(command -v caddy)" \
             || { error "Caddy 已安装，但没有受支持的持久服务"; return 1; }
@@ -10725,12 +10779,14 @@ caddy_site_diagnostics() {
         echo ""; echo -e "  ${BOLD}${ADDRESS}${NC}  ${DIM}${TYPE} → ${TARGET}${NC}"
         if caddy_site_address_parse "$ADDRESS" && [ "$CADDY_SITE_DOMAIN" = true ]; then
             DNS=$(caddy_domain_addresses "$CADDY_SITE_HOST" 2>/dev/null || true)
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             [ -n "$DNS" ] && echo -e "    DNS：${DIM}$(tr '\n' ' ' <<< "$DNS")${NC}" || warn "${CADDY_SITE_HOST} 无 DNS 结果"
         fi
         if caddy_local_health "$ADDRESS"; then info "本机 Caddy 入口可响应"; else error "本机 Caddy 入口无响应"; fi
         if command -v curl >/dev/null 2>&1; then
             if [[ "$ADDRESS" == http://* || "$ADDRESS" == https://* ]]; then URL="$ADDRESS"; else URL="https://$ADDRESS"; fi
             CODE=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 4 --max-time 10 "$URL" 2>/dev/null || true)
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             [[ "$CODE" =~ ^[1-5][0-9][0-9]$ ]] \
                 && echo -e "    公网 HTTP：${BOLD}${CODE}${NC}" \
                 || warn "公网 HTTPS/HTTP 暂不可验证"
@@ -12591,6 +12647,14 @@ config_archive_extract() {
         error "导入包解压失败"
         return 1
     fi
+    # 归档校验只看成员路径，解包后也只查过符号链接。设备节点、FIFO、套接字
+    # 一旦被 cp -a 搬进 /etc 或 /var/lib，就是一个由归档作者控制的特殊文件。
+    # 只允许普通文件、目录和符号链接三种类型。
+    if find "$STAGE" ! -type f ! -type d ! -type l -print 2>/dev/null | grep -q .; then
+        rm -rf "$STAGE"
+        error "归档包含普通文件、目录、符号链接以外的特殊文件（设备节点 / FIFO / 套接字）"
+        return 1
+    fi
     while IFS= read -r LINK; do
         REL=${LINK#"$STAGE"/}
         TARGET=$(readlink "$LINK" 2>/dev/null || true)
@@ -14157,6 +14221,7 @@ first_run_recommended_flow() {
     echo "$ANSWER" | grep -qiE '^y(es)?$' || return 0
 
     first_run_preflight || { warn "预检未通过，推荐流程已停止"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     BACKUP=$(config_backup_create first_run_wizard true) \
         && info "配置快照已创建：$BACKUP" \
         || { error "配置备份失败，推荐流程已停止"; return 1; }
@@ -14211,6 +14276,7 @@ first_run_wizard() {
         case "$CHOICE" in
             1) first_run_preflight; ui_pause ;;
             2)
+                # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
                 BACKUP=$(config_backup_create first_run_wizard true) \
                     && info "配置快照已创建：$BACKUP" \
                     || error "配置备份失败"
@@ -14466,6 +14532,7 @@ Components: stable
 Architectures: $ARCH
 Signed-By: $KEYRING
 EOF
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 0644 "$STAGE" && mv "$STAGE" "$SOURCE" || { rm -f "$STAGE"; return 1; }
     apt-get update || return 1
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -14517,7 +14584,7 @@ docker_install() {
         apk) docker_install_alpine || { audit_action "通过 Alpine 仓库安装 Docker" FAILED; return 1; } ;;
         *) error "当前包管理器不支持自动安装 Docker：$PM"; return 1 ;;
     esac
-    svc_enable docker
+    svc_enable docker || warn "Docker 开机自启设置失败：重启后需要手动启动"
     svc_start docker || true
     if ! docker_is_ready; then
         error "Docker 包已安装，但守护进程未正常运行"
@@ -14629,8 +14696,10 @@ docker_diagnose() {
     if docker_is_ready; then info "Docker 守护进程运行正常"; else error "Docker 守护进程不可用"; FAILED=1; fi
     if docker_compose_available; then info "Compose 插件可用"; else error "Compose 插件不可用"; FAILED=1; fi
     DRIVER=$(docker info --format '{{.LoggingDriver}}' 2>/dev/null || true)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$DRIVER" = local ] && info "默认日志驱动为 local" || { warn "默认日志驱动为 ${DRIVER:-未知}，建议应用生产基线"; FAILED=1; }
     LIVE=$(docker info --format '{{.LiveRestoreEnabled}}' 2>/dev/null || true)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$LIVE" = true ] && info "live-restore 已启用" || { warn "live-restore 未启用"; FAILED=1; }
     FIREWALL=$(docker_firewall_status)
     case "$FIREWALL" in
@@ -15089,6 +15158,7 @@ self_update() {
         mkdir -p "$QUENCH_VERSION_DIR" || { rm -rf "$WORK"; return 1; }
         chmod 700 "$QUENCH_VERSION_DIR" 2>/dev/null || true
         SAVED="$QUENCH_VERSION_DIR/${CUR_VER:-unknown}_$(date +%Y%m%d_%H%M%S).sh"
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         cp -p "$LOCAL_SCRIPT" "$SAVED" && chmod 700 "$SAVED" \
             || { rm -rf "$WORK"; error "当前版本备份失败"; return 1; }
     fi
@@ -15126,6 +15196,7 @@ self_rollback() {
         "当前版本也会保留为回滚点" || return 0
     CURRENT_BACKUP="$QUENCH_VERSION_DIR/before_rollback_$(date +%Y%m%d_%H%M%S).sh"
     [ ! -f "$LOCAL_SCRIPT" ] || cp -p "$LOCAL_SCRIPT" "$CURRENT_BACKUP" || return 1
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     self_atomic_replace "$SELECTED" "$LOCAL_SCRIPT" && self_script_valid "$LOCAL_SCRIPT" || {
         [ ! -f "$CURRENT_BACKUP" ] || self_atomic_replace "$CURRENT_BACKUP" "$LOCAL_SCRIPT" || true
         error "回滚失败，已尝试恢复当前版本"; return 1;
@@ -16348,6 +16419,7 @@ nft_add_rule() {
 
     nft_lock_acquire || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     if ! echo "$id|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$map_mode|$snat|$acl|yes|$comment" \
@@ -16457,6 +16529,7 @@ nft_edit_rule() {
 
     nft_lock_acquire || return 1
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     nft_rule_record_replace "$id" "$record" \
@@ -16486,6 +16559,7 @@ nft_delete_rule() {
     echo "$confirm" | grep -qiE '^y(es)?$' || return
     nft_lock_acquire || return 1
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     if ! awk -F'|' -v id="$id" '$1 != id' "$NFT_RULES_FILE" > "${rules_backup}.new" \
@@ -16522,6 +16596,7 @@ nft_toggle_rule() {
     record="$rid|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment"
     nft_lock_acquire || return 1
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     nft_rule_record_replace "$id" "$record" \
@@ -16561,6 +16636,7 @@ nft_edit_access() {
     record="$rid|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment"
     nft_lock_acquire || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; rm -f "$rules_backup" "$access_backup" "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     if ! nft_rule_record_replace "$id" "$record" \
@@ -16599,10 +16675,12 @@ nft_refresh_domain_targets() {
         echo "$id|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment" >> "$tmp"
     done < "$NFT_RULES_FILE"
     if [ "$domains" -eq 0 ] || [ "$changed" -eq 0 ]; then
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$domains" -eq 0 ] && warn "没有域名目标" || info "域名目标没有变化"
         rm -f "$tmp"; nft_lock_release; return 0
     fi
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { rm -f "$tmp" "$rules_backup" "$access_backup"; nft_lock_release; return 1; }
     install -m 600 "$tmp" "$NFT_RULES_FILE" \
@@ -16671,6 +16749,7 @@ EOF
     install -m 644 "$tmp" "$NFT_REFRESH_TIMER_FILE" || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
     systemctl daemon-reload >/dev/null 2>&1
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     systemctl enable --now quench-nft-target-refresh.timer >/dev/null 2>&1 \
         && info "域名目标自动刷新已启用（${interval}）✓" \
         || { error "自动刷新启用失败"; return 1; }
@@ -16699,10 +16778,12 @@ nft_diagnostics() {
     echo -e "  IPv6 转发：${BOLD}$(nft_sysctl_get net.ipv6.conf.all.forwarding || echo 不可用)${NC}"
     for family in ipv4 ipv6; do
         if nft_rules_has_family "$family"; then
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             nft_table_present "$family" && info "$family Quench 规则表已加载" || error "$family Quench 规则表缺失"
         fi
     done
     if systemd_available; then
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         systemctl is-enabled --quiet quench-nft-forward.service 2>/dev/null \
             && info "Quench 独立持久服务已启用" || warn "Quench 持久服务未启用"
     fi
@@ -16711,6 +16792,7 @@ nft_diagnostics() {
         [ "$enabled" = yes ] || continue
         flag=$(nft_family_flag "$family")
         route=$(ip "$flag" route get "$tip" 2>/dev/null | head -1 || true)
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ -n "$route" ] && info "[$id] 目标路由存在：$route" || error "[$id] 目标 $tip 没有路由"
         if [ "$proto" != udp ] && nft_tcp_probe "$tip" "$ts"; then
             info "[$id] TCP 目标 ${tip}:${ts} 可连接"
@@ -16744,6 +16826,7 @@ nft_clear_all_rules() {
     [ "$confirm" = CLEAR ] || return
     nft_lock_acquire || return 1
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     if ! : > "$NFT_RULES_FILE" || ! : > "$NFT_ACCESS_FILE"; then
@@ -16834,7 +16917,15 @@ nft_menu() {
             d|D) nft_diagnostics ;;
             r|R) nft_reapply ;;
             f|F) nft_refresh_domain_targets ;;
-            a|A) [ "$timer" = active ] && nft_refresh_timer_disable || nft_refresh_timer_enable ;;
+            a|A)
+                # 不能写成 `active && disable || enable`：disable 一旦失败就会
+                # 掉进 || 去 enable，把刚要关掉的定时器重新打开。
+                if [ "$timer" = active ]; then
+                    nft_refresh_timer_disable
+                else
+                    nft_refresh_timer_enable
+                fi
+                ;;
             u|U) nft_uninstall ;;
             0) return ;;
             00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
@@ -16867,6 +16958,7 @@ self_check_update() {
     HINT_DIR=$(dirname "$QUENCH_UPDATE_HINT_FILE")
     mkdir -p "$HINT_DIR" 2>/dev/null || return
     HINT_STAGE=$(mktemp "$HINT_DIR/.new-version.XXXXXX") || return
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     printf '%s\n' "$REMOTE_VER" > "$HINT_STAGE" && chmod 600 "$HINT_STAGE" \
         && mv "$HINT_STAGE" "$QUENCH_UPDATE_HINT_FILE" || rm -f "$HINT_STAGE"
 }

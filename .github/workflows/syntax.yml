@@ -19,10 +19,10 @@ jobs:
         run: ./build.sh --check
 
       - name: Run ShellCheck
-        # info 级也纳入门禁。SC2015 是唯一例外：仓库里剩余 67 处都是
-        # `cmd && next || cleanup` 这类“失败即清理”惯用法，已逐条审计为良性；
-        # 会导致恢复失败反而删掉配置的危险变体已经修复并有回归测试覆盖。
-        run: shellcheck --severity=info --exclude=SC2015 -x vps-quench.sh build-offline-package.sh tests/offline-package.sh tests/lib/harness.sh
+        # info 级全量门禁，不再全局排除 SC2015：那正是「恢复失败反而删配置」
+        # 所属的规则，全局排除等于以后同类错误也不会报警。现存的每一处都改成
+        # 了带理由的行级 suppression，新写的同类代码仍会被拦下。
+        run: shellcheck --severity=info -x vps-quench.sh build-offline-package.sh tests/offline-package.sh tests/lib/harness.sh
 
       - name: Verify release checksum
         run: sha256sum -c vps-quench.sh.sha256

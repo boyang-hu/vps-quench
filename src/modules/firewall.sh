@@ -170,6 +170,7 @@ fw_install() {
     safety_arm "${TYPE}_install" || return 1
     case "$TYPE" in
         ufw)
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             ufw default deny incoming >/dev/null 2>&1 \
                 && ufw default allow outgoing >/dev/null 2>&1 \
                 && ufw logging low >/dev/null 2>&1 \
@@ -203,7 +204,7 @@ fw_install() {
                 error "HTTP/HTTPS 放行失败，未启用 firewalld"
                 return 1
             fi
-            svc_enable firewalld
+            svc_enable firewalld || warn "firewalld 开机自启设置失败：重启后防火墙不会自动生效"
             if [ "$MODE" != online ] && ! svc_start firewalld; then
                 safety_rollback_after_failure
                 error "firewalld 启动失败"
@@ -239,6 +240,7 @@ ufw_add_port() {
     read -rp "  方向 [in/out，默认 in]: " DIR
     DIR="${DIR:-in}"
     [[ "$DIR" =~ ^(in|out)$ ]] || { error "方向只能是 in 或 out"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     ufw allow "$DIR" "$SPEC" >/dev/null 2>&1 && info "已放行 $DIR $SPEC ✓" || error "添加失败"
 }
 
@@ -250,6 +252,7 @@ ufw_delete_numbered_rule() {
         read -rp "  输入规则编号（回车返回）: " NUM
         [ -n "$NUM" ] || return
         [[ "$NUM" =~ ^[0-9]+$ ]] || { error "无效编号"; continue; }
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         echo y | ufw delete "$NUM" >/dev/null 2>&1 && info "规则 [$NUM] 已删除 ✓" || error "删除失败"
         sleep 1
     done
@@ -264,6 +267,7 @@ ufw_block_ip() {
     read -rp "  IP 或 CIDR: " IP
     [ -n "$IP" ] || return
     FAMILY=$(fw_ip_family "$IP") || { error "IP/CIDR 格式无效"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     ufw deny from "$IP" to any >/dev/null 2>&1 \
         && info "已拉黑 ${IP}（${FAMILY}）✓" || error "操作失败"
 }
@@ -309,6 +313,7 @@ ufw_allow_ip() {
         BASE="${SCOPE%/*}"; PROTO="${SCOPE##*/}"
         ufw allow from "$IP" to any port "$BASE" proto "$PROTO" >/dev/null 2>&1 || FAILED=true
     fi
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$FAILED" = false ] && info "已放行 ${IP}（${FAMILY}，范围 ${SCOPE}）✓" || error "操作失败"
 }
 
@@ -318,6 +323,7 @@ ufw_quick_allow() {
     echo -e "  将保证 SSH $(ssh_effective_ports_csv)/tcp，并放行 80/tcp、443/tcp"
     read -rp "  确认？(y/N): " CONFIRM
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || return
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     fw_ufw_allow_ssh && fw_allow_web_ports ufw \
         && info "SSH / HTTP / HTTPS 已放行 ✓" || error "放行失败"
 }
@@ -336,6 +342,7 @@ fwd_add_port() {
     [ -n "$INPUT" ] || return
     SPEC=$(fw_port_spec_normalize "$INPUT" firewalld) || { error "端口或协议格式无效"; return 1; }
     ZONE=$(fw_firewalld_zone)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     firewall-cmd --permanent --zone="$ZONE" --add-port="$SPEC" >/dev/null 2>&1 \
         && firewall-cmd --reload >/dev/null 2>&1 \
         && info "已放行 $SPEC ✓" || error "添加失败"
@@ -349,6 +356,7 @@ fwd_del_port() {
     read -rp "  输入要删除的端口/协议: " INPUT
     [ -n "$INPUT" ] || return
     SPEC=$(fw_port_spec_normalize "$INPUT" firewalld) || { error "格式无效"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     firewall-cmd --permanent --zone="$ZONE" --remove-port="$SPEC" >/dev/null 2>&1 \
         && firewall-cmd --reload >/dev/null 2>&1 \
         && info "端口 $SPEC 已删除 ✓" || error "删除失败"
@@ -362,6 +370,7 @@ fwd_block_ip() {
     FAMILY=$(fw_ip_family "$IP") || { error "IP/CIDR 格式无效"; return 1; }
     ZONE=$(fw_firewalld_zone)
     RULE="rule family='${FAMILY}' source address='${IP}' reject"
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     firewall-cmd --permanent --zone="$ZONE" --add-rich-rule="$RULE" >/dev/null 2>&1 \
         && firewall-cmd --reload >/dev/null 2>&1 \
         && info "已拉黑 $IP ✓" || error "操作失败"
@@ -391,6 +400,7 @@ fwd_allow_ip() {
         RULE="rule family='${FAMILY}' source address='${IP}' port port='${BASE}' protocol='${PROTO}' accept"
         firewall-cmd --permanent --zone="$ZONE" --add-rich-rule="$RULE" >/dev/null 2>&1 || FAILED=true
     fi
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$FAILED" = false ] && firewall-cmd --reload >/dev/null 2>&1 \
         && info "已放行 ${IP}（范围 ${SCOPE}）✓" || error "操作失败"
 }
@@ -406,6 +416,7 @@ fwd_del_ip() {
     read -rp "  输入要删除的规则编号: " NUM
     [[ "$NUM" =~ ^[0-9]+$ ]] && [ "$NUM" -ge 1 ] && [ "$NUM" -le "${#RULES[@]}" ] \
         || { error "无效编号"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     firewall-cmd --permanent --zone="$ZONE" --remove-rich-rule="${RULES[$((NUM - 1))]}" >/dev/null 2>&1 \
         && firewall-cmd --reload >/dev/null 2>&1 \
         && info "规则 [$NUM] 已删除 ✓" || error "删除失败"
@@ -418,6 +429,7 @@ fwd_quick_allow() {
     read -rp "  确认？(y/N): " CONFIRM
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || return
     ZONE=$(fw_firewalld_zone)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     fw_firewalld_allow_ssh online "$ZONE" && fw_allow_web_ports firewalld online "$ZONE" \
         && info "SSH / HTTP / HTTPS 已放行 ✓" || error "放行失败"
 }
@@ -451,6 +463,7 @@ ufw_menu() {
         STATUS=$(fw_running ufw); [ "$STATUS" = active ] && ST_COLOR="$GREEN" || ST_COLOR="$RED"
         print_header "防火墙管理 — UFW"
         echo -e "  服务状态: ${ST_COLOR}${BOLD}${STATUS}${NC}"
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$STATUS" = active ] && menu_item "1" "关闭防火墙" "$YELLOW" || menu_item "1" "开启防火墙"
         menu_pair "2" "查看规则" "3" "添加端口"
         menu_pair "4" "删除端口" "5" "拉黑 IP"
@@ -492,6 +505,7 @@ fwd_menu() {
         STATUS=$(fw_running firewalld); [ "$STATUS" = active ] && ST_COLOR="$GREEN" || ST_COLOR="$RED"
         print_header "防火墙管理 — firewalld"
         echo -e "  服务状态: ${ST_COLOR}${BOLD}${STATUS}${NC}"
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$STATUS" = active ] && menu_item "1" "关闭防火墙" "$YELLOW" || menu_item "1" "开启防火墙"
         menu_pair "2" "查看规则" "3" "添加端口"
         menu_pair "4" "删除端口" "5" "拉黑 IP"

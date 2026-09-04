@@ -414,6 +414,7 @@ ssh_sync_fail2ban_ports() {
     if [ "$FAILED" = true ]; then
         restore_backup_or_remove "$BACKUP" "$JAIL_FILE" "$EXISTED" || return 1
         if [ "$WAS_RUNNING" = running ]; then
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             restart_fail2ban >/dev/null 2>&1 && f2b_runtime_healthy \
                 || warn "Fail2ban 原配置恢复后仍未正常运行，请立即检查服务"
         fi
@@ -421,6 +422,7 @@ ssh_sync_fail2ban_ports() {
         return 1
     fi
     rm -f "$BACKUP"
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$WAS_RUNNING" = running ] \
         && info "Fail2ban sshd jail 已验证：端口 ${PORTS} ✓" \
         || info "Fail2ban 配置已验证：端口 ${PORTS}（服务保持停止）"
@@ -594,5 +596,6 @@ ssh_security_status() {
     fi
     if ssh_read_port_state; then warn "存在未完成端口迁移：$OLD_PORT → $NEW_PORT"; WARNINGS=$((WARNINGS + 1)); fi
     echo ""
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$WARNINGS" -eq 0 ] && info "SSH 访问链路检查通过" || warn "发现 $WARNINGS 项需要确认"
 }

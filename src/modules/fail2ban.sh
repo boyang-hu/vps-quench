@@ -509,6 +509,7 @@ f2b_unban() {
         done
         read -rp "  输入要解封的 IP（回车返回）: " UNBAN_IP
         [ -n "$UNBAN_IP" ] || return
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         fail2ban-client set "$JAIL" unbanip "$UNBAN_IP" >/dev/null 2>&1 \
             && info "IP $UNBAN_IP 已解封 ✓" || error "解封失败"
         sleep 1
@@ -583,6 +584,7 @@ fail2ban_menu() {
         menu_pair "3" "实时日志" "4" "SSH 防护参数"
         menu_pair "5" "编辑 Quench 配置" "6" "卸载 Fail2ban" "$GREEN" "$YELLOW"
         menu_item "u" "安装 / 修复 / 更新 Fail2ban" "$CYAN"
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$F2B_ST" = running ] && menu_item "7" "停止服务" "$YELLOW" || menu_item "7" "启动服务"
         menu_pair "0" "返回主菜单" "00" "退出脚本" "$RED" "$RED"
         box_bot
@@ -597,8 +599,10 @@ fail2ban_menu() {
             u|U) f2b_install ;;
             7)
                 if [ "$F2B_ST" = running ]; then
+                    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
                     stop_fail2ban && info "Fail2ban 已停止" || error "停止失败"
                 else
+                    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
                     f2b_validate_config && start_fail2ban && f2b_ping \
                         && info "Fail2ban 已启动 ✓" || error "启动失败，请检查配置和日志"
                 fi

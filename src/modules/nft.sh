@@ -1098,6 +1098,7 @@ nft_add_rule() {
 
     nft_lock_acquire || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     if ! echo "$id|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$map_mode|$snat|$acl|yes|$comment" \
@@ -1207,6 +1208,7 @@ nft_edit_rule() {
 
     nft_lock_acquire || return 1
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     nft_rule_record_replace "$id" "$record" \
@@ -1236,6 +1238,7 @@ nft_delete_rule() {
     echo "$confirm" | grep -qiE '^y(es)?$' || return
     nft_lock_acquire || return 1
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     if ! awk -F'|' -v id="$id" '$1 != id' "$NFT_RULES_FILE" > "${rules_backup}.new" \
@@ -1272,6 +1275,7 @@ nft_toggle_rule() {
     record="$rid|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment"
     nft_lock_acquire || return 1
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     nft_rule_record_replace "$id" "$record" \
@@ -1311,6 +1315,7 @@ nft_edit_access() {
     record="$rid|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment"
     nft_lock_acquire || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; rm -f "$rules_backup" "$access_backup" "${NFT_PROMPT_ACCESS_TMP:-}"; return 1; }
     if ! nft_rule_record_replace "$id" "$record" \
@@ -1349,10 +1354,12 @@ nft_refresh_domain_targets() {
         echo "$id|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment" >> "$tmp"
     done < "$NFT_RULES_FILE"
     if [ "$domains" -eq 0 ] || [ "$changed" -eq 0 ]; then
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$domains" -eq 0 ] && warn "没有域名目标" || info "域名目标没有变化"
         rm -f "$tmp"; nft_lock_release; return 0
     fi
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { rm -f "$tmp" "$rules_backup" "$access_backup"; nft_lock_release; return 1; }
     install -m 600 "$tmp" "$NFT_RULES_FILE" \
@@ -1421,6 +1428,7 @@ EOF
     install -m 644 "$tmp" "$NFT_REFRESH_TIMER_FILE" || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
     systemctl daemon-reload >/dev/null 2>&1
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     systemctl enable --now quench-nft-target-refresh.timer >/dev/null 2>&1 \
         && info "域名目标自动刷新已启用（${interval}）✓" \
         || { error "自动刷新启用失败"; return 1; }
@@ -1449,10 +1457,12 @@ nft_diagnostics() {
     echo -e "  IPv6 转发：${BOLD}$(nft_sysctl_get net.ipv6.conf.all.forwarding || echo 不可用)${NC}"
     for family in ipv4 ipv6; do
         if nft_rules_has_family "$family"; then
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             nft_table_present "$family" && info "$family Quench 规则表已加载" || error "$family Quench 规则表缺失"
         fi
     done
     if systemd_available; then
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         systemctl is-enabled --quiet quench-nft-forward.service 2>/dev/null \
             && info "Quench 独立持久服务已启用" || warn "Quench 持久服务未启用"
     fi
@@ -1461,6 +1471,7 @@ nft_diagnostics() {
         [ "$enabled" = yes ] || continue
         flag=$(nft_family_flag "$family")
         route=$(ip "$flag" route get "$tip" 2>/dev/null | head -1 || true)
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ -n "$route" ] && info "[$id] 目标路由存在：$route" || error "[$id] 目标 $tip 没有路由"
         if [ "$proto" != udp ] && nft_tcp_probe "$tip" "$ts"; then
             info "[$id] TCP 目标 ${tip}:${ts} 可连接"
@@ -1494,6 +1505,7 @@ nft_clear_all_rules() {
     [ "$confirm" = CLEAR ] || return
     nft_lock_acquire || return 1
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     cp "$NFT_RULES_FILE" "$rules_backup" && cp "$NFT_ACCESS_FILE" "$access_backup" \
         || { nft_lock_release; return 1; }
     if ! : > "$NFT_RULES_FILE" || ! : > "$NFT_ACCESS_FILE"; then
@@ -1584,7 +1596,15 @@ nft_menu() {
             d|D) nft_diagnostics ;;
             r|R) nft_reapply ;;
             f|F) nft_refresh_domain_targets ;;
-            a|A) [ "$timer" = active ] && nft_refresh_timer_disable || nft_refresh_timer_enable ;;
+            a|A)
+                # 不能写成 `active && disable || enable`：disable 一旦失败就会
+                # 掉进 || 去 enable，把刚要关掉的定时器重新打开。
+                if [ "$timer" = active ]; then
+                    nft_refresh_timer_disable
+                else
+                    nft_refresh_timer_enable
+                fi
+                ;;
             u|U) nft_uninstall ;;
             0) return ;;
             00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;

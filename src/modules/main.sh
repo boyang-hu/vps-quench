@@ -22,6 +22,7 @@ self_check_update() {
     HINT_DIR=$(dirname "$QUENCH_UPDATE_HINT_FILE")
     mkdir -p "$HINT_DIR" 2>/dev/null || return
     HINT_STAGE=$(mktemp "$HINT_DIR/.new-version.XXXXXX") || return
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     printf '%s\n' "$REMOTE_VER" > "$HINT_STAGE" && chmod 600 "$HINT_STAGE" \
         && mv "$HINT_STAGE" "$QUENCH_UPDATE_HINT_FILE" || rm -f "$HINT_STAGE"
 }

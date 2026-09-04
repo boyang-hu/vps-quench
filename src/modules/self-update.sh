@@ -177,6 +177,7 @@ self_update() {
         mkdir -p "$QUENCH_VERSION_DIR" || { rm -rf "$WORK"; return 1; }
         chmod 700 "$QUENCH_VERSION_DIR" 2>/dev/null || true
         SAVED="$QUENCH_VERSION_DIR/${CUR_VER:-unknown}_$(date +%Y%m%d_%H%M%S).sh"
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         cp -p "$LOCAL_SCRIPT" "$SAVED" && chmod 700 "$SAVED" \
             || { rm -rf "$WORK"; error "当前版本备份失败"; return 1; }
     fi
@@ -214,6 +215,7 @@ self_rollback() {
         "当前版本也会保留为回滚点" || return 0
     CURRENT_BACKUP="$QUENCH_VERSION_DIR/before_rollback_$(date +%Y%m%d_%H%M%S).sh"
     [ ! -f "$LOCAL_SCRIPT" ] || cp -p "$LOCAL_SCRIPT" "$CURRENT_BACKUP" || return 1
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     self_atomic_replace "$SELECTED" "$LOCAL_SCRIPT" && self_script_valid "$LOCAL_SCRIPT" || {
         [ ! -f "$CURRENT_BACKUP" ] || self_atomic_replace "$CURRENT_BACKUP" "$LOCAL_SCRIPT" || true
         error "回滚失败，已尝试恢复当前版本"; return 1;

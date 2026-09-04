@@ -53,7 +53,7 @@ caddy_service_enable() {
         && ! command -v update-rc.d >/dev/null 2>&1 && [ -x /etc/init.d/caddy ]; then
         /etc/init.d/caddy enable >/dev/null 2>&1
     else
-        svc_enable caddy
+        svc_enable caddy || warn "Caddy 开机自启设置失败：重启后需要手动启动"
     fi
 }
 
@@ -302,11 +302,13 @@ caddy_install_package() {
         apt-get update -qq || return 1
         apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg || return 1
         TMP=$(quench_mktemp_d) || return 1
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         curl --proto '=https' --tlsv1.2 -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key -o "$TMP/caddy.gpg.key" \
             && curl --proto '=https' --tlsv1.2 -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o "$TMP/caddy.list" \
             && gpg --dearmor --yes -o "$TMP/caddy.gpg" "$TMP/caddy.gpg.key" \
             && grep -Fq 'https://dl.cloudsmith.io/public/caddy/stable/deb/debian' "$TMP/caddy.list" \
             || { rm -rf "$TMP"; return 1; }
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         install -m 644 "$TMP/caddy.gpg" /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
             && install -m 644 "$TMP/caddy.list" /etc/apt/sources.list.d/caddy-stable.list \
             || { rm -rf "$TMP"; return 1; }
@@ -482,6 +484,7 @@ caddy_backup_before_change() {
     local LABEL="$1"
     case "$CADDYFILE" in
         /etc/caddy/*)
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             declare -F config_backup_create >/dev/null 2>&1 \
                 && config_backup_create "caddy_${LABEL}" true >/dev/null \
                 || warn "无法建立统一配置备份；仍保留本次即时文件回滚"
@@ -561,6 +564,7 @@ caddy_post_install() {
     local MODE="${1:-install}" WAS_ACTIVE="${2:-false}" REPLACE_FRESH="${3:-false}"
     command -v caddy >/dev/null 2>&1 || { error "Caddy 可执行文件不存在"; return 1; }
     caddy_service_available || {
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$(caddy_detect_install_method)" = binary ] \
             && caddy_binary_service_install "$(command -v caddy)" \
             || { error "Caddy 已安装，但没有受支持的持久服务"; return 1; }
@@ -1507,12 +1511,14 @@ caddy_site_diagnostics() {
         echo ""; echo -e "  ${BOLD}${ADDRESS}${NC}  ${DIM}${TYPE} → ${TARGET}${NC}"
         if caddy_site_address_parse "$ADDRESS" && [ "$CADDY_SITE_DOMAIN" = true ]; then
             DNS=$(caddy_domain_addresses "$CADDY_SITE_HOST" 2>/dev/null || true)
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             [ -n "$DNS" ] && echo -e "    DNS：${DIM}$(tr '\n' ' ' <<< "$DNS")${NC}" || warn "${CADDY_SITE_HOST} 无 DNS 结果"
         fi
         if caddy_local_health "$ADDRESS"; then info "本机 Caddy 入口可响应"; else error "本机 Caddy 入口无响应"; fi
         if command -v curl >/dev/null 2>&1; then
             if [[ "$ADDRESS" == http://* || "$ADDRESS" == https://* ]]; then URL="$ADDRESS"; else URL="https://$ADDRESS"; fi
             CODE=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 4 --max-time 10 "$URL" 2>/dev/null || true)
+            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             [[ "$CODE" =~ ^[1-5][0-9][0-9]$ ]] \
                 && echo -e "    公网 HTTP：${BOLD}${CODE}${NC}" \
                 || warn "公网 HTTPS/HTTP 暂不可验证"

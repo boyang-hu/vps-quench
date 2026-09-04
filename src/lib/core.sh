@@ -659,16 +659,23 @@ pkg_remove() {
 }
 
 # 通用服务启用（开机自启）
+# 返回真实状态。systemd 分支原来把 enable 的失败 || true 吞掉，于是
+# “当前能跑但重启后不会自启”的服务被当成安装成功。
 svc_enable() {
     local SVC="$1"
     if systemd_available; then
         systemctl unmask "$SVC" 2>/dev/null || true
-        systemctl enable "$SVC" --quiet 2>/dev/null || true
+        systemctl enable "$SVC" --quiet 2>/dev/null || return 1
+        return 0
     elif command -v rc-update &>/dev/null; then
-        rc-update add "$SVC" default 2>/dev/null
+        rc-update add "$SVC" default 2>/dev/null || return 1
+        return 0
     elif command -v update-rc.d &>/dev/null; then
-        update-rc.d "$SVC" enable 2>/dev/null
+        update-rc.d "$SVC" enable 2>/dev/null || return 1
+        return 0
     fi
+    # 没有任何服务管理器：调用方自行决定要不要在意
+    return 1
 }
 
 svc_disable() {

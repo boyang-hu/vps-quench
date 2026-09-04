@@ -1854,4 +1854,51 @@ t_restore_004() {
 }
 run_test "Restoring the SSH backup only succeeds when the service verifies" t_restore_004
 
+# The archive check only looked at member paths, and the post-extraction pass only
+# inspected symlinks. A device node or FIFO on an allowlisted path went straight into
+# /etc through cp -a.
+t_archive_001() {
+    ARC_DIR="$TMP/archive-special"
+    mkdir -p "$ARC_DIR/src/etc" "$ARC_DIR/dest"
+    printf 'quench-test\n' > "$ARC_DIR/src/etc/hostname"
+    mkfifo "$ARC_DIR/src/etc/hosts" 2>/dev/null \
+        || { echo "SKIP: mkfifo unavailable" >&2; exit 0; }
+    ( cd "$ARC_DIR/src" && tar -czf "$ARC_DIR/special.tar.gz" etc/hostname etc/hosts ) \
+        || { echo "could not build the fixture archive" >&2; exit 1; }
+
+    CONFIG_RESTORE_ROOT="$ARC_DIR/dest"
+    config_archive_extract "$ARC_DIR/special.tar.gz" >/dev/null 2>&1 \
+        && { echo "extraction accepted an archive containing a FIFO" >&2; exit 1; }
+    [ ! -e "$ARC_DIR/dest/etc/hostname" ] \
+        || { echo "a rejected archive still copied files into the restore root" >&2; exit 1; }
+
+    # 同一批文件去掉 FIFO 之后必须能正常恢复，证明拒绝的是类型而不是路径
+    rm -f "$ARC_DIR/src/etc/hosts"
+    ( cd "$ARC_DIR/src" && tar -czf "$ARC_DIR/plain.tar.gz" etc/hostname )
+    config_archive_extract "$ARC_DIR/plain.tar.gz" >/dev/null 2>&1 \
+        || { echo "extraction rejected an archive of plain files" >&2; exit 1; }
+    [ -f "$ARC_DIR/dest/etc/hostname" ] \
+        || { echo "a valid archive was not restored" >&2; exit 1; }
+    :
+}
+run_test "Archive restore rejects device nodes, FIFOs and sockets" t_archive_001
+
+# A service that is running now but will not come back after a reboot must not be
+# reported as a successful install.
+t_svc_001() {
+    # shellcheck disable=SC2329 # test stub overrides the sourced function
+    systemd_available() { return 0; }
+    # shellcheck disable=SC2329 # test stub stands in for the systemctl binary
+    systemctl() { case "${1:-}" in enable) return 1 ;; esac; return 0; }
+    svc_enable somesvc >/dev/null 2>&1 \
+        && { echo "svc_enable reported success while systemctl enable failed" >&2; exit 1; }
+
+    # shellcheck disable=SC2329 # test stub stands in for the systemctl binary
+    systemctl() { return 0; }
+    svc_enable somesvc >/dev/null 2>&1 \
+        || { echo "svc_enable reported failure while systemctl enable succeeded" >&2; exit 1; }
+    :
+}
+run_test "svc_enable reports a failed boot-time enable" t_svc_001
+
 test_summary "Fault injection"

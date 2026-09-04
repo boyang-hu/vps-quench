@@ -64,6 +64,14 @@ config_archive_extract() {
         error "导入包解压失败"
         return 1
     fi
+    # 归档校验只看成员路径，解包后也只查过符号链接。设备节点、FIFO、套接字
+    # 一旦被 cp -a 搬进 /etc 或 /var/lib，就是一个由归档作者控制的特殊文件。
+    # 只允许普通文件、目录和符号链接三种类型。
+    if find "$STAGE" ! -type f ! -type d ! -type l -print 2>/dev/null | grep -q .; then
+        rm -rf "$STAGE"
+        error "归档包含普通文件、目录、符号链接以外的特殊文件（设备节点 / FIFO / 套接字）"
+        return 1
+    fi
     while IFS= read -r LINK; do
         REL=${LINK#"$STAGE"/}
         TARGET=$(readlink "$LINK" 2>/dev/null || true)

@@ -155,6 +155,7 @@ bbr_ensure_baseline() {
         rm -f "$TMP"
         return 0
     fi
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 600 "$TMP" && mv "$TMP" "$BBR_BASELINE_FILE" || {
         rm -f "$TMP"
         error "无法保存 BBR 应用前运行参数基线"
@@ -775,6 +776,7 @@ bbr_tc_snapshot_foreign() {
         printf '\n[filter-json]\n'
         "$TC_BIN" -j filter show dev "$DEV" 2>&1 || true
     } > "$TMP" || { rm -f "$TMP"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 600 "$TMP" && mv "$TMP" "$SNAPSHOT" || { rm -f "$TMP"; return 1; }
     printf '%s\n' "$SNAPSHOT"
 }
@@ -1006,6 +1008,7 @@ bbr_tc_write_persistence() {
         rm -f "$TMP"
         return 1
     }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 600 "$TMP" && mv "$TMP" "$TC_STATE_FILE" || { rm -f "$TMP"; return 1; }
 
     TMP=$(mktemp "${TC_HELPER}.tmp.XXXXXX") || return 1
@@ -1076,6 +1079,7 @@ awk -v actual="$ACTUAL" -v expected="$RATE" 'BEGIN {
     exit !(delta<=tolerance)
 }'
 TC_HELPER_EOF
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 700 "$TMP" && mv "$TMP" "$TC_HELPER" || { rm -f "$TMP"; return 1; }
 
     if systemd_available; then
@@ -1094,6 +1098,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
         mv "$TMP" "$SERVICE_TC" || { rm -f "$TMP"; return 1; }
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         systemctl daemon-reload >/dev/null 2>&1 \
             && systemctl enable tc-fq --quiet >/dev/null 2>&1 \
             && systemctl restart tc-fq >/dev/null 2>&1 || {
@@ -1102,6 +1107,7 @@ EOF
             }
     elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_TC_INIT" "$TC_HELPER" openrc || return 1
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         rc-update add tc-fq default >/dev/null 2>&1 \
             && rc-service tc-fq restart >/dev/null 2>&1 || {
                 error "tc 已立即生效，但 OpenRC 持久化失败"
@@ -1109,6 +1115,7 @@ EOF
             }
     elif command -v update-rc.d >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_TC_INIT" "$TC_HELPER" sysv || return 1
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         update-rc.d tc-fq defaults >/dev/null 2>&1 \
             && service tc-fq restart >/dev/null 2>&1 || {
                 error "tc 已立即生效，但 SysV 持久化失败"
@@ -1151,6 +1158,7 @@ case "\${1:-start}" in
 esac
 EOF
     fi
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 755 "$TMP" && mv "$TMP" "$DEST" || { rm -f "$TMP"; return 1; }
 }
 
@@ -2177,6 +2185,7 @@ bbr_calibration_write_result() {
         [ -z "$KNEE" ] || printf 'KNEE_MBPS=%s\n' "$KNEE"
         [ -z "$RECOMMEND" ] || printf 'RECOMMEND_MBPS=%s\n' "$RECOMMEND"
     } > "$TMP"
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 600 "$TMP" && mv "$TMP" "$BBR_CALIBRATION_RESULT_FILE" || { rm -f "$TMP"; return 1; }
 }
 
@@ -2717,6 +2726,7 @@ bbr_cwnd_write_persistence() {
         rm -f "$TMP"
         return 1
     }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 600 "$TMP" && mv "$TMP" "$CWND_STATE_FILE" || { rm -f "$TMP"; return 1; }
 
     TMP=$(mktemp "${CWND_HELPER}.tmp.XXXXXX") || return 1
@@ -2782,6 +2792,7 @@ case "${1:-apply}" in
     *) exit 2 ;;
 esac
 CWND_HELPER_EOF
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 700 "$TMP" && mv "$TMP" "$CWND_HELPER" || { rm -f "$TMP"; return 1; }
 
     if systemd_available; then
@@ -2800,6 +2811,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
         mv "$TMP" "$SERVICE_CWND" || { rm -f "$TMP"; return 1; }
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         systemctl daemon-reload >/dev/null 2>&1 \
             && systemctl enable initcwnd --quiet >/dev/null 2>&1 \
             && systemctl restart initcwnd >/dev/null 2>&1 || {
@@ -2808,6 +2820,7 @@ EOF
             }
     elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_CWND_INIT" "$CWND_HELPER" openrc || return 1
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         rc-update add initcwnd default >/dev/null 2>&1 \
             && rc-service initcwnd restart >/dev/null 2>&1 || {
                 error "initcwnd 已立即生效，但 OpenRC 持久化失败"
@@ -2815,6 +2828,7 @@ EOF
             }
     elif command -v update-rc.d >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_CWND_INIT" "$CWND_HELPER" sysv || return 1
+        # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         update-rc.d initcwnd defaults >/dev/null 2>&1 \
             && service initcwnd restart >/dev/null 2>&1 || {
                 error "initcwnd 已立即生效，但 SysV 持久化失败"

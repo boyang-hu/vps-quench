@@ -818,7 +818,13 @@ mirror_apply_rpm() {
         "只在新仓库独立验证成功后禁用原核心仓库" || return 1
 
     if mirror_url_probe "$PROBE_URL"; then info "候选 RPM 元数据可访问 ✓"; else
-        RC=$?; [ "$RC" -eq 2 ] && warn "缺少 curl/wget，跳过 HTTP 预检" || { error "候选 RPM 仓库不可访问"; return 1; }
+        RC=$?
+        if [ "$RC" -eq 2 ]; then
+            warn "缺少 curl/wget，跳过 HTTP 预检"
+        else
+            error "候选 RPM 仓库不可访问"
+            return 1
+        fi
     fi
     command -v dnf >/dev/null 2>&1 || { error "当前系统缺少 dnf"; return 1; }
     if ! dnf config-manager --help >/dev/null 2>&1; then

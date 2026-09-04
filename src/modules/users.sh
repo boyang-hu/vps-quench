@@ -284,10 +284,12 @@ user_nopasswd_status() {
 user_nopasswd_enable() {
     local USERNAME="$1" TARGET TMP
     [ "$USERNAME" != root ] || { error "root 不需要免密 sudo"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     user_valid_name "$USERNAME" && user_exists "$USERNAME" \
         || { error "用户名无效或用户不存在"; return 1; }
     user_is_admin "$USERNAME" \
         || { error "请先授予 $USERNAME sudo/wheel 管理员权限"; return 1; }
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     command -v sudo >/dev/null 2>&1 && command -v visudo >/dev/null 2>&1 \
         || { error "系统缺少 sudo 或 visudo"; return 1; }
     TARGET=$(user_nopasswd_file "$USERNAME") || return 1

@@ -83,6 +83,7 @@ Components: stable
 Architectures: $ARCH
 Signed-By: $KEYRING
 EOF
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     chmod 0644 "$STAGE" && mv "$STAGE" "$SOURCE" || { rm -f "$STAGE"; return 1; }
     apt-get update || return 1
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -134,7 +135,7 @@ docker_install() {
         apk) docker_install_alpine || { audit_action "通过 Alpine 仓库安装 Docker" FAILED; return 1; } ;;
         *) error "当前包管理器不支持自动安装 Docker：$PM"; return 1 ;;
     esac
-    svc_enable docker
+    svc_enable docker || warn "Docker 开机自启设置失败：重启后需要手动启动"
     svc_start docker || true
     if ! docker_is_ready; then
         error "Docker 包已安装，但守护进程未正常运行"
@@ -246,8 +247,10 @@ docker_diagnose() {
     if docker_is_ready; then info "Docker 守护进程运行正常"; else error "Docker 守护进程不可用"; FAILED=1; fi
     if docker_compose_available; then info "Compose 插件可用"; else error "Compose 插件不可用"; FAILED=1; fi
     DRIVER=$(docker info --format '{{.LoggingDriver}}' 2>/dev/null || true)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$DRIVER" = local ] && info "默认日志驱动为 local" || { warn "默认日志驱动为 ${DRIVER:-未知}，建议应用生产基线"; FAILED=1; }
     LIVE=$(docker info --format '{{.LiveRestoreEnabled}}' 2>/dev/null || true)
+    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
     [ "$LIVE" = true ] && info "live-restore 已启用" || { warn "live-restore 未启用"; FAILED=1; }
     FIREWALL=$(docker_firewall_status)
     case "$FIREWALL" in
