@@ -627,6 +627,33 @@ ROLLBACK_EOF
     warn "防断联保护已启动：${DELAY} 秒内未确认将自动恢复。"
 }
 
+# 变更失败后如何处置安全网。两种语义必须分开：
+#   restored    已确认恢复到变更前状态 -> 可以取消计时器
+#   unverified  恢复未确认            -> 必须保留计时器、快照与事务记录
+# 以前所有失败路径一律 cancel_safety_timer，恢复失败时反而把唯一的兜底撤掉了。
+safety_release_after_failure() {
+    case "${1:-unverified}" in
+        restored)
+            cancel_safety_timer || return 1
+            ;;
+        *)
+            warn "恢复结果未确认，自动回滚计时器保持运行"
+            warn "快照与事务记录已保留，可在「回滚中心 → 检查未完成的变更」处置"
+            audit_action "变更失败且恢复未确认，保留自动回滚" FAILED
+            ;;
+    esac
+    return 0
+}
+
+# 变更已经落到系统上却失败了：立即执行快照回滚，而不是只把计时器取消掉。
+safety_rollback_after_failure() {
+    if safety_rollback_now; then
+        return 0
+    fi
+    error "自动回滚执行失败，快照与事务记录已保留，请立即人工检查"
+    return 1
+}
+
 safety_confirm() {
     [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ] || {
         SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""

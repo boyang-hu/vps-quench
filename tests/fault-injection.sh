@@ -1736,4 +1736,122 @@ t_cancel_001() {
 }
 run_test "A cancel that cannot stop the timer reports failure and keeps the rollback" t_cancel_001
 
+# A failed backup used to still record the path and print "已备份", handing
+# apply_and_restart a rollback point that does not exist.
+t_restore_001() {
+    BK_DIR="$TMP/backup-guard"
+    mkdir -p "$BK_DIR/ro"
+    SSHD_CONFIG="$BK_DIR/sshd_config"
+    printf 'Port 22\n' > "$SSHD_CONFIG"
+    LAST_SSHD_BACKUP="sentinel-must-be-cleared"
+    chmod 500 "$BK_DIR/ro"
+    SSHD_CONFIG="$BK_DIR/ro/sshd_config"
+    printf 'Port 22\n' > "$BK_DIR/source"
+    # 目标目录不可写 => cp 必然失败
+    backup_config >/dev/null 2>&1 \
+        && { chmod 700 "$BK_DIR/ro"; echo "backup_config reported success while cp failed" >&2; exit 1; }
+    chmod 700 "$BK_DIR/ro"
+    [ -z "$LAST_SSHD_BACKUP" ] \
+        || { echo "a failed backup left a bogus rollback point behind: $LAST_SSHD_BACKUP" >&2; exit 1; }
+    :
+}
+run_test "A failed SSH backup reports failure and records no rollback point" t_restore_001
+
+# apply_and_restart must tell the caller whether the config was actually put back:
+# cancelling the safety timer is only safe when it was.
+t_restore_002() {
+    AR_DIR="$TMP/apply-restart"
+    mkdir -p "$AR_DIR"
+    SSHD_CONFIG="$AR_DIR/sshd_config"
+    LAST_SSHD_BACKUP="$AR_DIR/sshd_config.bak"
+    printf 'Port 2222\n' > "$SSHD_CONFIG"
+    printf 'Port 22\n' > "$LAST_SSHD_BACKUP"
+
+    # sshd -t 按“配置文件当前内容”判定，而不是靠标志位：它在 restart_ssh
+    # 之前求值，用标志位会永远拿到旧值。
+    # shellcheck disable=SC2329 # test stub stands in for the sshd binary
+    sshd() {
+        [ "$SSHD_ACCEPTS_BACKUP" = 1 ] || return 1
+        grep -qx 'Port 22' "$SSHD_CONFIG" 2>/dev/null
+    }
+    # shellcheck disable=SC2329 # test stub stands in for restart_ssh
+    restart_ssh() { return 0; }
+
+    # 新配置语法不过，但回滚后的验证通过 => 1（已恢复，可以取消计时器）
+    SSHD_ACCEPTS_BACKUP=1
+    # 必须写成 `|| RC=$?`：非零返回在 set -e 下会直接中止用例。
+    RC=0
+    apply_and_restart >/dev/null 2>&1 || RC=$?
+    [ "$RC" = 1 ] \
+        || { echo "a failure with a verified rollback should return 1, got $RC" >&2; exit 1; }
+    grep -qx 'Port 22' "$SSHD_CONFIG" \
+        || { echo "the verified rollback did not restore the backup" >&2; exit 1; }
+
+    # 回滚后的验证也失败 => 2（恢复未确认，必须保留计时器）
+    printf 'Port 2222\n' > "$SSHD_CONFIG"
+    SSHD_ACCEPTS_BACKUP=0
+    # 必须写成 `|| RC=$?`：非零返回在 set -e 下会直接中止用例。
+    RC=0
+    apply_and_restart >/dev/null 2>&1 || RC=$?
+    [ "$RC" = 2 ] \
+        || { echo "an unverified rollback should return 2, got $RC" >&2; exit 1; }
+    :
+}
+run_test "apply_and_restart distinguishes a verified rollback from an unverified one" t_restore_002
+
+# The unverified branch must leave the timer, the snapshot and the record alone.
+t_restore_003() {
+    REL_DIR="$TMP/release-guard"
+    mkdir -p "$REL_DIR"
+    SAFETY_SCRIPT="$REL_DIR/rollback.sh"
+    printf '#!/bin/bash\n' > "$SAFETY_SCRIPT"
+    SAFETY_UNIT=""
+    SAFETY_PID=""
+    QUENCH_TXN_REGISTRY=""
+    safety_release_after_failure unverified >/dev/null 2>&1 \
+        || { echo "the unverified branch reported failure" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT" ] \
+        || { echo "an unverified restore cancelled the safety net anyway" >&2; exit 1; }
+    [ -n "$SAFETY_SCRIPT" ] \
+        || { echo "an unverified restore dropped the rollback handle" >&2; exit 1; }
+    :
+}
+run_test "An unverified restore keeps the rollback timer armed" t_restore_003
+
+# ssh_restore_last_backup swallowed the restart result with || true, so callers
+# treated a service that never came back as a successful restore and cancelled
+# the safety net on the strength of it.
+t_restore_004() {
+    RB_DIR="$TMP/restore-verify"
+    mkdir -p "$RB_DIR"
+    SSHD_CONFIG="$RB_DIR/sshd_config"
+    LAST_SSHD_BACKUP="$RB_DIR/sshd_config.bak"
+    printf 'Port 2222\n' > "$SSHD_CONFIG"
+    printf 'Port 22\n' > "$LAST_SSHD_BACKUP"
+    # shellcheck disable=SC2329 # test stub stands in for the sshd binary
+    sshd() { return 0; }
+    # shellcheck disable=SC2329 # test stub stands in for restart_ssh
+    restart_ssh() { return 1; }
+    ssh_restore_last_backup >/dev/null 2>&1 \
+        && { echo "restore reported success while the service failed to restart" >&2; exit 1; }
+
+    # 语法检查不过时同样必须失败，而不是写完就算数
+    # shellcheck disable=SC2329 # test stub stands in for the sshd binary
+    sshd() { return 1; }
+    # shellcheck disable=SC2329 # test stub stands in for restart_ssh
+    restart_ssh() { return 0; }
+    ssh_restore_last_backup >/dev/null 2>&1 \
+        && { echo "restore reported success while sshd -t rejected the config" >&2; exit 1; }
+
+    # 都正常时必须成功
+    # shellcheck disable=SC2329 # test stub stands in for the sshd binary
+    sshd() { return 0; }
+    ssh_restore_last_backup >/dev/null 2>&1 \
+        || { echo "restore failed even though the config and service were fine" >&2; exit 1; }
+    grep -qx 'Port 22' "$SSHD_CONFIG" \
+        || { echo "restore did not put the backup back" >&2; exit 1; }
+    :
+}
+run_test "Restoring the SSH backup only succeeds when the service verifies" t_restore_004
+
 test_summary "Fault injection"

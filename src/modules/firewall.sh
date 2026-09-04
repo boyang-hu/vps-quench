@@ -174,14 +174,14 @@ fw_install() {
                 && ufw default allow outgoing >/dev/null 2>&1 \
                 && ufw logging low >/dev/null 2>&1 \
                 && fw_ufw_allow_ssh \
-                || { cancel_safety_timer; error "UFW 基础策略写入失败，未启用"; return 1; }
+                || { safety_rollback_after_failure; error "UFW 基础策略写入失败，未启用"; return 1; }
             if [ "$WEB_CONFIRM" = y ] && ! fw_allow_web_ports ufw; then
-                cancel_safety_timer
+                safety_rollback_after_failure
                 error "HTTP/HTTPS 放行失败，未启用 UFW"
                 return 1
             fi
             ufw --force enable >/dev/null 2>&1 && [ "$(fw_running ufw)" = active ] \
-                || { cancel_safety_timer; error "UFW 启用失败"; return 1; }
+                || { safety_rollback_after_failure; error "UFW 启用失败"; return 1; }
             while IFS= read -r PORT; do
                 LC_ALL=C ufw status 2>/dev/null | grep -Eq "${PORT}/tcp.*LIMIT" \
                     || { error "UFW 启用后未找到 SSH ${PORT}/tcp 限速规则"; return 1; }
@@ -197,20 +197,20 @@ fw_install() {
                 return 1
             fi
             fw_firewalld_allow_ssh "$MODE" "$ZONE" \
-                || { cancel_safety_timer; return 1; }
+                || { safety_rollback_after_failure; return 1; }
             if [ "$WEB_CONFIRM" = y ] && ! fw_allow_web_ports firewalld "$MODE" "$ZONE"; then
-                cancel_safety_timer
+                safety_rollback_after_failure
                 error "HTTP/HTTPS 放行失败，未启用 firewalld"
                 return 1
             fi
             svc_enable firewalld
             if [ "$MODE" != online ] && ! svc_start firewalld; then
-                cancel_safety_timer
+                safety_rollback_after_failure
                 error "firewalld 启动失败"
                 return 1
             fi
             [ "$(fw_running firewalld)" = active ] \
-                || { cancel_safety_timer; error "firewalld 未进入运行状态"; return 1; }
+                || { safety_rollback_after_failure; error "firewalld 未进入运行状态"; return 1; }
             while IFS= read -r PORT; do
                 firewall-cmd --zone="$ZONE" --query-port="${PORT}/tcp" >/dev/null 2>&1 \
                     || { error "firewalld 启动后未放行 SSH ${PORT}/tcp"; return 1; }
@@ -481,7 +481,7 @@ ufw_menu() {
             00) safe_clear; exit 0 ;;
             *) warn "无效选项"; OK=false ;;
         esac
-        case "$CH" in 1|3|4|5|6|7|8) [ "$OK" = true ] && safety_confirm || cancel_safety_timer ;; esac
+        case "$CH" in 1|3|4|5|6|7|8) if [ "$OK" = true ]; then safety_confirm; else safety_rollback_after_failure; fi ;; esac
         [ "$CH" != 0 ] && ui_pause
     done
 }
@@ -522,7 +522,7 @@ fwd_menu() {
             00) safe_clear; exit 0 ;;
             *) warn "无效选项"; OK=false ;;
         esac
-        case "$CH" in 1|3|4|5|6|7|8) [ "$OK" = true ] && safety_confirm || cancel_safety_timer ;; esac
+        case "$CH" in 1|3|4|5|6|7|8) if [ "$OK" = true ]; then safety_confirm; else safety_rollback_after_failure; fi ;; esac
         [ "$CH" != 0 ] && ui_pause
     done
 }

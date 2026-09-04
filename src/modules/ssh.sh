@@ -191,14 +191,17 @@ generate_key() {
     umask "$OLD_UMASK"
 }
 
+# 返回 0 只代表“已恢复且服务验证通过”。原来 restart 的结果被 || true 吞掉，
+# 于是恢复其实没成功也报成功，调用方据此取消了安全网。
 ssh_restore_last_backup() {
     [ -n "${LAST_SSHD_BACKUP:-}" ] && [ -f "$LAST_SSHD_BACKUP" ] || return 1
     atomic_replace_file "$LAST_SSHD_BACKUP" "$SSHD_CONFIG" || return 1
-    restart_ssh >/dev/null 2>&1 || true
+    sshd -t 2>/dev/null || return 1
+    restart_ssh >/dev/null 2>&1 || return 1
 }
 
 ssh_apply_policy() {
-    local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE
+    local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE APPLY_RC
     CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     set_config_file "$CANDIDATE" PasswordAuthentication "$PASSWORD"
@@ -209,13 +212,22 @@ ssh_apply_policy() {
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "$LABEL"; then
         rm -f "$CANDIDATE"; warn "已取消，配置未修改"; return 1
     fi
-    backup_config
+    backup_config || { rm -f "$CANDIDATE"; return 1; }
     safety_arm ssh_login || { rm -f "$CANDIDATE"; return 1; }
     if ! atomic_replace_file "$CANDIDATE" "$SSHD_CONFIG"; then
         rm -f "$CANDIDATE"; cancel_safety_timer; error "SSH 配置写入失败"; return 1
     fi
     rm -f "$CANDIDATE"
-    if ! apply_and_restart; then cancel_safety_timer; return 1; fi
+    apply_and_restart
+    APPLY_RC=$?
+    if [ "$APPLY_RC" -ne 0 ]; then
+        if [ "$APPLY_RC" -eq 2 ]; then
+            safety_release_after_failure unverified
+        else
+            safety_release_after_failure restored
+        fi
+        return 1
+    fi
     local EFFECTIVE_ROOT
     EFFECTIVE_ROOT=$(get_config PermitRootLogin)
     [ "$ROOT_LOGIN" != prohibit-password ] || [ "$EFFECTIVE_ROOT" != without-password ] || EFFECTIVE_ROOT=prohibit-password
@@ -224,8 +236,11 @@ ssh_apply_policy() {
         || [ "$(get_config PubkeyAuthentication)" != "$PUBKEY" ] \
         || [ "$EFFECTIVE_ROOT" != "$ROOT_LOGIN" ]; then
         error "sshd 最终生效值与目标策略不一致，正在恢复"
-        ssh_restore_last_backup
-        cancel_safety_timer
+        if ssh_restore_last_backup; then
+            safety_release_after_failure restored
+        else
+            safety_release_after_failure unverified
+        fi
         return 1
     fi
     audit_action "$LABEL" SUCCESS
@@ -346,7 +361,7 @@ ssh_apply_ports() {
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "$LABEL"; then
         rm -f "$CANDIDATE"; warn "已取消，配置未修改"; return 1
     fi
-    backup_config
+    backup_config || { rm -f "$CANDIDATE"; return 1; }
     if ! atomic_replace_file "$CANDIDATE" "$SSHD_CONFIG"; then
         rm -f "$CANDIDATE"; error "SSH 配置写入失败"; return 1
     fi

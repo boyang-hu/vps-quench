@@ -237,17 +237,20 @@ first_run_ssh_baseline_apply() {
     info "SSH 基础加固已生效：认证尝试 4 次、登录等待 30 秒、关闭 X11 转发"
 }
 
+# 返回 0 只代表“确认恢复成功”。原来文件恢复和每一条 sysctl 回写都 || true，
+# 结果无论恢复成没成都报成功，调用方据此取消了安全网。
 first_run_network_security_restore() {
-    local EXISTED="$1" BACKUP="$2" RUNTIME="$3" KEY VALUE
+    local EXISTED="$1" BACKUP="$2" RUNTIME="$3" KEY VALUE RC=0
     if [ "$EXISTED" = yes ]; then
-        cp "$BACKUP" "$FIRST_RUN_NETWORK_SECURITY_FILE" 2>/dev/null || true
+        atomic_replace_file "$BACKUP" "$FIRST_RUN_NETWORK_SECURITY_FILE" || RC=1
     else
-        rm -f "$FIRST_RUN_NETWORK_SECURITY_FILE"
+        rm -f "$FIRST_RUN_NETWORK_SECURITY_FILE" || RC=1
     fi
     while IFS='|' read -r KEY VALUE; do
         [ -n "$KEY" ] || continue
-        sysctl -w "${KEY}=${VALUE}" >/dev/null 2>&1 || true
+        sysctl -w "${KEY}=${VALUE}" >/dev/null 2>&1 || RC=1
     done < "$RUNTIME"
+    return "$RC"
 }
 
 first_run_network_security_apply() {
@@ -296,8 +299,11 @@ first_run_network_security_apply() {
         || ! sysctl -p "$FIRST_RUN_NETWORK_SECURITY_FILE" >/dev/null 2>&1 \
         || ! first_run_network_security_ready; then
         error "网络安全基线应用失败，正在恢复原参数"
-        first_run_network_security_restore "$EXISTED" "$BACKUP" "$RUNTIME"
-        cancel_safety_timer
+        if first_run_network_security_restore "$EXISTED" "$BACKUP" "$RUNTIME"; then
+            safety_release_after_failure restored
+        else
+            safety_release_after_failure unverified
+        fi
         rm -f "$CANDIDATE" "$RUNTIME" "$BACKUP"
         audit_action "应用首次开荒内核网络安全基线" FAILED
         return 1

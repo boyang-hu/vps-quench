@@ -938,41 +938,53 @@ atomic_replace_file() {
 backup_config() {
     local BACKUP
     BACKUP="$SSHD_CONFIG.bak.$(date +%Y%m%d_%H%M%S)"
-    cp "$SSHD_CONFIG" "$BACKUP"
+    # cp 失败时绝不能仍然记下备份路径并报告成功：apply_and_restart 会以为
+    # 有回滚点，真回滚时读到的却是不存在或残缺的文件。
+    if ! cp "$SSHD_CONFIG" "$BACKUP"; then
+        LAST_SSHD_BACKUP=""
+        error "SSH 配置备份失败：$BACKUP"
+        return 1
+    fi
     LAST_SSHD_BACKUP="$BACKUP"   # 供 apply_and_restart 失败时回滚
     info "配置已备份：$BACKUP"
 }
 
 apply_and_restart() {
     # 失败时自动回滚到最近备份，避免把自己锁在外面
+    # 返回 0 = 已回滚并验证通过；非 0 = 恢复未确认。
     _ssh_rollback() {
-        if [ -n "${LAST_SSHD_BACKUP:-}" ] && [ -f "$LAST_SSHD_BACKUP" ]; then
-            if ! atomic_replace_file "$LAST_SSHD_BACKUP" "$SSHD_CONFIG"; then
-                error "回滚写入失败，sshd_config 保持原样，请立即手动恢复备份：$LAST_SSHD_BACKUP"
-                return 1
-            fi
-            warn "已回滚 sshd_config 到备份：$LAST_SSHD_BACKUP"
-            if sshd -t 2>/dev/null && restart_ssh; then
-                info "已用备份配置恢复 SSH 服务 ✓"
-            else
-                error "回滚后仍异常，请立即手动检查 sshd_config 与 SSH 服务！"
-            fi
-        else
+        if [ -z "${LAST_SSHD_BACKUP:-}" ] || [ ! -f "$LAST_SSHD_BACKUP" ]; then
             error "未找到可回滚的备份，请立即手动检查 SSH 配置！"
+            return 1
         fi
+        if ! atomic_replace_file "$LAST_SSHD_BACKUP" "$SSHD_CONFIG"; then
+            error "回滚写入失败，sshd_config 保持原样，请立即手动恢复备份：$LAST_SSHD_BACKUP"
+            return 1
+        fi
+        warn "已回滚 sshd_config 到备份：$LAST_SSHD_BACKUP"
+        if sshd -t 2>/dev/null && restart_ssh; then
+            info "已用备份配置恢复 SSH 服务 ✓"
+            return 0
+        fi
+        error "回滚后仍异常，请立即手动检查 sshd_config 与 SSH 服务！"
+        return 1
     }
+    # 三态返回，调用方据此决定安全网去留：
+    #   0 = 已生效
+    #   1 = 失败，但已确认恢复到变更前状态（可以取消计时器）
+    #   2 = 失败且恢复未确认（必须保留计时器、快照与事务记录）
     if ! sshd -t 2>/dev/null; then
         error "配置文件语法错误，自动回滚中..."
-        _ssh_rollback
+        _ssh_rollback || return 2
         return 1
     fi
     if restart_ssh; then
         info "SSH 服务已重启 ✓"
-    else
-        error "SSH 服务重启失败，自动回滚中..."
-        _ssh_rollback
-        return 1
+        return 0
     fi
+    error "SSH 服务重启失败，自动回滚中..."
+    _ssh_rollback || return 2
+    return 1
 }
 
 list_keys() {

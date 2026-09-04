@@ -938,41 +938,53 @@ atomic_replace_file() {
 backup_config() {
     local BACKUP
     BACKUP="$SSHD_CONFIG.bak.$(date +%Y%m%d_%H%M%S)"
-    cp "$SSHD_CONFIG" "$BACKUP"
+    # cp 失败时绝不能仍然记下备份路径并报告成功：apply_and_restart 会以为
+    # 有回滚点，真回滚时读到的却是不存在或残缺的文件。
+    if ! cp "$SSHD_CONFIG" "$BACKUP"; then
+        LAST_SSHD_BACKUP=""
+        error "SSH 配置备份失败：$BACKUP"
+        return 1
+    fi
     LAST_SSHD_BACKUP="$BACKUP"   # 供 apply_and_restart 失败时回滚
     info "配置已备份：$BACKUP"
 }
 
 apply_and_restart() {
     # 失败时自动回滚到最近备份，避免把自己锁在外面
+    # 返回 0 = 已回滚并验证通过；非 0 = 恢复未确认。
     _ssh_rollback() {
-        if [ -n "${LAST_SSHD_BACKUP:-}" ] && [ -f "$LAST_SSHD_BACKUP" ]; then
-            if ! atomic_replace_file "$LAST_SSHD_BACKUP" "$SSHD_CONFIG"; then
-                error "回滚写入失败，sshd_config 保持原样，请立即手动恢复备份：$LAST_SSHD_BACKUP"
-                return 1
-            fi
-            warn "已回滚 sshd_config 到备份：$LAST_SSHD_BACKUP"
-            if sshd -t 2>/dev/null && restart_ssh; then
-                info "已用备份配置恢复 SSH 服务 ✓"
-            else
-                error "回滚后仍异常，请立即手动检查 sshd_config 与 SSH 服务！"
-            fi
-        else
+        if [ -z "${LAST_SSHD_BACKUP:-}" ] || [ ! -f "$LAST_SSHD_BACKUP" ]; then
             error "未找到可回滚的备份，请立即手动检查 SSH 配置！"
+            return 1
         fi
+        if ! atomic_replace_file "$LAST_SSHD_BACKUP" "$SSHD_CONFIG"; then
+            error "回滚写入失败，sshd_config 保持原样，请立即手动恢复备份：$LAST_SSHD_BACKUP"
+            return 1
+        fi
+        warn "已回滚 sshd_config 到备份：$LAST_SSHD_BACKUP"
+        if sshd -t 2>/dev/null && restart_ssh; then
+            info "已用备份配置恢复 SSH 服务 ✓"
+            return 0
+        fi
+        error "回滚后仍异常，请立即手动检查 sshd_config 与 SSH 服务！"
+        return 1
     }
+    # 三态返回，调用方据此决定安全网去留：
+    #   0 = 已生效
+    #   1 = 失败，但已确认恢复到变更前状态（可以取消计时器）
+    #   2 = 失败且恢复未确认（必须保留计时器、快照与事务记录）
     if ! sshd -t 2>/dev/null; then
         error "配置文件语法错误，自动回滚中..."
-        _ssh_rollback
+        _ssh_rollback || return 2
         return 1
     fi
     if restart_ssh; then
         info "SSH 服务已重启 ✓"
-    else
-        error "SSH 服务重启失败，自动回滚中..."
-        _ssh_rollback
-        return 1
+        return 0
     fi
+    error "SSH 服务重启失败，自动回滚中..."
+    _ssh_rollback || return 2
+    return 1
 }
 
 list_keys() {
@@ -1309,14 +1321,17 @@ generate_key() {
     umask "$OLD_UMASK"
 }
 
+# 返回 0 只代表“已恢复且服务验证通过”。原来 restart 的结果被 || true 吞掉，
+# 于是恢复其实没成功也报成功，调用方据此取消了安全网。
 ssh_restore_last_backup() {
     [ -n "${LAST_SSHD_BACKUP:-}" ] && [ -f "$LAST_SSHD_BACKUP" ] || return 1
     atomic_replace_file "$LAST_SSHD_BACKUP" "$SSHD_CONFIG" || return 1
-    restart_ssh >/dev/null 2>&1 || true
+    sshd -t 2>/dev/null || return 1
+    restart_ssh >/dev/null 2>&1 || return 1
 }
 
 ssh_apply_policy() {
-    local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE
+    local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE APPLY_RC
     CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     set_config_file "$CANDIDATE" PasswordAuthentication "$PASSWORD"
@@ -1327,13 +1342,22 @@ ssh_apply_policy() {
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "$LABEL"; then
         rm -f "$CANDIDATE"; warn "已取消，配置未修改"; return 1
     fi
-    backup_config
+    backup_config || { rm -f "$CANDIDATE"; return 1; }
     safety_arm ssh_login || { rm -f "$CANDIDATE"; return 1; }
     if ! atomic_replace_file "$CANDIDATE" "$SSHD_CONFIG"; then
         rm -f "$CANDIDATE"; cancel_safety_timer; error "SSH 配置写入失败"; return 1
     fi
     rm -f "$CANDIDATE"
-    if ! apply_and_restart; then cancel_safety_timer; return 1; fi
+    apply_and_restart
+    APPLY_RC=$?
+    if [ "$APPLY_RC" -ne 0 ]; then
+        if [ "$APPLY_RC" -eq 2 ]; then
+            safety_release_after_failure unverified
+        else
+            safety_release_after_failure restored
+        fi
+        return 1
+    fi
     local EFFECTIVE_ROOT
     EFFECTIVE_ROOT=$(get_config PermitRootLogin)
     [ "$ROOT_LOGIN" != prohibit-password ] || [ "$EFFECTIVE_ROOT" != without-password ] || EFFECTIVE_ROOT=prohibit-password
@@ -1342,8 +1366,11 @@ ssh_apply_policy() {
         || [ "$(get_config PubkeyAuthentication)" != "$PUBKEY" ] \
         || [ "$EFFECTIVE_ROOT" != "$ROOT_LOGIN" ]; then
         error "sshd 最终生效值与目标策略不一致，正在恢复"
-        ssh_restore_last_backup
-        cancel_safety_timer
+        if ssh_restore_last_backup; then
+            safety_release_after_failure restored
+        else
+            safety_release_after_failure unverified
+        fi
         return 1
     fi
     audit_action "$LABEL" SUCCESS
@@ -1464,7 +1491,7 @@ ssh_apply_ports() {
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "$LABEL"; then
         rm -f "$CANDIDATE"; warn "已取消，配置未修改"; return 1
     fi
-    backup_config
+    backup_config || { rm -f "$CANDIDATE"; return 1; }
     if ! atomic_replace_file "$CANDIDATE" "$SSHD_CONFIG"; then
         rm -f "$CANDIDATE"; error "SSH 配置写入失败"; return 1
     fi
@@ -6502,14 +6529,14 @@ fw_install() {
                 && ufw default allow outgoing >/dev/null 2>&1 \
                 && ufw logging low >/dev/null 2>&1 \
                 && fw_ufw_allow_ssh \
-                || { cancel_safety_timer; error "UFW 基础策略写入失败，未启用"; return 1; }
+                || { safety_rollback_after_failure; error "UFW 基础策略写入失败，未启用"; return 1; }
             if [ "$WEB_CONFIRM" = y ] && ! fw_allow_web_ports ufw; then
-                cancel_safety_timer
+                safety_rollback_after_failure
                 error "HTTP/HTTPS 放行失败，未启用 UFW"
                 return 1
             fi
             ufw --force enable >/dev/null 2>&1 && [ "$(fw_running ufw)" = active ] \
-                || { cancel_safety_timer; error "UFW 启用失败"; return 1; }
+                || { safety_rollback_after_failure; error "UFW 启用失败"; return 1; }
             while IFS= read -r PORT; do
                 LC_ALL=C ufw status 2>/dev/null | grep -Eq "${PORT}/tcp.*LIMIT" \
                     || { error "UFW 启用后未找到 SSH ${PORT}/tcp 限速规则"; return 1; }
@@ -6525,20 +6552,20 @@ fw_install() {
                 return 1
             fi
             fw_firewalld_allow_ssh "$MODE" "$ZONE" \
-                || { cancel_safety_timer; return 1; }
+                || { safety_rollback_after_failure; return 1; }
             if [ "$WEB_CONFIRM" = y ] && ! fw_allow_web_ports firewalld "$MODE" "$ZONE"; then
-                cancel_safety_timer
+                safety_rollback_after_failure
                 error "HTTP/HTTPS 放行失败，未启用 firewalld"
                 return 1
             fi
             svc_enable firewalld
             if [ "$MODE" != online ] && ! svc_start firewalld; then
-                cancel_safety_timer
+                safety_rollback_after_failure
                 error "firewalld 启动失败"
                 return 1
             fi
             [ "$(fw_running firewalld)" = active ] \
-                || { cancel_safety_timer; error "firewalld 未进入运行状态"; return 1; }
+                || { safety_rollback_after_failure; error "firewalld 未进入运行状态"; return 1; }
             while IFS= read -r PORT; do
                 firewall-cmd --zone="$ZONE" --query-port="${PORT}/tcp" >/dev/null 2>&1 \
                     || { error "firewalld 启动后未放行 SSH ${PORT}/tcp"; return 1; }
@@ -6809,7 +6836,7 @@ ufw_menu() {
             00) safe_clear; exit 0 ;;
             *) warn "无效选项"; OK=false ;;
         esac
-        case "$CH" in 1|3|4|5|6|7|8) [ "$OK" = true ] && safety_confirm || cancel_safety_timer ;; esac
+        case "$CH" in 1|3|4|5|6|7|8) if [ "$OK" = true ]; then safety_confirm; else safety_rollback_after_failure; fi ;; esac
         [ "$CH" != 0 ] && ui_pause
     done
 }
@@ -6850,7 +6877,7 @@ fwd_menu() {
             00) safe_clear; exit 0 ;;
             *) warn "无效选项"; OK=false ;;
         esac
-        case "$CH" in 1|3|4|5|6|7|8) [ "$OK" = true ] && safety_confirm || cancel_safety_timer ;; esac
+        case "$CH" in 1|3|4|5|6|7|8) if [ "$OK" = true ]; then safety_confirm; else safety_rollback_after_failure; fi ;; esac
         [ "$CH" != 0 ] && ui_pause
     done
 }
@@ -13127,6 +13154,33 @@ ROLLBACK_EOF
     warn "防断联保护已启动：${DELAY} 秒内未确认将自动恢复。"
 }
 
+# 变更失败后如何处置安全网。两种语义必须分开：
+#   restored    已确认恢复到变更前状态 -> 可以取消计时器
+#   unverified  恢复未确认            -> 必须保留计时器、快照与事务记录
+# 以前所有失败路径一律 cancel_safety_timer，恢复失败时反而把唯一的兜底撤掉了。
+safety_release_after_failure() {
+    case "${1:-unverified}" in
+        restored)
+            cancel_safety_timer || return 1
+            ;;
+        *)
+            warn "恢复结果未确认，自动回滚计时器保持运行"
+            warn "快照与事务记录已保留，可在「回滚中心 → 检查未完成的变更」处置"
+            audit_action "变更失败且恢复未确认，保留自动回滚" FAILED
+            ;;
+    esac
+    return 0
+}
+
+# 变更已经落到系统上却失败了：立即执行快照回滚，而不是只把计时器取消掉。
+safety_rollback_after_failure() {
+    if safety_rollback_now; then
+        return 0
+    fi
+    error "自动回滚执行失败，快照与事务记录已保留，请立即人工检查"
+    return 1
+}
+
 safety_confirm() {
     [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ] || {
         SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
@@ -13909,17 +13963,20 @@ first_run_ssh_baseline_apply() {
     info "SSH 基础加固已生效：认证尝试 4 次、登录等待 30 秒、关闭 X11 转发"
 }
 
+# 返回 0 只代表“确认恢复成功”。原来文件恢复和每一条 sysctl 回写都 || true，
+# 结果无论恢复成没成都报成功，调用方据此取消了安全网。
 first_run_network_security_restore() {
-    local EXISTED="$1" BACKUP="$2" RUNTIME="$3" KEY VALUE
+    local EXISTED="$1" BACKUP="$2" RUNTIME="$3" KEY VALUE RC=0
     if [ "$EXISTED" = yes ]; then
-        cp "$BACKUP" "$FIRST_RUN_NETWORK_SECURITY_FILE" 2>/dev/null || true
+        atomic_replace_file "$BACKUP" "$FIRST_RUN_NETWORK_SECURITY_FILE" || RC=1
     else
-        rm -f "$FIRST_RUN_NETWORK_SECURITY_FILE"
+        rm -f "$FIRST_RUN_NETWORK_SECURITY_FILE" || RC=1
     fi
     while IFS='|' read -r KEY VALUE; do
         [ -n "$KEY" ] || continue
-        sysctl -w "${KEY}=${VALUE}" >/dev/null 2>&1 || true
+        sysctl -w "${KEY}=${VALUE}" >/dev/null 2>&1 || RC=1
     done < "$RUNTIME"
+    return "$RC"
 }
 
 first_run_network_security_apply() {
@@ -13968,8 +14025,11 @@ first_run_network_security_apply() {
         || ! sysctl -p "$FIRST_RUN_NETWORK_SECURITY_FILE" >/dev/null 2>&1 \
         || ! first_run_network_security_ready; then
         error "网络安全基线应用失败，正在恢复原参数"
-        first_run_network_security_restore "$EXISTED" "$BACKUP" "$RUNTIME"
-        cancel_safety_timer
+        if first_run_network_security_restore "$EXISTED" "$BACKUP" "$RUNTIME"; then
+            safety_release_after_failure restored
+        else
+            safety_release_after_failure unverified
+        fi
         rm -f "$CANDIDATE" "$RUNTIME" "$BACKUP"
         audit_action "应用首次开荒内核网络安全基线" FAILED
         return 1
