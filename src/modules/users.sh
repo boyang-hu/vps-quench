@@ -486,12 +486,11 @@ user_set_password() {
 }
 
 user_key_menu_for() {
-    local USERNAME="$1" CHOICE
+    local USERNAME="$1" CHOICE AUTH_FILE
     while true; do
-        local AUTH_KEYS
-        AUTH_KEYS=$(user_authorized_keys "$USERNAME")
+        AUTH_FILE=$(user_authorized_keys "$USERNAME")
         print_header "$USERNAME · SSH 公钥"
-        echo -e "  路径：${DIM}$AUTH_KEYS${NC}"
+        echo -e "  路径：${DIM}${AUTH_FILE}${NC}"
         echo -e "  公钥：${BOLD}$(user_key_count "$USERNAME")${NC}"
         echo ""
         menu_pair "1" "查看公钥" "2" "添加公钥"
@@ -499,20 +498,20 @@ user_key_menu_for() {
         menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
         read -rp "$(ui_prompt '选择操作 [0-4]: ')" CHOICE
         case "$CHOICE" in
-            1) show_keys; ui_pause ;;
-            2) add_key; user_fix_ssh_permissions "$USERNAME"; audit_action "为用户 $USERNAME 添加 SSH 公钥" SUCCESS; ui_pause ;;
+            1) show_keys "$AUTH_FILE"; ui_pause ;;
+            2) add_key "$AUTH_FILE"; user_fix_ssh_permissions "$USERNAME"; audit_action "为用户 $USERNAME 添加 SSH 公钥" SUCCESS; ui_pause ;;
             3)
                 if user_ready_admin "$USERNAME" && [ "$(user_ready_admin_count)" -le 1 ] \
                     && [ "$(get_config PasswordAuthentication)" = no ]; then
                     error "不能删除最后一个可接管管理员的最后一组公钥"
                 else
-                    delete_key
+                    delete_key "$AUTH_FILE"
                     user_fix_ssh_permissions "$USERNAME"
                     audit_action "删除用户 $USERNAME 的 SSH 公钥" SUCCESS
                 fi
                 ui_pause
                 ;;
-            4) generate_key; user_fix_ssh_permissions "$USERNAME"; audit_action "为用户 $USERNAME 生成 SSH 密钥" SUCCESS; ui_pause ;;
+            4) generate_key "$AUTH_FILE"; user_fix_ssh_permissions "$USERNAME"; audit_action "为用户 $USERNAME 生成 SSH 密钥" SUCCESS; ui_pause ;;
             0) return ;;
             00) safe_clear; exit 0 ;;
             *) warn "无效选项"; sleep 1 ;;
@@ -546,9 +545,9 @@ user_create() {
     read -rp "  现在添加 SSH 公钥？(Y/n): " ADD_KEY
     ADD_KEY="${ADD_KEY:-y}"
     if echo "$ADD_KEY" | grep -qiE '^y(es)?$'; then
-        local AUTH_KEYS
-        AUTH_KEYS=$(user_authorized_keys "$USERNAME")
-        add_key
+        local AUTH_FILE
+        AUTH_FILE=$(user_authorized_keys "$USERNAME")
+        add_key "$AUTH_FILE"
         user_fix_ssh_permissions "$USERNAME"
     fi
     audit_action "创建用户 $USERNAME" SUCCESS

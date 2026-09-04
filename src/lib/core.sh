@@ -681,9 +681,12 @@ ssh_effective_ports_csv() {
     ssh_effective_ports | awk 'NF && !seen[$1]++ {if (out != "") out=out ","; out=out $1} END {print out}'
 }
 
+# 目标 authorized_keys 一律显式传入；省略时才回落到全局 AUTH_KEYS。
+# 以前这些函数只读全局变量，调用方靠 `local AUTH_KEYS` 的动态作用域来“换用户”，
+# 谁改动一下调用顺序，公钥就会被写到 root 头上。
 ssh_key_count() {
-    local COUNT
-    COUNT=$(grep -cE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2|sk-ssh|sk-ecdsa|ssh-dss) ' "$AUTH_KEYS" 2>/dev/null || true)
+    local AUTH_FILE="${1:-$AUTH_KEYS}" COUNT
+    COUNT=$(grep -cE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2|sk-ssh|sk-ecdsa|ssh-dss) ' "$AUTH_FILE" 2>/dev/null || true)
     case "$COUNT" in
         ''|*[!0-9]*) printf '0\n' ;;
         *) printf '%s\n' "$COUNT" ;;
@@ -820,7 +823,8 @@ apply_and_restart() {
 }
 
 list_keys() {
-    if [ ! -f "$AUTH_KEYS" ] || ! grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2|sk-ssh|sk-ecdsa|ssh-dss) ' "$AUTH_KEYS" 2>/dev/null; then
+    local AUTH_FILE="${1:-$AUTH_KEYS}"
+    if [ ! -f "$AUTH_FILE" ] || ! grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2|sk-ssh|sk-ecdsa|ssh-dss) ' "$AUTH_FILE" 2>/dev/null; then
         echo -e "  ${YELLOW}（暂无公钥）${NC}"
         return 1
     fi
@@ -837,7 +841,7 @@ list_keys() {
             echo ""
             i=$((i+1))
         fi
-    done < "$AUTH_KEYS"
+    done < "$AUTH_FILE"
     return 0
 }
 

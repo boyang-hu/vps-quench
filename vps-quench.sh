@@ -681,9 +681,12 @@ ssh_effective_ports_csv() {
     ssh_effective_ports | awk 'NF && !seen[$1]++ {if (out != "") out=out ","; out=out $1} END {print out}'
 }
 
+# 目标 authorized_keys 一律显式传入；省略时才回落到全局 AUTH_KEYS。
+# 以前这些函数只读全局变量，调用方靠 `local AUTH_KEYS` 的动态作用域来“换用户”，
+# 谁改动一下调用顺序，公钥就会被写到 root 头上。
 ssh_key_count() {
-    local COUNT
-    COUNT=$(grep -cE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2|sk-ssh|sk-ecdsa|ssh-dss) ' "$AUTH_KEYS" 2>/dev/null || true)
+    local AUTH_FILE="${1:-$AUTH_KEYS}" COUNT
+    COUNT=$(grep -cE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2|sk-ssh|sk-ecdsa|ssh-dss) ' "$AUTH_FILE" 2>/dev/null || true)
     case "$COUNT" in
         ''|*[!0-9]*) printf '0\n' ;;
         *) printf '%s\n' "$COUNT" ;;
@@ -820,7 +823,8 @@ apply_and_restart() {
 }
 
 list_keys() {
-    if [ ! -f "$AUTH_KEYS" ] || ! grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2|sk-ssh|sk-ecdsa|ssh-dss) ' "$AUTH_KEYS" 2>/dev/null; then
+    local AUTH_FILE="${1:-$AUTH_KEYS}"
+    if [ ! -f "$AUTH_FILE" ] || ! grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2|sk-ssh|sk-ecdsa|ssh-dss) ' "$AUTH_FILE" 2>/dev/null; then
         echo -e "  ${YELLOW}（暂无公钥）${NC}"
         return 1
     fi
@@ -837,7 +841,7 @@ list_keys() {
             echo ""
             i=$((i+1))
         fi
-    done < "$AUTH_KEYS"
+    done < "$AUTH_FILE"
     return 0
 }
 
@@ -964,11 +968,15 @@ firewall_allow_port() {
 # ══════════════════════════════════════════════════════════
 
 show_keys() {
+    local AUTH_FILE="${1:-}"
+    [ -n "$AUTH_FILE" ] || { error "内部错误：show_keys 未收到目标 authorized_keys 路径"; return 1; }
     print_header "查看已有公钥"
-    list_keys
+    list_keys "$AUTH_FILE"
 }
 
 add_key() {
+    local AUTH_FILE="${1:-}"
+    [ -n "$AUTH_FILE" ] || { error "内部错误：add_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "添加 SSH 公钥"
     echo -e "  请粘贴公钥内容（以 ssh-ed25519 / ssh-rsa 等开头）"
     echo -e "  粘贴完成后按 ${BOLD}Enter${NC}，再按 ${BOLD}Ctrl+D${NC} 结束输入："
@@ -990,29 +998,31 @@ add_key() {
         return
     fi
 
-    mkdir -p "$(dirname "$AUTH_KEYS")"
-    chmod 700 "$(dirname "$AUTH_KEYS")"
+    mkdir -p "$(dirname "$AUTH_FILE")"
+    chmod 700 "$(dirname "$AUTH_FILE")"
 
     # 检查是否已存在相同公钥（取类型+主体比较，忽略备注差异）
     local KEY_BODY
     KEY_BODY=$(echo "$PUBKEY_INPUT" | awk '{print $1, $2}')
-    if grep -qF "$KEY_BODY" "$AUTH_KEYS" 2>/dev/null; then
+    if grep -qF "$KEY_BODY" "$AUTH_FILE" 2>/dev/null; then
         warn "该公钥已存在，跳过添加（避免重复）"
         return
     fi
 
-    echo "$PUBKEY_INPUT" >> "$AUTH_KEYS"
-    chmod 600 "$AUTH_KEYS"
+    echo "$PUBKEY_INPUT" >> "$AUTH_FILE"
+    chmod 600 "$AUTH_FILE"
 
     local TOTAL
-    TOTAL=$(ssh_key_count)
+    TOTAL=$(ssh_key_count "$AUTH_FILE")
     info "公钥已添加！当前共 $TOTAL 个公钥 ✓"
 }
 
 delete_key() {
+    local AUTH_FILE="${1:-}"
+    [ -n "$AUTH_FILE" ] || { error "内部错误：delete_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "删除 SSH 公钥"
 
-    if ! list_keys; then
+    if ! list_keys "$AUTH_FILE"; then
         return
     fi
 
@@ -1030,7 +1040,7 @@ delete_key() {
             if [ "$i" -eq "$DEL_NUM" ]; then TARGET_LINE="$line"; break; fi
             i=$((i+1))
         fi
-    done < "$AUTH_KEYS"
+    done < "$AUTH_FILE"
 
     if [ -z "$TARGET_LINE" ]; then
         error "编号 $DEL_NUM 不存在。"; return
@@ -1047,13 +1057,15 @@ delete_key() {
     # 取公钥主体（类型+base64）作为匹配依据，避免尾部空格/备注差异导致删除失败
     local KEY_BODY
     KEY_BODY=$(echo "$TARGET_LINE" | awk '{print $1, $2}')
-    grep -vF "$KEY_BODY" "$AUTH_KEYS" > "${AUTH_KEYS}.tmp" || true
-    mv "${AUTH_KEYS}.tmp" "$AUTH_KEYS"
-    chmod 600 "$AUTH_KEYS"
+    grep -vF "$KEY_BODY" "$AUTH_FILE" > "${AUTH_FILE}.tmp" || true
+    mv "${AUTH_FILE}.tmp" "$AUTH_FILE"
+    chmod 600 "$AUTH_FILE"
     info "公钥已删除 ✓"
 }
 
 generate_key() {
+    local AUTH_FILE="${1:-}"
+    [ -n "$AUTH_FILE" ] || { error "内部错误：generate_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "生成 SSH 密钥对"
 
     echo -e "  选择密钥类型："
@@ -1124,15 +1136,15 @@ generate_key() {
     read -rp "  是否将公钥添加到本服务器？(Y/n，默认Y): " ADD_CONFIRM
     [ -z "${ADD_CONFIRM}" ] && ADD_CONFIRM="y"
     if echo "${ADD_CONFIRM}" | grep -qiE '^y(es)?$'; then
-        mkdir -p "$(dirname "$AUTH_KEYS")"; chmod 700 "$(dirname "$AUTH_KEYS")"
+        mkdir -p "$(dirname "$AUTH_FILE")"; chmod 700 "$(dirname "$AUTH_FILE")"
         local KEY_BODY
         KEY_BODY=$(echo "$PUBKEY" | awk '{print $1, $2}')
-        if grep -qF "$KEY_BODY" "$AUTH_KEYS" 2>/dev/null; then
+        if grep -qF "$KEY_BODY" "$AUTH_FILE" 2>/dev/null; then
             warn "该公钥已存在于服务器，跳过添加"
         else
-            echo "$PUBKEY" >> "$AUTH_KEYS"; chmod 600 "$AUTH_KEYS"
+            echo "$PUBKEY" >> "$AUTH_FILE"; chmod 600 "$AUTH_FILE"
             local TOTAL
-            TOTAL=$(ssh_key_count)
+            TOTAL=$(ssh_key_count "$AUTH_FILE")
             echo ""
             info "公钥已添加到服务器！当前共 $TOTAL 个公钥 ✓"
         fi
@@ -2022,12 +2034,11 @@ user_set_password() {
 }
 
 user_key_menu_for() {
-    local USERNAME="$1" CHOICE
+    local USERNAME="$1" CHOICE AUTH_FILE
     while true; do
-        local AUTH_KEYS
-        AUTH_KEYS=$(user_authorized_keys "$USERNAME")
+        AUTH_FILE=$(user_authorized_keys "$USERNAME")
         print_header "$USERNAME · SSH 公钥"
-        echo -e "  路径：${DIM}$AUTH_KEYS${NC}"
+        echo -e "  路径：${DIM}${AUTH_FILE}${NC}"
         echo -e "  公钥：${BOLD}$(user_key_count "$USERNAME")${NC}"
         echo ""
         menu_pair "1" "查看公钥" "2" "添加公钥"
@@ -2035,20 +2046,20 @@ user_key_menu_for() {
         menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
         read -rp "$(ui_prompt '选择操作 [0-4]: ')" CHOICE
         case "$CHOICE" in
-            1) show_keys; ui_pause ;;
-            2) add_key; user_fix_ssh_permissions "$USERNAME"; audit_action "为用户 $USERNAME 添加 SSH 公钥" SUCCESS; ui_pause ;;
+            1) show_keys "$AUTH_FILE"; ui_pause ;;
+            2) add_key "$AUTH_FILE"; user_fix_ssh_permissions "$USERNAME"; audit_action "为用户 $USERNAME 添加 SSH 公钥" SUCCESS; ui_pause ;;
             3)
                 if user_ready_admin "$USERNAME" && [ "$(user_ready_admin_count)" -le 1 ] \
                     && [ "$(get_config PasswordAuthentication)" = no ]; then
                     error "不能删除最后一个可接管管理员的最后一组公钥"
                 else
-                    delete_key
+                    delete_key "$AUTH_FILE"
                     user_fix_ssh_permissions "$USERNAME"
                     audit_action "删除用户 $USERNAME 的 SSH 公钥" SUCCESS
                 fi
                 ui_pause
                 ;;
-            4) generate_key; user_fix_ssh_permissions "$USERNAME"; audit_action "为用户 $USERNAME 生成 SSH 密钥" SUCCESS; ui_pause ;;
+            4) generate_key "$AUTH_FILE"; user_fix_ssh_permissions "$USERNAME"; audit_action "为用户 $USERNAME 生成 SSH 密钥" SUCCESS; ui_pause ;;
             0) return ;;
             00) safe_clear; exit 0 ;;
             *) warn "无效选项"; sleep 1 ;;
@@ -2082,9 +2093,9 @@ user_create() {
     read -rp "  现在添加 SSH 公钥？(Y/n): " ADD_KEY
     ADD_KEY="${ADD_KEY:-y}"
     if echo "$ADD_KEY" | grep -qiE '^y(es)?$'; then
-        local AUTH_KEYS
-        AUTH_KEYS=$(user_authorized_keys "$USERNAME")
-        add_key
+        local AUTH_FILE
+        AUTH_FILE=$(user_authorized_keys "$USERNAME")
+        add_key "$AUTH_FILE"
         user_fix_ssh_permissions "$USERNAME"
     fi
     audit_action "创建用户 $USERNAME" SUCCESS

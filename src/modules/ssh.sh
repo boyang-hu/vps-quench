@@ -3,11 +3,15 @@
 # ══════════════════════════════════════════════════════════
 
 show_keys() {
+    local AUTH_FILE="${1:-}"
+    [ -n "$AUTH_FILE" ] || { error "内部错误：show_keys 未收到目标 authorized_keys 路径"; return 1; }
     print_header "查看已有公钥"
-    list_keys
+    list_keys "$AUTH_FILE"
 }
 
 add_key() {
+    local AUTH_FILE="${1:-}"
+    [ -n "$AUTH_FILE" ] || { error "内部错误：add_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "添加 SSH 公钥"
     echo -e "  请粘贴公钥内容（以 ssh-ed25519 / ssh-rsa 等开头）"
     echo -e "  粘贴完成后按 ${BOLD}Enter${NC}，再按 ${BOLD}Ctrl+D${NC} 结束输入："
@@ -29,29 +33,31 @@ add_key() {
         return
     fi
 
-    mkdir -p "$(dirname "$AUTH_KEYS")"
-    chmod 700 "$(dirname "$AUTH_KEYS")"
+    mkdir -p "$(dirname "$AUTH_FILE")"
+    chmod 700 "$(dirname "$AUTH_FILE")"
 
     # 检查是否已存在相同公钥（取类型+主体比较，忽略备注差异）
     local KEY_BODY
     KEY_BODY=$(echo "$PUBKEY_INPUT" | awk '{print $1, $2}')
-    if grep -qF "$KEY_BODY" "$AUTH_KEYS" 2>/dev/null; then
+    if grep -qF "$KEY_BODY" "$AUTH_FILE" 2>/dev/null; then
         warn "该公钥已存在，跳过添加（避免重复）"
         return
     fi
 
-    echo "$PUBKEY_INPUT" >> "$AUTH_KEYS"
-    chmod 600 "$AUTH_KEYS"
+    echo "$PUBKEY_INPUT" >> "$AUTH_FILE"
+    chmod 600 "$AUTH_FILE"
 
     local TOTAL
-    TOTAL=$(ssh_key_count)
+    TOTAL=$(ssh_key_count "$AUTH_FILE")
     info "公钥已添加！当前共 $TOTAL 个公钥 ✓"
 }
 
 delete_key() {
+    local AUTH_FILE="${1:-}"
+    [ -n "$AUTH_FILE" ] || { error "内部错误：delete_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "删除 SSH 公钥"
 
-    if ! list_keys; then
+    if ! list_keys "$AUTH_FILE"; then
         return
     fi
 
@@ -69,7 +75,7 @@ delete_key() {
             if [ "$i" -eq "$DEL_NUM" ]; then TARGET_LINE="$line"; break; fi
             i=$((i+1))
         fi
-    done < "$AUTH_KEYS"
+    done < "$AUTH_FILE"
 
     if [ -z "$TARGET_LINE" ]; then
         error "编号 $DEL_NUM 不存在。"; return
@@ -86,13 +92,15 @@ delete_key() {
     # 取公钥主体（类型+base64）作为匹配依据，避免尾部空格/备注差异导致删除失败
     local KEY_BODY
     KEY_BODY=$(echo "$TARGET_LINE" | awk '{print $1, $2}')
-    grep -vF "$KEY_BODY" "$AUTH_KEYS" > "${AUTH_KEYS}.tmp" || true
-    mv "${AUTH_KEYS}.tmp" "$AUTH_KEYS"
-    chmod 600 "$AUTH_KEYS"
+    grep -vF "$KEY_BODY" "$AUTH_FILE" > "${AUTH_FILE}.tmp" || true
+    mv "${AUTH_FILE}.tmp" "$AUTH_FILE"
+    chmod 600 "$AUTH_FILE"
     info "公钥已删除 ✓"
 }
 
 generate_key() {
+    local AUTH_FILE="${1:-}"
+    [ -n "$AUTH_FILE" ] || { error "内部错误：generate_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "生成 SSH 密钥对"
 
     echo -e "  选择密钥类型："
@@ -163,15 +171,15 @@ generate_key() {
     read -rp "  是否将公钥添加到本服务器？(Y/n，默认Y): " ADD_CONFIRM
     [ -z "${ADD_CONFIRM}" ] && ADD_CONFIRM="y"
     if echo "${ADD_CONFIRM}" | grep -qiE '^y(es)?$'; then
-        mkdir -p "$(dirname "$AUTH_KEYS")"; chmod 700 "$(dirname "$AUTH_KEYS")"
+        mkdir -p "$(dirname "$AUTH_FILE")"; chmod 700 "$(dirname "$AUTH_FILE")"
         local KEY_BODY
         KEY_BODY=$(echo "$PUBKEY" | awk '{print $1, $2}')
-        if grep -qF "$KEY_BODY" "$AUTH_KEYS" 2>/dev/null; then
+        if grep -qF "$KEY_BODY" "$AUTH_FILE" 2>/dev/null; then
             warn "该公钥已存在于服务器，跳过添加"
         else
-            echo "$PUBKEY" >> "$AUTH_KEYS"; chmod 600 "$AUTH_KEYS"
+            echo "$PUBKEY" >> "$AUTH_FILE"; chmod 600 "$AUTH_FILE"
             local TOTAL
-            TOTAL=$(ssh_key_count)
+            TOTAL=$(ssh_key_count "$AUTH_FILE")
             echo ""
             info "公钥已添加到服务器！当前共 $TOTAL 个公钥 ✓"
         fi

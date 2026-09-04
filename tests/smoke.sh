@@ -531,6 +531,51 @@ EOF
     [[ "$(ssh_key_count)" = 0 ]] || { echo "Missing authorized_keys did not return zero" >&2; exit 1; }
 )
 
+# These helpers used to take their target from a dynamically scoped AUTH_KEYS, so a
+# caller that shadowed it in the wrong order would write a user's key into root's
+# authorized_keys. The target is an explicit argument now; the global is only a default.
+(
+    mkdir -p "$TMP/keyarg"
+    AUTH_KEYS="$TMP/keyarg/global"
+    : > "$AUTH_KEYS"
+    KEY_TARGET="$TMP/keyarg/explicit"
+    : > "$KEY_TARGET"
+
+    printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExplicitTarget explicit@test' \
+        | add_key "$KEY_TARGET" >/dev/null 2>&1
+    grep -qF ExplicitTarget "$KEY_TARGET" \
+        || { echo "add_key ignored its explicit target file" >&2; exit 1; }
+    [ ! -s "$AUTH_KEYS" ] \
+        || { echo "add_key wrote into the global AUTH_KEYS instead of its argument" >&2; exit 1; }
+
+    [ "$(ssh_key_count "$KEY_TARGET")" = 1 ] \
+        || { echo "ssh_key_count ignored its explicit target file" >&2; exit 1; }
+    [ "$(ssh_key_count)" = 0 ] \
+        || { echo "ssh_key_count no longer defaults to the global AUTH_KEYS" >&2; exit 1; }
+
+    list_keys "$KEY_TARGET" >/dev/null \
+        || { echo "list_keys ignored its explicit target file" >&2; exit 1; }
+    list_keys >/dev/null 2>&1 \
+        && { echo "list_keys default did not fall back to the empty global file" >&2; exit 1; }
+
+    printf '1\ny\n' | delete_key "$KEY_TARGET" >/dev/null 2>&1
+    [ "$(ssh_key_count "$KEY_TARGET")" = 0 ] \
+        || { echo "delete_key ignored its explicit target file" >&2; exit 1; }
+
+    # The mutating helpers take no default: forgetting the argument must fail loudly
+    # rather than quietly falling back to root's authorized_keys.
+    for KEY_FN in show_keys add_key delete_key generate_key; do
+        "$KEY_FN" >/dev/null 2>&1 \
+            && { echo "$KEY_FN accepted a missing target file" >&2; exit 1; }
+    done
+
+    # 没有任何一处写到全局默认文件上
+    if [ -s "$AUTH_KEYS" ]; then
+        echo "A key helper leaked into the global AUTH_KEYS" >&2
+        exit 1
+    fi
+)
+
 [[ "$(ts_https_date_epoch 'Sat, 25 Jul 2026 12:00:00 GMT')" = 1784980800 ]] || { echo "HTTPS Date header parsing failed" >&2; exit 1; }
 ! ts_https_date_epoch 'invalid date' >/dev/null 2>&1 || { echo "Invalid HTTPS Date header was accepted" >&2; exit 1; }
 [[ "$(ts_epoch_utc 1784980800)" = '2026-07-25 12:00:00' ]] || { echo "HTTPS epoch formatting failed" >&2; exit 1; }
