@@ -11,12 +11,18 @@ trap 'rm -rf "$TMP"' EXIT
 export QUENCH_TEST_MODE=1
 # shellcheck source=/dev/null
 source "$ROOT/vps-quench.sh"
+# shellcheck source=lib/harness.sh
+source "$ROOT/tests/lib/harness.sh"
 
-confirm_change_preview "test" "reject" <<< "n" >/dev/null 2>&1 && { echo "Preview accepted rejection" >&2; exit 1; }
-confirm_change_preview "test" "accept" <<< "y" >/dev/null 2>&1 || { echo "Preview rejected confirmation" >&2; exit 1; }
+t_fitop_001() {
+    confirm_change_preview "test" "reject" <<< "n" >/dev/null 2>&1 && { echo "Preview accepted rejection" >&2; exit 1; }
+    confirm_change_preview "test" "accept" <<< "y" >/dev/null 2>&1 || { echo "Preview rejected confirmation" >&2; exit 1; }
+    :
+}
+run_test "Preview accepted rejection …+1 项" t_fitop_001
 
 # Passwordless sudo must roll back when the effective non-interactive check fails.
-(
+t_fi_001() {
     USER_PASSWD_FILE="$TMP/nopasswd-passwd"
     USER_GROUP_FILE="$TMP/nopasswd-group"
     USER_SUDOERS_DIR="$TMP/nopasswd-sudoers"
@@ -36,10 +42,12 @@ confirm_change_preview "test" "accept" <<< "y" >/dev/null 2>&1 || { echo "Previe
         || { echo "Passwordless sudo accepted a failed runtime verification" >&2; exit 1; }
     [ ! -e "$(user_nopasswd_file admin)" ] \
         || { echo "Failed passwordless sudo verification left an active rule" >&2; exit 1; }
-)
+    :
+}
+run_test "Passwordless sudo must roll back when the effective non-interactive check fails" t_fi_001
 
 # A colliding sudoers file not owned by Quench must never be overwritten or deleted.
-(
+t_fi_002() {
     USER_PASSWD_FILE="$TMP/nopasswd-collision-passwd"
     USER_GROUP_FILE="$TMP/nopasswd-collision-group"
     USER_SUDOERS_DIR="$TMP/nopasswd-collision-sudoers"
@@ -64,11 +72,13 @@ confirm_change_preview "test" "accept" <<< "y" >/dev/null 2>&1 || { echo "Previe
         || { echo "Passwordless sudo deleted a foreign sudoers file" >&2; exit 1; }
     grep -qx 'admin ALL=(root) NOPASSWD: /usr/bin/systemctl' "$COLLISION_FILE" \
         || { echo "Foreign sudoers file contents changed" >&2; exit 1; }
-)
+    :
+}
+run_test "A colliding sudoers file not owned by Quench must never be overwritten or deleted" t_fi_002
 
 # A pending network transaction must roll back before another starts. Newly created
 # DNS drop-ins must also disappear during immediate rollback.
-(
+t_fi_003() {
     SAFETY_ROOT="$TMP/safety-root"
     SAFETY_DATA="$TMP/safety-data"
     SAFETY_SNAPSHOT="$TMP/safety-snapshot.tar.gz"
@@ -98,16 +108,20 @@ confirm_change_preview "test" "accept" <<< "y" >/dev/null 2>&1 || { echo "Previe
     [ ! -e "$SAFETY_NEW_PATH" ] \
         || { echo "Safety rollback left a newly-created DNS drop-in behind" >&2; exit 1; }
     cancel_safety_timer
-)
+    :
+}
+run_test "A pending network transaction must roll back before another starts" t_fi_003
 
-(
+t_fi_004() {
     ROLLBACK_MARK="$TMP/dns-immediate-rollback"
     safety_rollback_now() { : > "$ROLLBACK_MARK"; }
     dns_fail_and_rollback 'injected DNS failure' NetworkManager >/dev/null 2>&1 || true
     [ -f "$ROLLBACK_MARK" ] || { echo "DNS failure did not request immediate rollback" >&2; exit 1; }
-)
+    :
+}
+run_test "A failed DNS apply requests an immediate rollback" t_fi_004
 
-(
+t_fi_005() {
     sleep 600 &
     STALE_PID=$!
     trap 'kill "$STALE_PID" 2>/dev/null || true; wait "$STALE_PID" 2>/dev/null || true' EXIT
@@ -115,7 +129,9 @@ confirm_change_preview "test" "accept" <<< "y" >/dev/null 2>&1 || { echo "Previe
     SAFETY_SCRIPT="$TMP/already-finished-rollback.sh"
     ! safety_confirm >/dev/null 2>&1 || { echo "A finished safety timer was treated as active" >&2; exit 1; }
     kill -0 "$STALE_PID" 2>/dev/null || { echo "Safety confirmation killed an unrelated reused PID" >&2; exit 1; }
-)
+    :
+}
+run_test "A finished safety timer is no longer reported as pending" t_fi_005
 
 docker() { [ "$1" = "inspect" ] && printf '<no value>\n'; }
 [ -z "$(docker_inspect_label fake-id com.docker.compose.project)" ] || {
@@ -123,16 +139,20 @@ docker() { [ "$1" = "inspect" ] && printf '<no value>\n'; }
     exit 1
 }
 
-docker_compose_url_valid 'https://example.com/path/app.yml?token=1' \
-    || { echo "Valid HTTPS Compose URL was rejected" >&2; exit 1; }
-! docker_compose_url_valid 'http://example.com/app.yml' \
-    || { echo "Insecure Compose URL was accepted" >&2; exit 1; }
-! docker_compose_url_valid 'https://user:secret@example.com/app.yml' \
-    || { echo "Credential-bearing Compose URL was accepted" >&2; exit 1; }
+t_fitop_002() {
+    docker_compose_url_valid 'https://example.com/path/app.yml?token=1' \
+        || { echo "Valid HTTPS Compose URL was rejected" >&2; exit 1; }
+    ! docker_compose_url_valid 'http://example.com/app.yml' \
+        || { echo "Insecure Compose URL was accepted" >&2; exit 1; }
+    ! docker_compose_url_valid 'https://user:secret@example.com/app.yml' \
+        || { echo "Credential-bearing Compose URL was accepted" >&2; exit 1; }
+    :
+}
+run_test "Valid HTTPS Compose URL was rejected …+2 项" t_fitop_002
 
 # Atomic replacement must preserve the target mode, and must leave the target
 # untouched when staging fails instead of truncating it like a plain cp would.
-(
+t_fi_006() {
     ATOMIC_DIR="$TMP/atomic"
     mkdir -p "$ATOMIC_DIR"
     printf 'new\n' > "$ATOMIC_DIR/source"
@@ -161,7 +181,9 @@ docker_compose_url_valid 'https://example.com/path/app.yml?token=1' \
         echo "Atomic replace left a staging file behind" >&2
         exit 1
     fi
-)
+    :
+}
+run_test "Atomic replacement must preserve the target mode, and must leave the target untouched when…" t_fi_006
 
 # A broken sshd validation must restore the previous configuration.
 SSHD_CONFIG="$TMP/sshd_config"
@@ -170,8 +192,12 @@ printf 'Port 2222\n' > "$SSHD_CONFIG"
 printf 'Port 22\n' > "$LAST_SSHD_BACKUP"
 sshd() { return 1; }
 restart_ssh() { return 0; }
-apply_and_restart >/dev/null 2>&1 && { echo "Expected SSH validation failure" >&2; exit 1; }
-grep -qx 'Port 22' "$SSHD_CONFIG" || { echo "SSH rollback did not restore backup" >&2; exit 1; }
+t_fitop_003() {
+    apply_and_restart >/dev/null 2>&1 && { echo "Expected SSH validation failure" >&2; exit 1; }
+    grep -qx 'Port 22' "$SSHD_CONFIG" || { echo "SSH rollback did not restore backup" >&2; exit 1; }
+    :
+}
+run_test "Expected SSH validation failure …+1 项" t_fitop_003
 
 # A tar failure must not leave a partial backup archive.
 QUENCH_DATA_DIR="$TMP/data"
@@ -179,7 +205,11 @@ QUENCH_BACKUP_DIR="$QUENCH_DATA_DIR/backups"
 export QUENCH_AUDIT_LOG="$TMP/audit.log"
 # shellcheck disable=SC2329 # test stub overrides the sourced function for config_backup_create
 config_backup_paths() { printf 'tmp/does-not-exist-quench-test\n'; }
-config_backup_create injected_failure true >/dev/null 2>&1 && { echo "Expected backup failure" >&2; exit 1; }
+t_fitop_004() {
+    config_backup_create injected_failure true >/dev/null 2>&1 && { echo "Expected backup failure" >&2; exit 1; }
+    :
+}
+run_test "Expected backup failure" t_fitop_004
 if find "$QUENCH_BACKUP_DIR" -type f -name '*.tar.gz' 2>/dev/null | grep -q .; then
     echo "Partial backup archive was left behind" >&2
     exit 1
@@ -194,14 +224,26 @@ config_backup_create one true >/dev/null
 config_backup_create two true >/dev/null
 config_backup_create three true >/dev/null
 COUNT=$(find "$QUENCH_BACKUP_DIR" -type f -name '*.tar.gz' | wc -l | tr -d ' ')
-[ "$COUNT" -eq 2 ] || { echo "Backup retention kept $COUNT archives instead of 2" >&2; exit 1; }
+t_fitop_005() {
+    [ "$COUNT" -eq 2 ] || { echo "Backup retention kept $COUNT archives instead of 2" >&2; exit 1; }
+    :
+}
+run_test "Backup retention kept \$COUNT archives instead of 2" t_fitop_005
 
 # Export/import helpers must validate paths and write archives to a caller-specified destination.
 EXPORT_PATH="$TMP/exported-config.tar.gz"
-config_export_archive "$EXPORT_PATH" test >/dev/null || { echo "Export helper failed" >&2; exit 1; }
-[ -f "$EXPORT_PATH" ] || { echo "Export helper did not create archive" >&2; exit 1; }
+t_fitop_006() {
+    config_export_archive "$EXPORT_PATH" test >/dev/null || { echo "Export helper failed" >&2; exit 1; }
+    [ -f "$EXPORT_PATH" ] || { echo "Export helper did not create archive" >&2; exit 1; }
+    :
+}
+run_test "Export helper failed …+1 项" t_fitop_006
 config_import_archive() { [ "$1" = "$EXPORT_PATH" ]; }
-config_import_archive "$EXPORT_PATH" >/dev/null || { echo "Import helper failed" >&2; exit 1; }
+t_fitop_007() {
+    config_import_archive "$EXPORT_PATH" >/dev/null || { echo "Import helper failed" >&2; exit 1; }
+    :
+}
+run_test "Import helper failed" t_fitop_007
 
 # Imported archives may contain only the explicit Quench configuration allowlist.
 mkdir -p "$TMP/archive-source/etc"
@@ -214,17 +256,23 @@ config_archive_validate "$TMP/malicious-config.tar.gz" >/dev/null 2>&1 && {
 mkdir -p "$TMP/archive-source/etc/caddy"
 printf 'valid\n' > "$TMP/archive-source/etc/caddy/Caddyfile"
 tar -czf "$TMP/valid-config.tar.gz" -C "$TMP/archive-source" etc/caddy/Caddyfile
-config_archive_validate "$TMP/valid-config.tar.gz" >/dev/null \
-    || { echo "Config import rejected an allowlisted path" >&2; exit 1; }
-(
+t_fitop_008() {
+    config_archive_validate "$TMP/valid-config.tar.gz" >/dev/null \
+        || { echo "Config import rejected an allowlisted path" >&2; exit 1; }
+    :
+}
+run_test "Config import rejected an allowlisted path" t_fitop_008
+t_fi_007() {
     export CONFIG_RESTORE_ROOT="$TMP/restored-root"
     config_archive_extract "$TMP/valid-config.tar.gz" >/dev/null
     grep -qx valid "$CONFIG_RESTORE_ROOT/etc/caddy/Caddyfile" \
         || { echo "Allowlisted config archive was not restored" >&2; exit 1; }
-)
+    :
+}
+run_test "Config archive restore accepts allowlisted paths and rejects the rest" t_fi_007
 
 # A partially applied first-run network baseline must restore its file and runtime sysctl values.
-(
+t_fi_008() {
     FIRST_RUN_NETWORK_SECURITY_FILE="$TMP/first-run-network-security.conf"
     FIRST_RUN_SYSCTL_STATE="$TMP/first-run-sysctl.state"
     printf '# existing network policy\nnet.ipv4.tcp_syncookies = 0\n' > "$FIRST_RUN_NETWORK_SECURITY_FILE"
@@ -275,10 +323,12 @@ config_archive_validate "$TMP/valid-config.tar.gz" >/dev/null \
         || { echo "First-run sysctl failure did not restore the config file" >&2; exit 1; }
     cmp -s "$FIRST_RUN_SYSCTL_STATE" "$TMP/first-run-sysctl.expected" \
         || { echo "First-run sysctl failure did not restore runtime values" >&2; exit 1; }
-)
+    :
+}
+run_test "A partially applied first-run network baseline must restore its file and runtime sysctl values" t_fi_008
 
 # Firewall installation must never enable UFW when the rate-limited SSH rule failed.
-(
+t_fi_009() {
     UFW_LOG="$TMP/ufw.log"
     print_header() { :; }
     info() { :; }
@@ -293,10 +343,12 @@ config_archive_validate "$TMP/valid-config.tar.gz" >/dev/null \
     }
     fw_install ufw >/dev/null 2>&1 && { echo "UFW install succeeded after SSH allow failure" >&2; exit 1; }
     ! grep -q -- '--force enable' "$UFW_LOG" || { echo "UFW was enabled without its SSH rule" >&2; sed 's/^/  /' "$UFW_LOG" >&2; exit 1; }
-)
+    :
+}
+run_test "Firewall installation must never enable UFW when the rate-limited SSH rule failed" t_fi_009
 
 # UFW's own netfilter rules must not be mistaken for a separate raw-iptables backend.
-(
+t_fi_010() {
     IPTABLES_CALLED=false
     UFW_LIMIT=false
     info() { :; }
@@ -317,10 +369,12 @@ config_archive_validate "$TMP/valid-config.tar.gz" >/dev/null \
         || { echo "UFW SSH port allowance failed" >&2; exit 1; }
     [ "$IPTABLES_CALLED" = false ] \
         || { echo "UFW rules were misclassified as raw iptables" >&2; exit 1; }
-)
+    :
+}
+run_test "UFW's own netfilter rules must not be mistaken for a separate raw-iptables backend" t_fi_010
 
 # A successful UFW command without an effective rule must still abort SSH migration.
-(
+t_fi_011() {
     info() { :; }
     warn() { :; }
     error() { :; }
@@ -331,10 +385,12 @@ config_archive_validate "$TMP/valid-config.tar.gz" >/dev/null \
     }
     ! firewall_allow_port 2222 <<< '' >/dev/null 2>&1 \
         || { echo "UFW allowance was accepted without an effective LIMIT rule" >&2; exit 1; }
-)
+    :
+}
+run_test "A successful UFW command without an effective rule must still abort SSH migration" t_fi_011
 
 # A pre-existing broad ALLOW must not silently bypass the newly added SSH LIMIT rule.
-(
+t_fi_012() {
     info() { :; }
     warn() { :; }
     error() { :; }
@@ -347,18 +403,22 @@ config_archive_validate "$TMP/valid-config.tar.gz" >/dev/null \
     }
     ! firewall_allow_port 2222 <<< '' >/dev/null 2>&1 \
         || { echo "UFW broad ALLOW was allowed to bypass SSH rate limiting" >&2; exit 1; }
-)
+    :
+}
+run_test "A pre-existing broad ALLOW must not silently bypass the newly added SSH LIMIT rule" t_fi_012
 
 # A broad UFW deny/reject must not be mistaken for a usable SSH allowance.
-(
+t_fi_013() {
     ufw() { printf 'Status: active\n2222/tcp LIMIT IN Anywhere\n2222/tcp DENY IN Anywhere\n'; }
     svc_is_active() { return 1; }
     ! firewall_port_ready 2222 \
         || { echo "UFW broad DENY was ignored during SSH readiness validation" >&2; exit 1; }
-)
+    :
+}
+run_test "A broad UFW deny/reject must not be mistaken for a usable SSH allowance" t_fi_013
 
 # firewalld SSH rules must target the zone bound to the active interface, not blindly use default.
-(
+t_fi_014() {
     FWD_LOG="$TMP/firewalld-ssh-zone.log"
     info() { :; }
     warn() { :; }
@@ -372,10 +432,12 @@ config_archive_validate "$TMP/valid-config.tar.gz" >/dev/null \
         || { echo "firewalld SSH rule used the wrong zone" >&2; exit 1; }
     grep -Fq -- '--zone=external --query-port=2222/tcp' "$FWD_LOG" \
         || { echo "firewalld SSH rule was not verified in its active zone" >&2; exit 1; }
-)
+    :
+}
+run_test "firewalld SSH rules must target the zone bound to the active interface, not blindly use default" t_fi_014
 
 # UFW installation must set explicit defaults, limit SSH, and keep web ports closed by default.
-(
+t_fi_015() {
     UFW_LOG="$TMP/ufw-minimal.log"
     print_header() { :; }
     info() { :; }
@@ -400,10 +462,12 @@ config_archive_validate "$TMP/valid-config.tar.gz" >/dev/null \
     grep -qx 'logging low' "$UFW_LOG" || { echo "UFW low logging was not enabled" >&2; exit 1; }
     grep -qx 'limit 2222/tcp' "$UFW_LOG" || { echo "UFW SSH rule was not rate-limited" >&2; exit 1; }
     ! grep -Eq 'allow (80|443)/tcp' "$UFW_LOG" || { echo "UFW opened web ports without confirmation" >&2; exit 1; }
-)
+    :
+}
+run_test "UFW installation must set explicit defaults, limit SSH, and keep web ports closed by default" t_fi_015
 
 # A first firewalld start must write the permanent SSH rule while the daemon is still offline.
-(
+t_fi_016() {
     FWD_LOG="$TMP/firewalld-order.log"
     FWD_ACTIVE=false
     print_header() { :; }
@@ -430,20 +494,26 @@ config_archive_validate "$TMP/valid-config.tar.gz" >/dev/null \
     START_LINE=$(grep -n '^START$' "$FWD_LOG" | cut -d: -f1)
     [ -n "$OFFLINE_LINE" ] && [ -n "$START_LINE" ] && [ "$OFFLINE_LINE" -lt "$START_LINE" ] \
         || { echo "firewalld started before its SSH rule was written" >&2; exit 1; }
-)
+    :
+}
+run_test "A first firewalld start must write the permanent SSH rule while the daemon is still offline" t_fi_016
 
 # Port/IP input helpers must reject malformed or out-of-range values and support IPv6 CIDR.
-[ "$(fw_port_spec_normalize 3000:3010/tcp ufw)" = 3000:3010/tcp ] \
-    || { echo "UFW port range normalization failed" >&2; exit 1; }
-[ "$(fw_port_spec_normalize 3000:3010/tcp firewalld)" = 3000-3010/tcp ] \
-    || { echo "firewalld port range normalization failed" >&2; exit 1; }
-! fw_port_spec_normalize 70000/tcp ufw >/dev/null 2>&1 \
-    || { echo "Out-of-range firewall port was accepted" >&2; exit 1; }
-[ "$(fw_ip_family 2001:db8::/64)" = ipv6 ] || { echo "IPv6 CIDR validation failed" >&2; exit 1; }
-! fw_ip_family 999.2.3.4 >/dev/null 2>&1 || { echo "Invalid IPv4 address was accepted" >&2; exit 1; }
+t_fitop_009() {
+    [ "$(fw_port_spec_normalize 3000:3010/tcp ufw)" = 3000:3010/tcp ] \
+        || { echo "UFW port range normalization failed" >&2; exit 1; }
+    [ "$(fw_port_spec_normalize 3000:3010/tcp firewalld)" = 3000-3010/tcp ] \
+        || { echo "firewalld port range normalization failed" >&2; exit 1; }
+    ! fw_port_spec_normalize 70000/tcp ufw >/dev/null 2>&1 \
+        || { echo "Out-of-range firewall port was accepted" >&2; exit 1; }
+    [ "$(fw_ip_family 2001:db8::/64)" = ipv6 ] || { echo "IPv6 CIDR validation failed" >&2; exit 1; }
+    ! fw_ip_family 999.2.3.4 >/dev/null 2>&1 || { echo "Invalid IPv4 address was accepted" >&2; exit 1; }
+    :
+}
+run_test "UFW port range normalization failed …+4 项" t_fitop_009
 
 # UFW verification must handle both compact, directional, and IPv6 status layouts.
-(
+t_fi_017() {
     ufw() {
         cat <<'EOF'
 Status: active
@@ -458,10 +528,12 @@ EOF
         || { echo "UFW source-scoped ALLOW rule was not recognized" >&2; exit 1; }
     ! ufw_port_rule_present 2223 ALLOW broad \
         || { echo "UFW source-scoped rule was mistaken for a broad rule" >&2; exit 1; }
-)
+    :
+}
+run_test "UFW verification must handle both compact, directional, and IPv6 status layouts" t_fi_017
 
 # Trusted-source SSH rules must cover both ports during a staged SSH migration.
-(
+t_fi_018() {
     UFW_LOG="$TMP/ufw-source.log"
     print_header() { :; }
     info() { :; }
@@ -474,8 +546,10 @@ EOF
         || { echo "UFW trusted source missed old SSH port" >&2; exit 1; }
     grep -Fqx 'allow from 203.0.113.10 to any port 2222 proto tcp' "$UFW_LOG" \
         || { echo "UFW trusted source missed new SSH port" >&2; exit 1; }
-)
-(
+    :
+}
+run_test "Trusted-source SSH rules must cover both ports during a staged SSH migration" t_fi_018
+t_fi_019() {
     FWD_LOG="$TMP/firewalld-source.log"
     print_header() { :; }
     info() { :; }
@@ -489,10 +563,12 @@ EOF
         || { echo "firewalld trusted source missed old SSH port" >&2; exit 1; }
     grep -Fq "port port='2222' protocol='tcp' accept" "$FWD_LOG" \
         || { echo "firewalld trusted source missed new SSH port" >&2; exit 1; }
-)
+    :
+}
+run_test "firewalld keeps a trusted SSH source rule after a partial failure" t_fi_019
 
 # Atomic replacement must leave the destination untouched when staging fails.
-(
+t_fi_020() {
     SOURCE="$TMP/update-source"
     DEST="$TMP/update-dest"
     printf 'new\n' > "$SOURCE"
@@ -500,10 +576,12 @@ EOF
     install() { return 1; }
     ! self_atomic_replace "$SOURCE" "$DEST" || { echo "Atomic update ignored install failure" >&2; exit 1; }
     grep -qx old "$DEST" || { echo "Atomic update damaged the current script" >&2; exit 1; }
-)
+    :
+}
+run_test "Atomic replacement must leave the destination untouched when staging fails" t_fi_020
 
 # Caddy startup failure must propagate instead of reporting success.
-(
+t_fi_021() {
     CADDYFILE="$TMP/Caddyfile"
     : > "$CADDYFILE"
     info() { :; }
@@ -512,10 +590,12 @@ EOF
     svc_start() { return 1; }
     caddy() { [ "$1" = validate ]; }
     ! caddy_reload_config >/dev/null 2>&1 || { echo "Caddy reload hid a startup failure" >&2; exit 1; }
-)
+    :
+}
+run_test "Caddy startup failure must propagate instead of reporting success" t_fi_021
 
 # Caddy layout adoption must restore the exact root config if active reload fails.
-(
+t_fi_022() {
     CADDY_CONFIG_DIR="$TMP/caddy-layout-failure"
     CADDYFILE="$CADDY_CONFIG_DIR/Caddyfile"
     CADDY_SITES_DIR="$CADDY_CONFIG_DIR/sites.d"
@@ -542,10 +622,12 @@ EOF
         || { echo "Caddy layout failure did not restore the root config" >&2; exit 1; }
     ! grep -qF '# BEGIN QUENCH CADDY SITE IMPORT' "$CADDYFILE" \
         || { echo "Caddy failed layout import remained after rollback" >&2; exit 1; }
-)
+    :
+}
+run_test "Caddy layout adoption must restore the exact root config if active reload fails" t_fi_022
 
 # A failed managed-site apply must remove the staged site and reload the old config.
-(
+t_fi_023() {
     CADDY_CONFIG_DIR="$TMP/caddy-apply-failure"
     CADDYFILE="$CADDY_CONFIG_DIR/Caddyfile"
     CADDY_SITES_DIR="$CADDY_CONFIG_DIR/sites.d"
@@ -570,10 +652,12 @@ EOF
         || { echo "Caddy failed site file remained after rollback" >&2; exit 1; }
     [ "$ROLLBACK_RELOADS" -eq 1 ] \
         || { echo "Caddy did not reload the previous active config" >&2; exit 1; }
-)
+    :
+}
+run_test "A failed managed-site apply must remove the staged site and reload the old config" t_fi_023
 
 # Failed site deletion must restore both contents and permissions.
-(
+t_fi_024() {
     CADDY_CONFIG_DIR="$TMP/caddy-delete-failure"
     CADDYFILE="$CADDY_CONFIG_DIR/Caddyfile"
     CADDY_SITES_DIR="$CADDY_CONFIG_DIR/sites.d"
@@ -606,10 +690,12 @@ EOF
     MODE_AFTER=$(stat -c '%a' "$SITE_FILE" 2>/dev/null || stat -f '%Lp' "$SITE_FILE")
     [ "$MODE_AFTER" = "$MODE_BEFORE" ] \
         || { echo "Caddy deletion rollback changed site permissions" >&2; exit 1; }
-)
+    :
+}
+run_test "Failed site deletion must restore both contents and permissions" t_fi_024
 
 # Quench Fail2ban changes are scoped to sshd and must not rewrite global defaults.
-(
+t_fi_025() {
     export F2B_JAIL_LOCAL="$TMP/jail.local"
     cat > "$F2B_JAIL_LOCAL" <<'EOF'
 [DEFAULT]
@@ -624,10 +710,12 @@ EOF
         || { echo "Fail2ban SSH update changed DEFAULT" >&2; exit 1; }
     [ "$(awk '/^\[sshd\]/{s=1;next} /^\[/{s=0} s && /^bantime/{print $3}' "$F2B_JAIL_LOCAL")" = 7200 ] \
         || { echo "Fail2ban SSH update missed sshd section" >&2; exit 1; }
-)
+    :
+}
+run_test "Quench Fail2ban changes are scoped to sshd and must not rewrite global defaults" t_fi_025
 
 # The managed Fail2ban drop-in must use real numeric ports and escalating bans.
-(
+t_fi_026() {
     F2B_RENDER="$TMP/zz-vps-quench.local"
     f2b_render_managed_config "$F2B_RENDER" systemd 22,2222 'allowipv6 = auto'
     grep -Eq '^port[[:space:]]*=[[:space:]]*22,2222$' "$F2B_RENDER" \
@@ -636,10 +724,12 @@ EOF
         || { echo "Fail2ban aggressive mode is missing" >&2; exit 1; }
     grep -Eq '^bantime\.increment[[:space:]]*=[[:space:]]*true$' "$F2B_RENDER" \
         || { echo "Fail2ban escalating bans are missing" >&2; exit 1; }
-)
+    :
+}
+run_test "The managed Fail2ban drop-in must use real numeric ports and escalating bans" t_fi_026
 
 # Invalid Fail2ban edits must restore the previous managed drop-in.
-(
+t_fi_027() {
     export F2B_JAIL_LOCAL="$TMP/fail2ban-rollback.local"
     printf '[sshd]\nenabled = true\nport = 22\n' > "$F2B_JAIL_LOCAL"
     fail2ban-client() { return 1; }
@@ -647,10 +737,12 @@ EOF
         || { echo "Invalid Fail2ban change was accepted" >&2; exit 1; }
     grep -Eq '^port[[:space:]]*=[[:space:]]*22$' "$F2B_JAIL_LOCAL" \
         || { echo "Fail2ban validation failure did not restore the original file" >&2; exit 1; }
-)
+    :
+}
+run_test "Invalid Fail2ban edits must restore the previous managed drop-in" t_fi_027
 
 # Updating SSH while Fail2ban is intentionally stopped must update its file without starting it.
-(
+t_fi_028() {
     export F2B_JAIL_LOCAL="$TMP/fail2ban-stopped.local"
     printf '[sshd]\nenabled = true\nport = 22\n' > "$F2B_JAIL_LOCAL"
     RESTARTED=false
@@ -666,10 +758,12 @@ EOF
         || { echo "SSH port synchronization started an intentionally stopped Fail2ban" >&2; exit 1; }
     grep -Eq '^port[[:space:]]*=[[:space:]]*22,2222$' "$F2B_JAIL_LOCAL" \
         || { echo "Stopped Fail2ban configuration did not receive both SSH ports" >&2; exit 1; }
-)
+    :
+}
+run_test "Updating SSH while Fail2ban is intentionally stopped must update its file without starting it" t_fi_028
 
 # A running sshd jail health failure must restore the previous Fail2ban port configuration.
-(
+t_fi_029() {
     export F2B_JAIL_LOCAL="$TMP/fail2ban-jail-health.local"
     printf '[sshd]\nenabled = true\nport = 22\n' > "$F2B_JAIL_LOCAL"
     RESTART_COUNT=0
@@ -686,10 +780,12 @@ EOF
         || { echo "Fail2ban sshd jail health failure did not restore old ports" >&2; exit 1; }
     [ "$RESTART_COUNT" -eq 2 ] \
         || { echo "Fail2ban old configuration was not restarted after rollback" >&2; exit 1; }
-)
+    :
+}
+run_test "A running sshd jail health failure must restore the previous Fail2ban port configuration" t_fi_029
 
 # Firewall cleanup must not report success while a broad UFW SSH rule remains effective.
-(
+t_fi_030() {
     info() { :; }
     error() { :; }
     svc_is_active() { return 1; }
@@ -699,10 +795,12 @@ EOF
     }
     ! ssh_firewall_close_port 2222 >/dev/null 2>&1 \
         || { echo "UFW cleanup accepted a rule that remained effective" >&2; exit 1; }
-)
+    :
+}
+run_test "Firewall cleanup must not report success while a broad UFW SSH rule remains effective" t_fi_030
 
 # A runtime restart failure after parameter edits must restore the whole previous file.
-(
+t_fi_031() {
     export F2B_JAIL_LOCAL="$TMP/fail2ban-runtime-rollback.local"
     printf '[sshd]\nenabled = true\nport = 22\nbantime = 3600\n' > "$F2B_JAIL_LOCAL"
     print_header() { :; }
@@ -720,11 +818,13 @@ EOF
         || { echo "Fail2ban parameter restart failure returned success" >&2; exit 1; }
     grep -Eq '^bantime[[:space:]]*=[[:space:]]*3600$' "$F2B_JAIL_LOCAL" \
         || { echo "Fail2ban restart failure did not restore all parameters" >&2; exit 1; }
-)
+    :
+}
+run_test "A runtime restart failure after parameter edits must restore the whole previous file" t_fi_031
 
 
 # Swap deletion must stop before touching fstab/files when swapoff fails.
-(
+t_fi_032() {
     print_header() { :; }
     menu_div() { :; }
     info() { :; }
@@ -746,10 +846,12 @@ EOF
     [ -f "$QUENCH_SWAP_FILE" ] || { echo "Swap delete removed file after swapoff failure" >&2; exit 1; }
     cmp -s "$QUENCH_SWAP_FSTAB.expected" "$QUENCH_SWAP_FSTAB" \
         || { echo "Swap delete changed fstab after swapoff failure" >&2; exit 1; }
-)
+    :
+}
+run_test "Swap deletion must stop before touching fstab/files when swapoff fails" t_fi_032
 
 # An existing foreign file at the managed default path must be rejected before swapoff.
-(
+t_fi_033() {
     QUENCH_SWAP_FILE="$TMP/foreign-swapfile"
     QUENCH_SWAP_STATE_DIR="$TMP/foreign-swap-state"
     QUENCH_SWAP_STATE_FILE="$QUENCH_SWAP_STATE_DIR/managed-file"
@@ -763,10 +865,12 @@ EOF
         || { echo "Swap replacement called swapoff before ownership validation" >&2; exit 1; }
     cmp -s "$QUENCH_SWAP_FILE.expected" "$QUENCH_SWAP_FILE" \
         || { echo "Swap replacement changed a foreign target" >&2; exit 1; }
-)
+    :
+}
+run_test "An existing foreign file at the managed default path must be rejected before swapoff" t_fi_033
 
 # A Docker restart failure must restore the exact previous daemon.json.
-(
+t_fi_034() {
     QUENCH_DOCKER_CONFIG="$TMP/docker-daemon.json"
     QUENCH_DOCKER_STATE_DIR="$TMP/docker-state"
     printf '{"data-root":"/srv/original"}\n' > "$QUENCH_DOCKER_CONFIG"
@@ -780,38 +884,46 @@ EOF
         || { echo "Docker baseline ignored a restart failure" >&2; exit 1; }
     cmp -s "$QUENCH_DOCKER_CONFIG.expected" "$QUENCH_DOCKER_CONFIG" \
         || { echo "Docker baseline restart failure did not restore daemon.json" >&2; exit 1; }
-)
+    :
+}
+run_test "A Docker restart failure must restore the exact previous daemon.json" t_fi_034
 
 # NTP repair must report a timedatectl failure.
-(
+t_fi_035() {
     print_header() { :; }
     info() { :; }
     error() { :; }
     ts_backend_detect() { echo timesyncd; }
     timedatectl() { return 1; }
     ! ts_ntp_repair >/dev/null 2>&1 || { echo "NTP repair hid timedatectl failure" >&2; exit 1; }
-)
+    :
+}
+run_test "NTP repair must report a timedatectl failure" t_fi_035
 
 # Timezone changes must validate the write instead of reporting false success.
-(
+t_fi_036() {
     error() { :; }
     ts_timezone_valid() { return 0; }
     systemd_available() { return 0; }
     timedatectl() { return 1; }
     ! ts_set_timezone UTC >/dev/null 2>&1 || { echo "Timezone update hid timedatectl failure" >&2; exit 1; }
-)
+    :
+}
+run_test "Timezone changes must validate the write instead of reporting false success" t_fi_036
 
 # An external NTP daemon must be reported, not silently replaced by Quench.
-(
+t_fi_037() {
     print_header() { :; }
     warn() { :; }
     ts_backend_detect() { echo external:ntpd; }
     ts_ntp_synchronized() { return 1; }
     ! ts_ntp_repair >/dev/null 2>&1 || { echo "Unsynchronized external NTP was reported as repaired" >&2; exit 1; }
-)
+    :
+}
+run_test "An external NTP daemon must be reported, not silently replaced by Quench" t_fi_037
 
 # Resolving an external/managed conflict keeps the external daemon and stops only managed backends.
-(
+t_fi_038() {
     print_header() { :; }
     warn() { :; }
     menu_item() { :; }
@@ -824,10 +936,12 @@ EOF
         || { echo "External NTP conflict resolution failed" >&2; exit 1; }
     [ -f "$TMP/timesyncd-disabled" ] && [ -f "$TMP/chrony-disabled" ] \
         || { echo "Managed NTP backends were not disabled around an external daemon" >&2; exit 1; }
-)
+    :
+}
+run_test "Resolving an external/managed conflict keeps the external daemon and stops only managed backends" t_fi_038
 
 # Multi-IP source switching must arm an exact route rollback and restore on verification failure.
-(
+t_fi_039() {
     QUENCH_DATA_DIR="$TMP/ip-source-safety"
     mkdir -p "$QUENCH_DATA_DIR"
     audit_action() { :; }
@@ -837,8 +951,10 @@ EOF
     grep -Fq 'ip -4 route replace default via 192.0.2.1 dev eth0 proto dhcp src 198.51.100.10 metric 100' "$SAFETY_SCRIPT" \
         || { echo "Multi-IP safety timer did not preserve the original route" >&2; exit 1; }
     cancel_safety_timer
-)
-(
+    :
+}
+run_test "Multi-IP source switching must arm an exact route rollback and restore on verification failure" t_fi_039
+t_fi_040() {
     APPLIED=0
     RESTORED=0
     print_header() { :; }
@@ -862,10 +978,12 @@ EOF
         || { echo "Multi-IP switch accepted a failed HTTPS verification" >&2; exit 1; }
     [ "$APPLIED" -eq 1 ] || { echo "Multi-IP switch did not apply the selected route" >&2; exit 1; }
     [ "$RESTORED" -eq 1 ] || { echo "Multi-IP switch did not restore the route after verification failure" >&2; exit 1; }
-)
+    :
+}
+run_test "Multi-IP switch accepted a failed HTTPS verification" t_fi_040
 
 # If direct route restoration fails, the independent rollback script must remain the fallback.
-(
+t_fi_041() {
     APPLIED=0
     FALLBACK=0
     CANCELLED=0
@@ -892,10 +1010,12 @@ EOF
     [ "$APPLIED" -eq 1 ] || { echo "Multi-IP fallback test did not apply the selected route" >&2; exit 1; }
     [ "$FALLBACK" -eq 1 ] || { echo "Multi-IP switch did not execute its independent rollback fallback" >&2; exit 1; }
     [ "$CANCELLED" -eq 0 ] || { echo "Multi-IP switch canceled rollback after direct restore failed" >&2; exit 1; }
-)
+    :
+}
+run_test "If direct route restoration fails, the independent rollback script must remain the fallback" t_fi_041
 
 # An IPv6 apply failure must immediately invoke the exact-state rollback.
-(
+t_fi_042() {
     ROLLED_BACK=0
     IP_V6_SYSCTL_FILE="$TMP/nonexistent-quench-ipv6.conf"
     print_header() { :; }
@@ -910,10 +1030,12 @@ EOF
     ! ip_disable_v6 >/dev/null 2>&1 \
         || { echo "IPv6 disable accepted a failed runtime apply" >&2; exit 1; }
     [ "$ROLLED_BACK" -eq 1 ] || { echo "IPv6 apply failure did not invoke exact-state rollback" >&2; exit 1; }
-)
+    :
+}
+run_test "An IPv6 apply failure must immediately invoke the exact-state rollback" t_fi_042
 
 # HTTPS synchronization must not set the clock without enough trusted responses.
-(
+t_fi_043() {
     print_header() { :; }
     info() { :; }
     warn() { :; }
@@ -921,10 +1043,12 @@ EOF
     # shellcheck disable=SC2329 # test stub used indirectly by ts_sync_https
     ts_https_fetch_epoch() { return 1; }
     ! ts_sync_https fallback >/dev/null 2>&1 || { echo "HTTPS time sync accepted zero valid sources" >&2; exit 1; }
-)
+    :
+}
+run_test "HTTPS synchronization must not set the clock without enough trusted responses" t_fi_043
 
 # HTTPS emergency time must report failure if the original NTP backend cannot be resumed.
-(
+t_fi_044() {
     CLOCK=2000000000
     SET_MARKER="$TMP/https-clock-set"
     PAUSE_MARKER="$TMP/https-ntp-paused"
@@ -955,10 +1079,12 @@ EOF
         || { echo "HTTPS time sync hid NTP resume failure" >&2; exit 1; }
     [ -f "$SET_MARKER" ] && [ -f "$PAUSE_MARKER" ] && [ -f "$RESUME_MARKER" ] \
         || { echo "HTTPS time sync did not exercise pause, set, and resume" >&2; exit 1; }
-)
+    :
+}
+run_test "HTTPS emergency time must report failure if the original NTP backend cannot be resumed" t_fi_044
 
 # A failed APT source copy must leave neither a partial snapshot nor a modified source tree.
-(
+t_fi_045() {
     MIRROR_APT_DIR="$TMP/mirror-copy-failure/apt"
     MIRROR_STATE_DIR="$TMP/mirror-copy-failure/state"
     mkdir -p "$MIRROR_APT_DIR/sources.list.d" "$MIRROR_STATE_DIR"
@@ -970,10 +1096,12 @@ EOF
         || { echo "APT snapshot failure modified the live source" >&2; exit 1; }
     ! find "$MIRROR_STATE_DIR" -maxdepth 1 -type d -name 'apt-backup.*' | grep -q . \
         || { echo "APT snapshot failure left a partial backup" >&2; exit 1; }
-)
+    :
+}
+run_test "A failed APT source copy must leave neither a partial snapshot nor a modified source tree" t_fi_045
 
 # Strict APT validation failure must restore every source file, including third-party entries.
-(
+t_fi_046() {
     MIRROR_APT_DIR="$TMP/mirror-apt-rollback/apt"
     MIRROR_STATE_DIR="$TMP/mirror-apt-rollback/state"
     MIRROR_OS_RELEASE_FILE="$TMP/mirror-apt-rollback/os-release"
@@ -996,10 +1124,12 @@ EOF
         || { echo "APT switch succeeded after an injected validation failure" >&2; exit 1; }
     diff -ru "$EXPECTED" "$MIRROR_APT_DIR" >/dev/null \
         || { echo "APT validation failure did not restore the exact source tree" >&2; exit 1; }
-)
+    :
+}
+run_test "Strict APT validation failure must restore every source file, including third-party entries" t_fi_046
 
 # An unreadable DNF enabled-state must abort snapshot creation before any write.
-(
+t_fi_047() {
     MIRROR_STATE_DIR="$TMP/mirror-rpm-state-failure/state"
     MIRROR_RPM_REPO_DIR="$TMP/mirror-rpm-state-failure/yum.repos.d"
     mkdir -p "$MIRROR_STATE_DIR" "$MIRROR_RPM_REPO_DIR"
@@ -1009,10 +1139,12 @@ EOF
         || { echo "RPM snapshot accepted an unreadable enabled-repository state" >&2; exit 1; }
     ! find "$MIRROR_STATE_DIR" -maxdepth 1 -type d -name 'rpm-backup.*' | grep -q . \
         || { echo "RPM state-capture failure left a partial backup" >&2; exit 1; }
-)
+    :
+}
+run_test "An unreadable DNF enabled-state must abort snapshot creation before any write" t_fi_047
 
 # An isolated DNF validation failure must restore the exact repository directory.
-(
+t_fi_048() {
     MIRROR_STATE_DIR="$TMP/mirror-rpm-rollback/state"
     MIRROR_RPM_REPO_DIR="$TMP/mirror-rpm-rollback/yum.repos.d"
     MIRROR_RPM_GPG_DIR="$TMP/mirror-rpm-rollback/rpm-gpg"
@@ -1040,7 +1172,9 @@ EOF
         || { echo "RPM switch succeeded after an injected isolated validation failure" >&2; exit 1; }
     diff -ru "$EXPECTED" "$MIRROR_RPM_REPO_DIR" >/dev/null \
         || { echo "RPM validation failure did not restore the exact repository tree" >&2; exit 1; }
-)
+    :
+}
+run_test "An isolated DNF validation failure must restore the exact repository directory" t_fi_048
 
 # Offline bundle creation must package a local script and offline install must place it at the target path.
 LOCAL_SCRIPT="$TMP/local-script"
@@ -1055,12 +1189,20 @@ if ! self_offline_bundle_create >/dev/null; then
     exit 1
 fi
 OFFLINE_BUNDLE=$(find "$QUENCH_DATA_DIR/offline" -type f -name '*.tar.gz' | head -1)
-[ -f "$OFFLINE_BUNDLE" ] || { echo "Offline bundle was not created" >&2; exit 1; }
+t_fitop_010() {
+    [ -f "$OFFLINE_BUNDLE" ] || { echo "Offline bundle was not created" >&2; exit 1; }
+    :
+}
+run_test "Offline bundle was not created" t_fitop_010
 LOCAL_SCRIPT="$TMP/installed-script.sh"
 LOCAL_BIN_DIR="$TMP/bin"
-self_offline_bundle_install "$OFFLINE_BUNDLE" >/dev/null || { echo "Offline install failed" >&2; exit 1; }
-[ -f "$LOCAL_SCRIPT" ] || { echo "Offline install did not place script" >&2; exit 1; }
-[ "$(readlink "$LOCAL_BIN_DIR/v")" = "$LOCAL_SCRIPT" ] || { echo "Offline install did not create an isolated shortcut" >&2; exit 1; }
+t_fitop_011() {
+    self_offline_bundle_install "$OFFLINE_BUNDLE" >/dev/null || { echo "Offline install failed" >&2; exit 1; }
+    [ -f "$LOCAL_SCRIPT" ] || { echo "Offline install did not place script" >&2; exit 1; }
+    [ "$(readlink "$LOCAL_BIN_DIR/v")" = "$LOCAL_SCRIPT" ] || { echo "Offline install did not create an isolated shortcut" >&2; exit 1; }
+    :
+}
+run_test "Offline install failed …+2 项" t_fitop_011
 
 # Process-substitution descriptors are streams, not complete reusable script files.
 if self_resolve_script_source /dev/fd/0 >/dev/null 2>&1; then
@@ -1071,14 +1213,22 @@ BROKEN_LINK_TARGET="$TMP/removed-script.sh"
 rm -f "$LOCAL_BIN_DIR/v"
 ln -s "$BROKEN_LINK_TARGET" "$LOCAL_BIN_DIR/v"
 self_install_shortcut v >/dev/null
-[ "$(readlink "$LOCAL_BIN_DIR/v")" = "$LOCAL_SCRIPT" ] || { echo "Installer did not repair a dangling shortcut" >&2; exit 1; }
+t_fitop_012() {
+    [ "$(readlink "$LOCAL_BIN_DIR/v")" = "$LOCAL_SCRIPT" ] || { echo "Installer did not repair a dangling shortcut" >&2; exit 1; }
+    :
+}
+run_test "Installer did not repair a dangling shortcut" t_fitop_012
 FOREIGN_SCRIPT="$TMP/foreign-command"
 printf '#!/bin/sh\nexit 0\n' > "$FOREIGN_SCRIPT"
 chmod +x "$FOREIGN_SCRIPT"
 rm -f "$LOCAL_BIN_DIR/V"
 ln -s "$FOREIGN_SCRIPT" "$LOCAL_BIN_DIR/V"
 self_install_shortcut V >/dev/null
-[ "$(readlink "$LOCAL_BIN_DIR/V")" = "$FOREIGN_SCRIPT" ] || { echo "Installer overwrote a foreign shortcut" >&2; exit 1; }
+t_fitop_013() {
+    [ "$(readlink "$LOCAL_BIN_DIR/V")" = "$FOREIGN_SCRIPT" ] || { echo "Installer overwrote a foreign shortcut" >&2; exit 1; }
+    :
+}
+run_test "Installer overwrote a foreign shortcut" t_fitop_013
 
 # The real updater must reject a mismatched checksum without replacing the local script.
 LOCAL_SCRIPT="$TMP/local-script"
@@ -1101,7 +1251,11 @@ if self_update >/dev/null 2>&1; then
     echo "Updater reported success after checksum mismatch" >&2
     exit 1
 fi
-grep -qx 'original' "$LOCAL_SCRIPT" || { echo "Updater replaced script after checksum mismatch" >&2; exit 1; }
+t_fitop_014() {
+    grep -qx 'original' "$LOCAL_SCRIPT" || { echo "Updater replaced script after checksum mismatch" >&2; exit 1; }
+    :
+}
+run_test "Updater replaced script after checksum mismatch" t_fitop_014
 
 # Post-update tc reconciliation must execute the newly installed script, not a function from the old process.
 TC_STATE_FILE="$TMP/update-tc.state"
@@ -1117,14 +1271,18 @@ cat > "$LOCAL_SCRIPT" <<'EOF'
 : > "$UPDATE_TC_MARKER"
 EOF
 chmod +x "$LOCAL_SCRIPT"
-self_reconcile_tc_after_update >/dev/null \
-    || { echo "Updater could not invoke the new tc reconciliation endpoint" >&2; exit 1; }
-[ -f "$UPDATE_TC_MARKER" ] \
-    || { echo "Updater reconciled tc through the old process" >&2; exit 1; }
+t_fitop_015() {
+    self_reconcile_tc_after_update >/dev/null \
+        || { echo "Updater could not invoke the new tc reconciliation endpoint" >&2; exit 1; }
+    [ -f "$UPDATE_TC_MARKER" ] \
+        || { echo "Updater reconciled tc through the old process" >&2; exit 1; }
+    :
+}
+run_test "Updater could not invoke the new tc reconciliation endpoint …+1 项" t_fitop_015
 
 # NFT firewall reconciliation must add the replacement before deleting the old
 # route, and an add/remove failure must retain the ownership state for rollback.
-(
+t_fi_049() {
     NFT_TEST="$TMP/nft-firewall-transaction"
     mkdir -p "$NFT_TEST"
     NFT_FIREWALL_STATE="$NFT_TEST/firewall.db"
@@ -1177,11 +1335,13 @@ self_reconcile_tc_after_update >/dev/null \
         || { echo "NFT firewall transaction ignored a remove failure" >&2; exit 1; }
     grep -qxF "$NEW" "$NFT_FIREWALL_STATE" \
         || { echo "NFT firewall remove failure lost retry ownership state" >&2; exit 1; }
-)
+    :
+}
+run_test "NFT firewall reconciliation must add the replacement before deleting the old route, and an…" t_fi_049
 
 # If a multi-rule firewall update fails after an earlier addition and that
 # addition cannot be rolled back, it must remain owned so a later retry can remove it.
-(
+t_fi_050() {
     NFT_TEST="$TMP/nft-firewall-partial-add"
     mkdir -p "$NFT_TEST"
     NFT_FIREWALL_STATE="$NFT_TEST/firewall.db"
@@ -1206,11 +1366,13 @@ self_reconcile_tc_after_update >/dev/null \
         || { echo "NFT partial add lost old firewall ownership" >&2; exit 1; }
     grep -qxF "$NEW1" "$NFT_FIREWALL_STATE" \
         || { echo "NFT orphaned a partially added firewall rule" >&2; exit 1; }
-)
+    :
+}
+run_test "If a multi-rule firewall update fails after an earlier addition and that addition cannot be…" t_fi_050
 
 # The rollback timer must outlive the login session: under systemd it has to run as a
 # system-level transient unit, because nohup does not survive a logind session sweep.
-(
+t_fi_051() {
     TIMER_DIR="$TMP/safety-timer"
     mkdir -p "$TIMER_DIR"
     TIMER_SCRIPT="$TIMER_DIR/rollback.sh"
@@ -1278,11 +1440,13 @@ self_reconcile_tc_after_update >/dev/null \
         || { echo "Non-systemd launch invented a transient unit" >&2; exit 1; }
     kill "$SAFETY_PID" 2>/dev/null || true
     wait "$SAFETY_PID" 2>/dev/null || true
-)
+    :
+}
+run_test "The rollback timer must outlive the login session: under systemd it has to run as a…" t_fi_051
 
 # Config changes must be mutually exclusive across sessions, and a failed arm must
 # never leave the lock behind — a leaked lock would wedge every later change.
-(
+t_fi_052() {
     QUENCH_TXN_LOCK_FILE="$TMP/txn/quench-config.lock"
     mkdir -p "$TMP/txn"
     FLOCK_RC=0
@@ -1325,11 +1489,13 @@ self_reconcile_tc_after_update >/dev/null \
         && { echo "safety_arm succeeded despite a failed timer launch" >&2; exit 1; }
     [ "$QUENCH_TXN_LOCK_HELD" = 0 ] \
         || { echo "A failed safety_arm leaked the config transaction lock" >&2; exit 1; }
-)
+    :
+}
+run_test "Config changes must be mutually exclusive across sessions, and a failed arm must never leave…" t_fi_052
 
 # A crashed session leaves no in-process trace, so the transaction record on disk is
 # the only way the rollback centre can surface it afterwards.
-(
+t_fi_053() {
     QUENCH_TXN_DIR="$TMP/txn-records"
     QUENCH_TXN_FILE=""
     SAFETY_UNIT=quench-rollback-probe
@@ -1360,11 +1526,13 @@ self_reconcile_tc_after_update >/dev/null \
     txn_record_end
     [ ! -e "$TXN_RECORD" ] || { echo "Completed transaction left its record behind" >&2; exit 1; }
     [ -z "$QUENCH_TXN_FILE" ] || { echo "Completed transaction kept a stale record handle" >&2; exit 1; }
-)
+    :
+}
+run_test "A crashed session leaves no in-process trace, so the transaction record on disk is the only way…" t_fi_053
 
 # sshd -T reparses the whole config and the dashboard asks for three keys per redraw.
 # The cache must collapse those into one call, and must drop on any config rewrite.
-(
+t_fi_054() {
     # The stub logs to a file: real callers use $(...), so a counter variable
     # bumped inside a subshell would never be visible here.
     SSHD_LOG="$TMP/sshd-calls.log"
@@ -1394,12 +1562,14 @@ self_reconcile_tc_after_update >/dev/null \
     # An unknown key must still fail rather than return a neighbouring value.
     ! sshd_effective_value NoSuchDirective >/dev/null 2>&1 \
         || { echo "Unknown directive returned a value" >&2; exit 1; }
-)
+    :
+}
+run_test "sshd -T reparses the whole config and the dashboard asks for three keys per redraw" t_fi_054
 
 # Both subsystem locks use fixed descriptors: exec {VAR}> is a bash 4.1 feature and
 # fails outright on the bash 3.2 the interpreter guard still admits. A failed acquire
 # must also give the descriptor back instead of leaking it for the rest of the session.
-(
+t_fi_055() {
     LOCK_DIR="$TMP/fixed-fd-locks"
     mkdir -p "$LOCK_DIR"
     NFT_LOCK_FILE="$LOCK_DIR/nft.lock"
@@ -1441,6 +1611,8 @@ self_reconcile_tc_after_update >/dev/null \
         echo "a failed bbr acquire leaked its descriptor" >&2
         exit 1
     fi
-)
+    :
+}
+run_test "Both subsystem locks use fixed descriptors: exec {VAR}> is a bash 4.1 feature and fails…" t_fi_055
 
-echo "Fault injection tests passed."
+test_summary "Fault injection"
