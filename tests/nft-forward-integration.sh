@@ -72,6 +72,9 @@ export NFT_ACCESS_FILE="$TEST_DIR/state/access.db"
 export NFT_FIREWALL_STATE="$TEST_DIR/state/firewall.db"
 export NFT_MANAGED_FILE="$TEST_DIR/quench.nft"
 export NFT_LOCK_FILE="$TEST_DIR/quench.lock"
+# nft.sh 依赖 core.sh 提供的 quench_mktemp / error 等 helper，必须先加载。
+# shellcheck source=../src/lib/core.sh
+source "$ROOT/src/lib/core.sh"
 # shellcheck source=../src/modules/nft.sh
 source "$ROOT/src/modules/nft.sh"
 

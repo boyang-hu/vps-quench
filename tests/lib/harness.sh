@@ -35,7 +35,10 @@ run_test() {
     fi
     QUENCH_TESTS_RUN=$((QUENCH_TESTS_RUN + 1))
     local OUT RC=0
-    OUT=$( "$@" 2>&1 ) || RC=$?
+    # 子 shell 内必须重新 set：命令替换处在 `|| RC=$?` 这个条件上下文里，
+    # bash 会在整棵子树上关掉 -e，用例体中间的失败命令就会被静默跳过，
+    # 于是只靠 exit/fail 才算失败，普通命令失败一律算通过。
+    OUT=$( set -Eeuo pipefail; "$@" 2>&1 ) || RC=$?
     if [ "$RC" -eq 0 ]; then
         [ -z "${QUENCH_TEST_VERBOSE:-}" ] || printf '  ok    %s\n' "$NAME"
         return 0

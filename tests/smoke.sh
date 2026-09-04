@@ -2193,14 +2193,25 @@ t_build_001() {
     cp -a "$ROOT/src" "$ROOT/build.sh" "$ROOT/vps-quench.sh" \
           "$ROOT/vps-quench.sh.sha256" "$ROOT/vps-quench.manifest.json" "$BUILD_COPY/" \
         || fail "could not stage a build copy"
-    ( cd "$BUILD_COPY" && ./build.sh ) >/dev/null || fail "first build failed"
-    cp "$BUILD_COPY/vps-quench.manifest.json" "$BUILD_COPY/manifest.first"
+    # 构建输出必须带进失败信息，否则 CI 上只看到 "first build failed"。
+    BUILD_LOG="$BUILD_COPY/build.log"
+    if ! ( cd "$BUILD_COPY" && bash ./build.sh ) > "$BUILD_LOG" 2>&1; then
+        BUILD_OUT=$(cat "$BUILD_LOG" 2>/dev/null)
+        rm -rf "$BUILD_COPY"
+        fail "first build failed: $BUILD_OUT"
+    fi
+    MANIFEST_FIRST=$(cat "$BUILD_COPY/vps-quench.manifest.json")
     sleep 1
-    ( cd "$BUILD_COPY" && ./build.sh ) >/dev/null || fail "second build failed"
-    IDENTICAL=0
-    cmp -s "$BUILD_COPY/manifest.first" "$BUILD_COPY/vps-quench.manifest.json" && IDENTICAL=1
+    if ! ( cd "$BUILD_COPY" && bash ./build.sh ) > "$BUILD_LOG" 2>&1; then
+        BUILD_OUT=$(cat "$BUILD_LOG" 2>/dev/null)
+        rm -rf "$BUILD_COPY"
+        fail "second build failed: $BUILD_OUT"
+    fi
+    # 用字符串比较而不是 cmp：精简的 Rocky 镜像里没有 diffutils。
+    MANIFEST_SECOND=$(cat "$BUILD_COPY/vps-quench.manifest.json")
     rm -rf "$BUILD_COPY"
-    [ "$IDENTICAL" = 1 ] || fail "rebuilding unchanged sources rewrote the manifest"
+    [ "$MANIFEST_FIRST" = "$MANIFEST_SECOND" ] \
+        || fail "rebuilding unchanged sources rewrote the manifest"
     :
 }
 run_test "Rebuilding unchanged sources leaves the manifest untouched" t_build_001

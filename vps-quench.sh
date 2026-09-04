@@ -294,34 +294,97 @@ BANNER_WIDE_EOF
 
 # ── 可见宽度计算（纯 bash，中文=2，ASCII=1）────────────────
 # 原来每次调用起一个 python3；一屏菜单调 14 次，低配 VPS 上要一两秒。
-# 而 Alpine / OpenWrt 常常没有 python3，旧的退化分支 ${#1} 把中文按 1 列算，
+# 而 Alpine / OpenWrt 常常没有 python3，早期的退化分支把中文按 1 列算，
 # 整个界面会错位 —— 恰恰是本脚本主打支持的系统。
 #
-# 这里按 UTF-8 首字节分段判宽，不需要码点（bash 3.2 的 printf %d "'c"
-# 只给首字节而非码点），也不需要 awk 的多字节支持：
-#   <0x80        ASCII                      宽 1
-#   0x80-0xBF    UTF-8 续字节                宽 0（仅在非 UTF-8 locale 按字节
-#                                           遍历时出现，这样两种模式结果一致）
-#   0xC2-0xE2    拉丁/希腊/西里尔、符号、制表、几何图形   宽 1
-#   0xE3-0xED    CJK 标点、假名、汉字、谚文    宽 2
-#   0xEE         私用区                      宽 1
-#   0xEF         全角标点（，：（）等）        宽 2
-#   >=0xF0       四字节（emoji 等）            宽 2
-# 已知近似：BMP 内的 emoji（0xE2 段）和阿拉伯表现形式（0xEF 段）会各差 1 列。
-# 对本脚本实际用到的字符集（ASCII + 汉字 + 全角标点 + ● ✓ ◆ › ━ ─ ×）结果精确。
+# 关键坑：printf '%d' "'字" 的返回值随 bash 版本和 locale 而变——
+#   bash 4.2+ 且 UTF-8 locale：返回码点（用 = 30056）
+#   bash 3.2 或单字节 locale ：返回该字符 UTF-8 编码的首字节（用 = 0xE7）
+# 两种都必须支持：只按其中一种写，另一种上所有中文宽度都是错的。
+# 启动时探测一次，之后走对应的判宽表。
+QUENCH_VIS_MODE=""
+
+vis_probe_mode() {
+    local V
+    printf -v V '%d' "'用" 2>/dev/null || V=0
+    [ "$V" -ge 0 ] || V=$(( -V ))
+    if [ "$V" -gt 255 ]; then printf 'codepoint\n'; else printf 'byte\n'; fi
+}
+
+# 码点判宽：East Asian Width 为 W/F 的区段返回 0（宽 2 列）。
+# 有意不含 0x2500-0x25FF（制表符、● ◆ 等几何图形）与 0x2713（✓）这类
+# ambiguous 字符——终端按 1 列渲染，本脚本界面正是这么用的。
+vis_codepoint_is_wide() {
+    local V="$1"
+    [ "$V" -ge 4352 ] || return 1
+    if   [ "$V" -le 4447 ];  then return 0   # 1100-115F 谚文字母
+    elif [ "$V" -lt 11904 ]; then return 1
+    elif [ "$V" -le 12350 ]; then return 0   # 2E80-303E CJK 部首/康熙/中文标点
+    elif [ "$V" -lt 12353 ]; then return 1
+    elif [ "$V" -le 19903 ]; then return 0   # 3041-4DBF 假名/CJK 扩展 A
+    elif [ "$V" -lt 19968 ]; then return 1
+    elif [ "$V" -le 40959 ]; then return 0   # 4E00-9FFF CJK 统一表意
+    elif [ "$V" -le 42191 ]; then return 0   # A000-A4CF 彝文
+    elif [ "$V" -lt 44032 ]; then return 1
+    elif [ "$V" -le 55203 ]; then return 0   # AC00-D7A3 谚文音节
+    elif [ "$V" -lt 63744 ]; then return 1
+    elif [ "$V" -le 64255 ]; then return 0   # F900-FAFF CJK 兼容表意
+    elif [ "$V" -lt 65040 ]; then return 1
+    elif [ "$V" -le 65049 ]; then return 0   # FE10-FE19 竖排标点
+    elif [ "$V" -lt 65072 ]; then return 1
+    elif [ "$V" -le 65135 ]; then return 0   # FE30-FE6F CJK 兼容形式
+    elif [ "$V" -lt 65280 ]; then return 1
+    elif [ "$V" -le 65376 ]; then return 0   # FF00-FF60 全角标点（，：（）等）
+    elif [ "$V" -lt 65504 ]; then return 1
+    elif [ "$V" -le 65510 ]; then return 0   # FFE0-FFE6 全角符号
+    elif [ "$V" -lt 127744 ]; then return 1
+    elif [ "$V" -le 128591 ]; then return 0  # 1F300-1F64F emoji
+    elif [ "$V" -lt 129280 ]; then return 1
+    elif [ "$V" -le 129791 ]; then return 0  # 1F900-1F9FF 补充 emoji
+    elif [ "$V" -lt 131072 ]; then return 1
+    elif [ "$V" -le 262141 ]; then return 0  # 20000-3FFFD CJK 扩展 B 及以上
+    fi
+    return 1
+}
+
+# 首字节判宽（非 UTF-8 locale 下按字节遍历时使用）：
+#   <0x80        ASCII                                   宽 1
+#   0x80-0xBF    UTF-8 续字节                             宽 0
+#   0xC2-0xE2    拉丁/希腊/西里尔、符号、制表、几何图形    宽 1
+#   0xE3-0xED    CJK 标点、假名、汉字、谚文                宽 2
+#   0xEE         私用区                                   宽 1
+#   0xEF         全角标点                                 宽 2
+#   >=0xF0       四字节（emoji 等）                        宽 2
+vis_leadbyte_width() {
+    local B="$1"
+    if   [ "$B" -lt 128 ]; then printf '1\n'
+    elif [ "$B" -le 191 ]; then printf '0\n'
+    elif [ "$B" -le 226 ]; then printf '1\n'
+    elif [ "$B" -le 237 ]; then printf '2\n'
+    elif [ "$B" -eq 238 ]; then printf '1\n'
+    elif [ "$B" -eq 239 ]; then printf '2\n'
+    else printf '2\n'
+    fi
+}
+
 vis_len() {
-    local TEXT="$1" LEN=0 I CH B
+    local TEXT="$1" LEN=0 I CH V
+    [ -n "$QUENCH_VIS_MODE" ] || QUENCH_VIS_MODE=$(vis_probe_mode)
     for ((I=0; I<${#TEXT}; I++)); do
         CH="${TEXT:I:1}"
-        printf -v B '%d' "'$CH" 2>/dev/null || B=63
-        B=$(( B & 255 ))
-        if [ "$B" -lt 128 ]; then LEN=$((LEN + 1))
-        elif [ "$B" -le 191 ]; then :
-        elif [ "$B" -le 226 ]; then LEN=$((LEN + 1))
-        elif [ "$B" -le 237 ]; then LEN=$((LEN + 2))
-        elif [ "$B" -eq 238 ]; then LEN=$((LEN + 1))
-        elif [ "$B" -eq 239 ]; then LEN=$((LEN + 2))
-        else LEN=$((LEN + 2))
+        printf -v V '%d' "'$CH" 2>/dev/null || V=63
+        if [ "$QUENCH_VIS_MODE" = codepoint ]; then
+            if vis_codepoint_is_wide "$V"; then LEN=$((LEN + 2)); else LEN=$((LEN + 1)); fi
+        else
+            V=$(( V & 255 ))
+            if   [ "$V" -lt 128 ]; then LEN=$((LEN + 1))
+            elif [ "$V" -le 191 ]; then :
+            elif [ "$V" -le 226 ]; then LEN=$((LEN + 1))
+            elif [ "$V" -le 237 ]; then LEN=$((LEN + 2))
+            elif [ "$V" -eq 238 ]; then LEN=$((LEN + 1))
+            elif [ "$V" -eq 239 ]; then LEN=$((LEN + 2))
+            else LEN=$((LEN + 2))
+            fi
         fi
     done
     printf '%s\n' "$LEN"
