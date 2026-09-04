@@ -22,7 +22,14 @@ jobs:
         # info 级全量门禁，不再全局排除 SC2015：那正是「恢复失败反而删配置」
         # 所属的规则，全局排除等于以后同类错误也不会报警。现存的每一处都改成
         # 了带理由的行级 suppression，新写的同类代码仍会被拦下。
-        run: shellcheck --severity=info -x vps-quench.sh build-offline-package.sh tests/offline-package.sh tests/lib/harness.sh
+        #
+        # 版本必须钉死：SC2015 的判定范围逐版本在收窄，runner 自带的版本比本地
+        # 新一点或旧一点，命中集合就不同，行级 suppression 会跟着对不上。
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 --version
+          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
+            --severity=info -x \
+            vps-quench.sh build-offline-package.sh tests/offline-package.sh tests/lib/harness.sh
 
       - name: Verify release checksum
         run: sha256sum -c vps-quench.sh.sha256
