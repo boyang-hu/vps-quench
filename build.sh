@@ -62,13 +62,18 @@ else
 fi
 
 HASH=$(awk 'NR==1{print $1}' "$CHECKSUM")
-VERSION=$(grep -oE 'V[0-9]+\.[0-9]+\.[0-9]+|V[0-9]+\.[0-9]+' "$OUTPUT" | head -1)
+# 不用 `grep ... | head -1`：head 读到第一行就退出，grep 继续写 700KB 会吃到
+# SIGPIPE(141)，在 set -o pipefail 下让整个构建静默失败。busybox 上必现，
+# GNU 上因缓冲差异通常不触发——Alpine 的构建就是这样挂掉且不留任何输出的。
+VERSION=$(awk 'match($0, /V[0-9]+[.][0-9]+[.][0-9]+|V[0-9]+[.][0-9]+/) { print substr($0, RSTART, RLENGTH); exit }' "$OUTPUT")
 
 # 只有产物真的变了才刷新时间戳。否则每次构建都会生成一个仅 generated_at 不同
 # 的 diff，把工作区弄脏，也在版本历史里留下无意义的改动。
 GENERATED_AT=""
 if [ -f "$MANIFEST" ] && grep -Fq "\"sha256\": \"$HASH\"" "$MANIFEST"; then
-    GENERATED_AT=$(sed -n 's/.*"generated_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$MANIFEST" | head -1)
+    # 用 awk 而不是 sed：`s///{p;q;}` 是 GNU 扩展，BSD sed 会报 bad flag；
+    # 也不能用 `sed | head -1`，那正是上面说的 SIGPIPE 陷阱。
+    GENERATED_AT=$(awk -F'"' '/"generated_at"/ { print $4; exit }' "$MANIFEST")
 fi
 [ -n "$GENERATED_AT" ] || GENERATED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 

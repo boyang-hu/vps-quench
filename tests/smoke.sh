@@ -2189,7 +2189,9 @@ run_test "The diagnostic bundle honours the caller's TMPDIR" t_diag_001
 # Rebuilding unchanged sources must not rewrite the manifest, or every build dirties
 # the working tree with a generated_at that is the only thing to have moved.
 t_build_001() {
-    BUILD_COPY=$(mktemp -d)
+    BUILD_COPY=$(mktemp -d "${TMPDIR:-/tmp}/quench-buildcheck.XXXXXX")
+    [ -n "$BUILD_COPY" ] && [ -d "$BUILD_COPY" ] \
+        || fail "could not create a staging directory"
     cp -a "$ROOT/src" "$ROOT/build.sh" "$ROOT/vps-quench.sh" \
           "$ROOT/vps-quench.sh.sha256" "$ROOT/vps-quench.manifest.json" "$BUILD_COPY/" \
         || fail "could not stage a build copy"

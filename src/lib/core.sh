@@ -133,6 +133,9 @@ quench_tmp_cleanup() {
 # mktemp 包装：创建并登记。参数与 mktemp 一致。
 quench_mktemp() {
     local PATH_VALUE
+    # 省略模板时给一个带 quench 前缀的默认值：/tmp 里出现残留时能一眼看出
+    # 是谁留下的，也便于登记表的临时目录守卫做前缀核对。
+    [ "$#" -gt 0 ] || set -- "${TMPDIR:-/tmp}/quench.XXXXXX"
     PATH_VALUE=$(mktemp "$@") || return 1
     quench_tmp_register "$PATH_VALUE"
     printf '%s\n' "$PATH_VALUE"
@@ -140,6 +143,7 @@ quench_mktemp() {
 
 quench_mktemp_d() {
     local PATH_VALUE
+    [ "$#" -gt 0 ] || set -- "${TMPDIR:-/tmp}/quench.XXXXXX"
     PATH_VALUE=$(mktemp -d "$@") || return 1
     quench_tmp_register "$PATH_VALUE"
     printf '%s\n' "$PATH_VALUE"
