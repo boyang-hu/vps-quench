@@ -2292,4 +2292,166 @@ t_lock_003() {
 }
 run_test "The transaction lock works with busybox flock, which lacks -w" t_lock_003
 
+# ── 以下五条来自外部评审的隔离复现，逐条固化 ─────────────────────────
+# 共用夹具：真实快照（tar）、真实回滚脚本，服务调用全部用替身。
+review_setup() {
+    PROBE="$TMP/review-$1"
+    CONFIG_RESTORE_ROOT="$PROBE/root"
+    QUENCH_DATA_DIR="$PROBE/data"
+    QUENCH_BACKUP_DIR="$QUENCH_DATA_DIR/backups"
+    QUENCH_TXN_DIR="$QUENCH_DATA_DIR/transactions"
+    QUENCH_TXN_LOCK_FILE="$PROBE/config.lock"
+    QUENCH_TXN_LOCK_HELD=0; QUENCH_TXN_LOCK_MODE=""; QUENCH_TXN_WRITE_DEPTH=0; QUENCH_TXN_FILE=""
+    SAFETY_PID=""; SAFETY_SCRIPT=""; SAFETY_UNIT=""
+    SAFETY_DELAY_SECONDS=600
+    mkdir -p "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config.d" "$QUENCH_BACKUP_DIR"
+    printf 'nameserver 192.0.2.53\n' > "$CONFIG_RESTORE_ROOT/etc/resolv.conf"
+    SSHD_CONFIG="$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config"
+    printf 'Port 22\nPasswordAuthentication yes\n' > "$SSHD_CONFIG"
+    # shellcheck disable=SC2329 # review fixture stubs
+    systemd_available() { return 1; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    svc_is_active() { return 1; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    audit_action() { :; }
+    # shellcheck disable=SC2329 # review fixture: a real tar snapshot of the fixture tree
+    config_backup_create() {
+        local ARCHIVE="$QUENCH_BACKUP_DIR/snapshot-$RANDOM.tar.gz"
+        tar -czf "$ARCHIVE" -C "$CONFIG_RESTORE_ROOT" etc || return 1
+        printf '%s\n' "$ARCHIVE"
+    }
+    # 大多数用例不需要真的起计时器；需要的用例自己覆盖回真实实现
+    # shellcheck disable=SC2329 # review fixture: record the script instead of launching it
+    safety_launch_timer() { SAFETY_UNIT=""; SAFETY_PID=""; SAFETY_SCRIPT="$1"; return 0; }
+    # shellcheck disable=SC2329 # review fixture: nothing to stop
+    safety_stop_timer_process() { return 0; }
+}
+
+# 1. Caddy 删除只拿自己的锁，DNS 回滚快照含 etc/caddy：删掉的站点会被回滚复活。
+t_review_001() {
+    review_setup cross_module
+    CADDY_CONFIG_DIR="$CONFIG_RESTORE_ROOT/etc/caddy"; CADDYFILE="$CADDY_CONFIG_DIR/Caddyfile"
+    CADDY_SITES_DIR="$CADDY_CONFIG_DIR/sites.d"; CADDY_STATE_DIR="$QUENCH_DATA_DIR/caddy"
+    CADDY_LOCK_DIR="$CADDY_STATE_DIR/config.lock"
+    mkdir -p "$CADDY_SITES_DIR" "$CADDY_STATE_DIR"
+    printf 'import %s/*.caddy\n' "$CADDY_SITES_DIR" > "$CADDYFILE"
+    SITE="$CADDY_SITES_DIR/example.caddy"
+    caddy_render_proxy_site example.com 127.0.0.1:8080 example > "$SITE"
+    # shellcheck disable=SC2329 # review fixture stubs
+    caddy_validate() { return 0; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    caddy_service_active() { return 0; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    caddy_reload_active() { return 0; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    caddy_backup_before_change() { :; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    confirm_change_preview() { return 0; }
+    safety_arm dns >/dev/null 2>&1 || { echo "could not arm the DNS transaction" >&2; exit 1; }
+    caddy_delete_site <<< '1' >/dev/null 2>&1 \
+        && { echo "a Caddy site was deleted while a DNS rollback was armed" >&2; exit 1; }
+    [ -f "$SITE" ] || { echo "the refused deletion still removed the site" >&2; exit 1; }
+    cancel_safety_timer >/dev/null 2>&1 || true
+    :
+}
+run_test "Caddy writes are refused while another module's rollback is armed" t_review_001
+
+# 2. SSH 候选在确认窗口前生成；窗口内另一笔端口迁移完成后，旧候选会把端口写回 22。
+t_review_002() {
+    review_setup stale_ssh
+    # shellcheck disable=SC2329 # review fixture: another session completes a port migration during the preview
+    confirm_file_diff() {
+        txn_write_begin 'port migration during preview' || return 1
+        ssh_set_ports_file "$SSHD_CONFIG" 2222 || return 1
+        txn_write_end
+        return 0
+    }
+    # shellcheck disable=SC2329 # review fixture stubs
+    apply_and_restart() { return 0; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    get_config() { awk -v key="$1" 'tolower($1)==tolower(key) {print $2; exit}' "$SSHD_CONFIG"; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    safety_confirm() { cancel_safety_timer; }
+    ssh_apply_policy 'policy test' no no yes no >/dev/null 2>&1 \
+        && { echo "a stale SSH candidate was applied over a newer change" >&2; exit 1; }
+    [ "$(get_config Port)" = 2222 ] \
+        || { echo "the other session's port migration was overwritten: port=$(get_config Port)" >&2; exit 1; }
+    :
+}
+run_test "An SSH candidate built before the lock is not applied over a newer change" t_review_002
+
+# 3. 真实计时器在等待确认期间到期：输入 y 不能再显示“已取消”。
+t_review_003() {
+    review_setup confirm_expiry
+    SAFETY_DELAY_SECONDS=1
+    # 这条要真实计时器：夹具里的 stub 是覆盖掉源函数的，unset 只会留下空洞，
+    # 所以这里直接给出 nohup 版的真实启动/停止实现。
+    # shellcheck disable=SC2329 # review fixture: a real background timer
+    safety_launch_timer() {
+        SAFETY_PID=""; SAFETY_UNIT=""; SAFETY_SCRIPT=""
+        [ -f "$1" ] || return 1
+        nohup bash "$1" >/dev/null 2>&1 &
+        SAFETY_PID=$!; SAFETY_SCRIPT="$1"
+    }
+    # shellcheck disable=SC2329 # review fixture: stop the background timer
+    safety_stop_timer_process() {
+        [ -z "${SAFETY_PID:-}" ] || { kill "$SAFETY_PID" 2>/dev/null || true; wait "$SAFETY_PID" 2>/dev/null || true; }
+        return 0
+    }
+    safety_arm dns >/dev/null 2>&1 || { echo "could not arm the DNS transaction" >&2; exit 1; }
+    printf 'nameserver 1.1.1.1\n' > "$CONFIG_RESTORE_ROOT/etc/resolv.conf"
+    # shellcheck disable=SC2329 # review fixture: the user takes longer than the timer
+    read() { sleep 3; builtin read "$@"; }
+    RC=0
+    safety_confirm <<< 'y' >/dev/null 2>&1 || RC=$?
+    unset -f read
+    [ "$RC" -ne 0 ] \
+        || { echo "confirming after the timer had fired reported success" >&2; exit 1; }
+    [ "$(cat "$CONFIG_RESTORE_ROOT/etc/resolv.conf")" = 'nameserver 192.0.2.53' ] \
+        || { echo "the expired timer did not restore the old value" >&2; exit 1; }
+    :
+}
+run_test "Confirming after the timer has already rolled back is reported as such" t_review_003
+
+# 4. 导入是精确替换，自动回滚却是解压合并：导入新增的 drop-in 回滚后仍留下。
+t_review_004() {
+    review_setup leftover_dropin
+    printf '# old drop-in\n' > "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config.d/10-original.conf"
+    mkdir -p "$PROBE/import/etc/ssh/sshd_config.d"
+    printf 'DenyUsers root\n' > "$PROBE/import/etc/ssh/sshd_config.d/99-deny.conf"
+    tar -czf "$PROBE/import.tar.gz" -C "$PROBE/import" etc/ssh/sshd_config.d
+    safety_arm config_restore >/dev/null 2>&1 || { echo "could not arm the restore transaction" >&2; exit 1; }
+    config_archive_extract "$PROBE/import.tar.gz" >/dev/null 2>&1 || { echo "import failed" >&2; exit 1; }
+    safety_rollback_now >/dev/null 2>&1 || { echo "automatic rollback failed" >&2; exit 1; }
+    [ -f "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config.d/10-original.conf" ] \
+        || { echo "rollback did not restore the original drop-in" >&2; exit 1; }
+    [ ! -e "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config.d/99-deny.conf" ] \
+        || { echo "rollback left the imported deny drop-in in place" >&2; exit 1; }
+    :
+}
+run_test "Automatic rollback removes files the transaction added" t_review_004
+
+# 5. 仅进入并退出 BBR 子菜单，不得调用会改限速的 reconcile。
+t_review_005() {
+    review_setup bbr_menu
+    TC_STATE_FILE="$PROBE/tc.state"
+    printf 'saved\n' > "$TC_STATE_FILE"
+    RECONCILE_LOG="$PROBE/reconcile.log"; : > "$RECONCILE_LOG"
+    # shellcheck disable=SC2329 # review fixture stubs
+    ensure_sysctl() { return 0; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    has_sysctl_write() { return 0; }
+    # shellcheck disable=SC2329 # review fixture: record any mutating reconcile
+    bbr_tc_reconcile_saved() { echo call >> "$RECONCILE_LOG"; return 0; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    bbr_tc_saved_matches_runtime() { return 1; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    bbr_print_status() { :; }
+    bbr_menu <<< '0' >/dev/null 2>&1 || true
+    [ ! -s "$RECONCILE_LOG" ] \
+        || { echo "entering the BBR menu applied the saved tc rate" >&2; exit 1; }
+    :
+}
+run_test "Entering and leaving the BBR menu applies nothing" t_review_005
+
 test_summary "Fault injection"

@@ -231,9 +231,10 @@ ssh_restore_last_backup() {
 }
 
 ssh_apply_policy() {
-    local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE APPLY_RC
+    local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE APPLY_RC BASE_SUM
     CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
+    BASE_SUM=$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)
     set_config_file "$CANDIDATE" PasswordAuthentication "$PASSWORD"
     set_config_file "$CANDIDATE" KbdInteractiveAuthentication "$KEYBOARD"
     set_config_file "$CANDIDATE" PubkeyAuthentication "$PUBKEY"
@@ -244,6 +245,13 @@ ssh_apply_policy() {
     fi
     backup_config || { rm -f "$CANDIDATE"; return 1; }
     safety_arm ssh_login || { rm -f "$CANDIDATE"; return 1; }
+    # 候选是在“等用户确认差异”之前从原文件派生的，那段时间没有持锁；
+    # 另一会话完成的端口迁移等修改会被这份旧候选原样覆盖回去。取锁后核对原文件。
+    if [ "$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)" != "$BASE_SUM" ]; then
+        rm -f "$CANDIDATE"; cancel_safety_timer
+        error "sshd_config 在确认期间被其他操作修改，已放弃本次应用；请重新进入并确认新的差异"
+        return 1
+    fi
     if ! atomic_replace_file "$CANDIDATE" "$SSHD_CONFIG"; then
         rm -f "$CANDIDATE"; cancel_safety_timer; error "SSH 配置写入失败"; return 1
     fi

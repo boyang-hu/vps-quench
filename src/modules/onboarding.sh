@@ -212,29 +212,37 @@ first_run_ssh_baseline_apply() {
     first_run_ssh_baseline_ready && { info "SSH 基础加固已经生效，无需重复修改"; return 0; }
     command -v sshd >/dev/null 2>&1 || { error "未找到 sshd，无法应用 SSH 基线"; return 1; }
     [ -f "$SSHD_CONFIG" ] || { error "SSH 主配置不存在：$SSHD_CONFIG"; return 1; }
-    local CANDIDATE
+    local CANDIDATE BASE_SUM
     CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
+    BASE_SUM=$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)
     first_run_ssh_baseline_render "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "SSH 基础加固"; then
         rm -f "$CANDIDATE"
         warn "已取消，SSH 配置未修改"
         return 0
     fi
-    backup_config || { rm -f "$CANDIDATE"; return 1; }
+    txn_write_begin "SSH 基础加固" || { rm -f "$CANDIDATE"; return 1; }
+    if [ "$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)" != "$BASE_SUM" ]; then
+        rm -f "$CANDIDATE"; txn_write_end
+        error "sshd_config 在确认期间被其他操作修改，已放弃本次应用；请重新运行"
+        return 1
+    fi
+    backup_config || { rm -f "$CANDIDATE"; txn_write_end; return 1; }
     if ! atomic_replace_file "$CANDIDATE" "$SSHD_CONFIG"; then
         rm -f "$CANDIDATE"
         error "SSH 配置写入失败"
-        return 1
+        txn_write_end; return 1
     fi
     rm -f "$CANDIDATE"
     if ! apply_and_restart || ! first_run_ssh_baseline_ready; then
         error "SSH 基础参数未完全生效，正在恢复"
         ssh_restore_last_backup
-        return 1
+        txn_write_end; return 1
     fi
     audit_action "应用首次开荒 SSH 基础加固" SUCCESS
     info "SSH 基础加固已生效：认证尝试 4 次、登录等待 30 秒、关闭 X11 转发"
+    txn_write_end
 }
 
 # 返回 0 只代表“确认恢复成功”。原来文件恢复和每一条 sysctl 回写都 || true，

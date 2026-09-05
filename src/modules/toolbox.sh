@@ -187,7 +187,16 @@ safety_timer_pending() {
 
 # 只有确认计时器已停止，才能删除回滚脚本、事务记录并释放锁。
 # 停不掉就如实报错并把全部回滚材料留在原地，让上层据此决定后续动作。
+# 返回值：0 = 已取消；1 = 停不掉，材料保留；2 = 回滚已经执行（脚本自删），无可取消。
 cancel_safety_timer() {
+    if [ -n "${SAFETY_SCRIPT:-}" ] && [ ! -f "$SAFETY_SCRIPT" ]; then
+        # 脚本只会在回滚成功后自删：走到这里说明倒计时已到期并已恢复配置。
+        # 此时报“已取消”会让用户以为新配置保住了。
+        SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+        txn_record_end
+        txn_lock_release
+        return 2
+    fi
     if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ]; then
         if ! safety_stop_timer_process; then
             error "无法停止自动回滚计时器（${SAFETY_UNIT:-PID ${SAFETY_PID:-未知}}）"
@@ -606,7 +615,7 @@ safety_arm() {
 safety_arm_locked() {
     local LABEL="$1" SNAP SCRIPT UFW_STATE="inactive" FIREWALLD_STATE="inactive"
     local DELAY="${SAFETY_DELAY_SECONDS:-180}" RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
-    local RESOLV_IMMUTABLE="inactive" CLEANUP_LINES="" PATH_VALUE TARGET TARGET_Q
+    local RESOLV_IMMUTABLE="inactive" PATH_VALUE TARGET ROOTS_Q="" ROOT_ITEM ROOT_ITEM_Q
     local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q
     shift
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
@@ -622,12 +631,14 @@ safety_arm_locked() {
             error "拒绝将非 Quench 配置路径加入回滚：$PATH_VALUE"
             return 1
         }
-        [ -e "$PATH_VALUE" ] || [ -L "$PATH_VALUE" ] || {
-            if [ "$RESTORE_ROOT" = / ]; then TARGET="$PATH_VALUE"; else TARGET="${RESTORE_ROOT%/}$PATH_VALUE"; fi
-            printf -v TARGET_Q '%q' "$TARGET"
-            CLEANUP_LINES+="rm -rf -- $TARGET_Q"$'\n'
-        }
     done
+    # 允许根列表嵌进回滚脚本：快照里没有的根在回滚时删除（快照时它不存在），
+    # 这一步取代了原来按调用方传入路径逐条生成的 rm 行和两处 sysctl.d 特判。
+    while IFS= read -r ROOT_ITEM; do
+        [ -n "$ROOT_ITEM" ] || continue
+        printf -v ROOT_ITEM_Q '%q' "$ROOT_ITEM"
+        ROOTS_Q="$ROOTS_Q $ROOT_ITEM_Q"
+    done < <(config_backup_allowed_roots)
     SNAP=$(config_backup_create "safety_${LABEL}" true) || return 1
     if [ "$RESTORE_ROOT" = / ] && command -v lsattr >/dev/null 2>&1 \
         && lsattr -d /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q i; then
@@ -658,16 +669,39 @@ if [ "\${1:-}" != --now ]; then
 fi
 trap - TERM INT
 chattr -i $RESOLV_Q >/dev/null 2>&1 || true
-tar -xzf $SNAP_Q -C $ROOT_Q >/dev/null 2>&1 || exit 1
-$CLEANUP_LINES
-tar -tzf $SNAP_Q 2>/dev/null | grep -qx 'etc/sysctl.d/98-vps-quench-network-security.conf' || rm -f ${RESTORE_ROOT%/}/etc/sysctl.d/98-vps-quench-network-security.conf
-tar -tzf $SNAP_Q 2>/dev/null | grep -qx 'etc/sysctl.d/99-quench-ipv6.conf' || rm -f ${RESTORE_ROOT%/}/etc/sysctl.d/99-quench-ipv6.conf
-if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
-if [ $ROOT_Q != / ]; then rm -f $SCRIPT_Q; exit 0; fi
-# RC 汇总必要步骤的结果。原来这些全是 || true，任何一步失败都被吞掉，
-# 脚本照样记录成功并删掉自己，调用方据此认为回滚已完成。
-# 只统计该组件确实存在时的失败；组件本来就没装不算失败。
+# 精确恢复，与配置导入同一语义。原来是 tar -xzf 直接解压合并：快照之后新增的文件
+# （例如导入带来的 sshd_config.d/99-deny.conf）会留下，回滚后的状态并不等于快照。
+# 快照里有的根整个替换，快照里没有的允许根删除（快照时它就不存在）；目录先在同一
+# 文件系统复制好再切换，复制失败原目录不动。
 RC=0
+STAGE=\$(mktemp -d "\${TMPDIR:-/tmp}/quench-rollback.XXXXXX") || exit 1
+tar -xzf $SNAP_Q -C "\$STAGE" >/dev/null 2>&1 || { rm -rf "\$STAGE"; exit 1; }
+for ROOT in $ROOTS_Q; do
+    SRC="\$STAGE/\$ROOT"
+    DEST="${RESTORE_ROOT%/}/\$ROOT"
+    if [ -e "\$SRC" ] || [ -L "\$SRC" ]; then
+        mkdir -p "\$(dirname "\$DEST")" || { RC=1; continue; }
+        rm -rf "\$DEST.quench-new" "\$DEST.quench-old"
+        if [ -d "\$SRC" ] && [ ! -L "\$SRC" ]; then cp -a "\$SRC" "\$DEST.quench-new" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }
+        else cp -a "\$SRC" "\$DEST.quench-new" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
+        fi
+        if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then mv "\$DEST" "\$DEST.quench-old" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }; fi
+        if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old"
+        else [ ! -e "\$DEST.quench-old" ] || mv "\$DEST.quench-old" "\$DEST"; rm -rf "\$DEST.quench-new"; RC=1
+        fi
+    else
+        rm -rf "\$DEST"
+    fi
+done
+rm -rf "\$STAGE"
+if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
+if [ $ROOT_Q != / ]; then
+    if [ "\$RC" -eq 0 ]; then rm -f $SCRIPT_Q; fi
+    exit "\$RC"
+fi
+# RC 汇总必要步骤的结果（延续上面文件恢复的结果）。原来这些全是 || true，任何一步
+# 失败都被吞掉，脚本照样记录成功并删掉自己，调用方据此认为回滚已完成。
+# 只统计该组件确实存在时的失败；组件本来就没装不算失败。
 if command -v sysctl >/dev/null 2>&1; then
     sysctl --system >/dev/null 2>&1 || RC=1
 fi
@@ -762,9 +796,21 @@ safety_confirm() {
     warn "请保持当前连接，并用新终端确认 SSH 和网络正常。"
     read -rp "  确认连接正常，取消自动回滚？(y/N): " OK
     if echo "$OK" | grep -qiE '^y(es)?$'; then
-        cancel_safety_timer || return 1
-        audit_action "确认连接正常，取消自动回滚" SUCCESS
-        info "已取消自动回滚"
+        # 等待输入期间倒计时可能已经到期并回滚：必须在取消前重新核对，
+        # 否则这里会对一个已经不存在的计时器说“已取消”。
+        cancel_safety_timer
+        case $? in
+            0)
+                audit_action "确认连接正常，取消自动回滚" SUCCESS
+                info "已取消自动回滚"
+                ;;
+            2)
+                audit_action "确认前自动回滚已到期执行" FAILED
+                error "自动回滚已在等待确认期间执行，配置已恢复到变更前的状态；本次变更未保留"
+                return 1
+                ;;
+            *) return 1 ;;
+        esac
     else
         warn "自动回滚仍在计时，请勿关闭旧连接。"
     fi

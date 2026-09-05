@@ -1500,9 +1500,10 @@ ssh_restore_last_backup() {
 }
 
 ssh_apply_policy() {
-    local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE APPLY_RC
+    local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE APPLY_RC BASE_SUM
     CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
+    BASE_SUM=$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)
     set_config_file "$CANDIDATE" PasswordAuthentication "$PASSWORD"
     set_config_file "$CANDIDATE" KbdInteractiveAuthentication "$KEYBOARD"
     set_config_file "$CANDIDATE" PubkeyAuthentication "$PUBKEY"
@@ -1513,6 +1514,13 @@ ssh_apply_policy() {
     fi
     backup_config || { rm -f "$CANDIDATE"; return 1; }
     safety_arm ssh_login || { rm -f "$CANDIDATE"; return 1; }
+    # 候选是在“等用户确认差异”之前从原文件派生的，那段时间没有持锁；
+    # 另一会话完成的端口迁移等修改会被这份旧候选原样覆盖回去。取锁后核对原文件。
+    if [ "$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)" != "$BASE_SUM" ]; then
+        rm -f "$CANDIDATE"; cancel_safety_timer
+        error "sshd_config 在确认期间被其他操作修改，已放弃本次应用；请重新进入并确认新的差异"
+        return 1
+    fi
     if ! atomic_replace_file "$CANDIDATE" "$SSHD_CONFIG"; then
         rm -f "$CANDIDATE"; cancel_safety_timer; error "SSH 配置写入失败"; return 1
     fi
@@ -6607,7 +6615,10 @@ bbr_menu() {
     if ! ensure_sysctl || ! has_sysctl_write; then
         _BBR_NO_SYSCTL=1
     fi
-    [ ! -s "$TC_STATE_FILE" ] || bbr_tc_reconcile_saved || true
+    # 进入菜单是只读动作：只提示运行值与保存值不一致，恢复由用户在 tc 子菜单明确触发。
+    if [ -s "$TC_STATE_FILE" ] && ! bbr_tc_saved_matches_runtime 2>/dev/null; then
+        warn "已保存的 tc 限速与当前运行值不一致；如需恢复，请进入「tc 智能整形」手动应用"
+    fi
     while true; do
         print_header "网络性能调优"
         bbr_print_status
@@ -10083,7 +10094,18 @@ caddy_backup_before_change() {
     esac
 }
 
+# 统一写入入口：回滚快照包含 etc/caddy，一笔未确认的 DNS/SSH 变更到期回滚时会把这里的
+# 修改覆盖回去；Caddy 自己的锁只防 Caddy 内部并发，防不了这个。见 txn_write_begin。
 caddy_ensure_layout() {
+    local RC
+    txn_write_begin "初始化 Caddy 目录" || return 1
+    caddy_ensure_layout_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+caddy_ensure_layout_locked() {
     local REPLACE_EXISTING="${1:-false}" STAGE BACKUP ACTIVE=false NEW=false APPLY_FAILED=false
     caddy_config_permissions || return 1
     caddy_import_markers_valid || { error "Caddyfile 中的 Quench import 标记不完整"; return 1; }
@@ -10802,7 +10824,18 @@ caddy_local_health() {
     fi
 }
 
+# 统一写入入口：回滚快照包含 etc/caddy，一笔未确认的 DNS/SSH 变更到期回滚时会把这里的
+# 修改覆盖回去；Caddy 自己的锁只防 Caddy 内部并发，防不了这个。见 txn_write_begin。
 caddy_apply_managed_site() {
+    local RC
+    txn_write_begin "应用 Caddy 站点" || return 1
+    caddy_apply_managed_site_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+caddy_apply_managed_site_locked() {
     local TYPE="$1" ADDRESS="$2" TARGET="$3" CONTENT="$4"
     local SLUG FILE STAGE WAS_ACTIVE=false STARTED=false
     caddy_ensure_layout || return 1
@@ -11021,7 +11054,18 @@ caddy_list_sites() {
     menu_div
 }
 
+# 统一写入入口：回滚快照包含 etc/caddy，一笔未确认的 DNS/SSH 变更到期回滚时会把这里的
+# 修改覆盖回去；Caddy 自己的锁只防 Caddy 内部并发，防不了这个。见 txn_write_begin。
 caddy_delete_site() {
+    local RC
+    txn_write_begin "删除 Caddy 站点" || return 1
+    caddy_delete_site_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+caddy_delete_site_locked() {
     local FILE ADDRESS TYPE TARGET INDEX=0 CHOICE BACKUP WAS_ACTIVE=false APPLY_FAILED=false
     local FILES=()
     print_header "删除 Quench 管理的 Caddy 站点"
@@ -11174,7 +11218,18 @@ caddy_reload_config() {
     fi
 }
 
+# 统一写入入口：回滚快照包含 etc/caddy，一笔未确认的 DNS/SSH 变更到期回滚时会把这里的
+# 修改覆盖回去；Caddy 自己的锁只防 Caddy 内部并发，防不了这个。见 txn_write_begin。
 caddy_edit_raw() {
+    local RC
+    txn_write_begin "编辑 Caddyfile" || return 1
+    caddy_edit_raw_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+caddy_edit_raw_locked() {
     local BACKUP WAS_ACTIVE=false APPLY_FAILED=false
     print_header "高级：编辑 Caddy 主配置"
     warn "Quench 管理的站点位于 ${CADDY_SITES_DIR}；此入口编辑主 Caddyfile。"
@@ -13098,7 +13153,16 @@ safety_timer_pending() {
 
 # 只有确认计时器已停止，才能删除回滚脚本、事务记录并释放锁。
 # 停不掉就如实报错并把全部回滚材料留在原地，让上层据此决定后续动作。
+# 返回值：0 = 已取消；1 = 停不掉，材料保留；2 = 回滚已经执行（脚本自删），无可取消。
 cancel_safety_timer() {
+    if [ -n "${SAFETY_SCRIPT:-}" ] && [ ! -f "$SAFETY_SCRIPT" ]; then
+        # 脚本只会在回滚成功后自删：走到这里说明倒计时已到期并已恢复配置。
+        # 此时报“已取消”会让用户以为新配置保住了。
+        SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+        txn_record_end
+        txn_lock_release
+        return 2
+    fi
     if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ]; then
         if ! safety_stop_timer_process; then
             error "无法停止自动回滚计时器（${SAFETY_UNIT:-PID ${SAFETY_PID:-未知}}）"
@@ -13517,7 +13581,7 @@ safety_arm() {
 safety_arm_locked() {
     local LABEL="$1" SNAP SCRIPT UFW_STATE="inactive" FIREWALLD_STATE="inactive"
     local DELAY="${SAFETY_DELAY_SECONDS:-180}" RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
-    local RESOLV_IMMUTABLE="inactive" CLEANUP_LINES="" PATH_VALUE TARGET TARGET_Q
+    local RESOLV_IMMUTABLE="inactive" PATH_VALUE TARGET ROOTS_Q="" ROOT_ITEM ROOT_ITEM_Q
     local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q
     shift
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
@@ -13533,12 +13597,14 @@ safety_arm_locked() {
             error "拒绝将非 Quench 配置路径加入回滚：$PATH_VALUE"
             return 1
         }
-        [ -e "$PATH_VALUE" ] || [ -L "$PATH_VALUE" ] || {
-            if [ "$RESTORE_ROOT" = / ]; then TARGET="$PATH_VALUE"; else TARGET="${RESTORE_ROOT%/}$PATH_VALUE"; fi
-            printf -v TARGET_Q '%q' "$TARGET"
-            CLEANUP_LINES+="rm -rf -- $TARGET_Q"$'\n'
-        }
     done
+    # 允许根列表嵌进回滚脚本：快照里没有的根在回滚时删除（快照时它不存在），
+    # 这一步取代了原来按调用方传入路径逐条生成的 rm 行和两处 sysctl.d 特判。
+    while IFS= read -r ROOT_ITEM; do
+        [ -n "$ROOT_ITEM" ] || continue
+        printf -v ROOT_ITEM_Q '%q' "$ROOT_ITEM"
+        ROOTS_Q="$ROOTS_Q $ROOT_ITEM_Q"
+    done < <(config_backup_allowed_roots)
     SNAP=$(config_backup_create "safety_${LABEL}" true) || return 1
     if [ "$RESTORE_ROOT" = / ] && command -v lsattr >/dev/null 2>&1 \
         && lsattr -d /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q i; then
@@ -13569,16 +13635,39 @@ if [ "\${1:-}" != --now ]; then
 fi
 trap - TERM INT
 chattr -i $RESOLV_Q >/dev/null 2>&1 || true
-tar -xzf $SNAP_Q -C $ROOT_Q >/dev/null 2>&1 || exit 1
-$CLEANUP_LINES
-tar -tzf $SNAP_Q 2>/dev/null | grep -qx 'etc/sysctl.d/98-vps-quench-network-security.conf' || rm -f ${RESTORE_ROOT%/}/etc/sysctl.d/98-vps-quench-network-security.conf
-tar -tzf $SNAP_Q 2>/dev/null | grep -qx 'etc/sysctl.d/99-quench-ipv6.conf' || rm -f ${RESTORE_ROOT%/}/etc/sysctl.d/99-quench-ipv6.conf
-if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
-if [ $ROOT_Q != / ]; then rm -f $SCRIPT_Q; exit 0; fi
-# RC 汇总必要步骤的结果。原来这些全是 || true，任何一步失败都被吞掉，
-# 脚本照样记录成功并删掉自己，调用方据此认为回滚已完成。
-# 只统计该组件确实存在时的失败；组件本来就没装不算失败。
+# 精确恢复，与配置导入同一语义。原来是 tar -xzf 直接解压合并：快照之后新增的文件
+# （例如导入带来的 sshd_config.d/99-deny.conf）会留下，回滚后的状态并不等于快照。
+# 快照里有的根整个替换，快照里没有的允许根删除（快照时它就不存在）；目录先在同一
+# 文件系统复制好再切换，复制失败原目录不动。
 RC=0
+STAGE=\$(mktemp -d "\${TMPDIR:-/tmp}/quench-rollback.XXXXXX") || exit 1
+tar -xzf $SNAP_Q -C "\$STAGE" >/dev/null 2>&1 || { rm -rf "\$STAGE"; exit 1; }
+for ROOT in $ROOTS_Q; do
+    SRC="\$STAGE/\$ROOT"
+    DEST="${RESTORE_ROOT%/}/\$ROOT"
+    if [ -e "\$SRC" ] || [ -L "\$SRC" ]; then
+        mkdir -p "\$(dirname "\$DEST")" || { RC=1; continue; }
+        rm -rf "\$DEST.quench-new" "\$DEST.quench-old"
+        if [ -d "\$SRC" ] && [ ! -L "\$SRC" ]; then cp -a "\$SRC" "\$DEST.quench-new" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }
+        else cp -a "\$SRC" "\$DEST.quench-new" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
+        fi
+        if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then mv "\$DEST" "\$DEST.quench-old" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }; fi
+        if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old"
+        else [ ! -e "\$DEST.quench-old" ] || mv "\$DEST.quench-old" "\$DEST"; rm -rf "\$DEST.quench-new"; RC=1
+        fi
+    else
+        rm -rf "\$DEST"
+    fi
+done
+rm -rf "\$STAGE"
+if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
+if [ $ROOT_Q != / ]; then
+    if [ "\$RC" -eq 0 ]; then rm -f $SCRIPT_Q; fi
+    exit "\$RC"
+fi
+# RC 汇总必要步骤的结果（延续上面文件恢复的结果）。原来这些全是 || true，任何一步
+# 失败都被吞掉，脚本照样记录成功并删掉自己，调用方据此认为回滚已完成。
+# 只统计该组件确实存在时的失败；组件本来就没装不算失败。
 if command -v sysctl >/dev/null 2>&1; then
     sysctl --system >/dev/null 2>&1 || RC=1
 fi
@@ -13673,9 +13762,21 @@ safety_confirm() {
     warn "请保持当前连接，并用新终端确认 SSH 和网络正常。"
     read -rp "  确认连接正常，取消自动回滚？(y/N): " OK
     if echo "$OK" | grep -qiE '^y(es)?$'; then
-        cancel_safety_timer || return 1
-        audit_action "确认连接正常，取消自动回滚" SUCCESS
-        info "已取消自动回滚"
+        # 等待输入期间倒计时可能已经到期并回滚：必须在取消前重新核对，
+        # 否则这里会对一个已经不存在的计时器说“已取消”。
+        cancel_safety_timer
+        case $? in
+            0)
+                audit_action "确认连接正常，取消自动回滚" SUCCESS
+                info "已取消自动回滚"
+                ;;
+            2)
+                audit_action "确认前自动回滚已到期执行" FAILED
+                error "自动回滚已在等待确认期间执行，配置已恢复到变更前的状态；本次变更未保留"
+                return 1
+                ;;
+            *) return 1 ;;
+        esac
     else
         warn "自动回滚仍在计时，请勿关闭旧连接。"
     fi
@@ -14418,29 +14519,37 @@ first_run_ssh_baseline_apply() {
     first_run_ssh_baseline_ready && { info "SSH 基础加固已经生效，无需重复修改"; return 0; }
     command -v sshd >/dev/null 2>&1 || { error "未找到 sshd，无法应用 SSH 基线"; return 1; }
     [ -f "$SSHD_CONFIG" ] || { error "SSH 主配置不存在：$SSHD_CONFIG"; return 1; }
-    local CANDIDATE
+    local CANDIDATE BASE_SUM
     CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
+    BASE_SUM=$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)
     first_run_ssh_baseline_render "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "SSH 基础加固"; then
         rm -f "$CANDIDATE"
         warn "已取消，SSH 配置未修改"
         return 0
     fi
-    backup_config || { rm -f "$CANDIDATE"; return 1; }
+    txn_write_begin "SSH 基础加固" || { rm -f "$CANDIDATE"; return 1; }
+    if [ "$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)" != "$BASE_SUM" ]; then
+        rm -f "$CANDIDATE"; txn_write_end
+        error "sshd_config 在确认期间被其他操作修改，已放弃本次应用；请重新运行"
+        return 1
+    fi
+    backup_config || { rm -f "$CANDIDATE"; txn_write_end; return 1; }
     if ! atomic_replace_file "$CANDIDATE" "$SSHD_CONFIG"; then
         rm -f "$CANDIDATE"
         error "SSH 配置写入失败"
-        return 1
+        txn_write_end; return 1
     fi
     rm -f "$CANDIDATE"
     if ! apply_and_restart || ! first_run_ssh_baseline_ready; then
         error "SSH 基础参数未完全生效，正在恢复"
         ssh_restore_last_backup
-        return 1
+        txn_write_end; return 1
     fi
     audit_action "应用首次开荒 SSH 基础加固" SUCCESS
     info "SSH 基础加固已生效：认证尝试 4 次、登录等待 30 秒、关闭 X11 转发"
+    txn_write_end
 }
 
 # 返回 0 只代表“确认恢复成功”。原来文件恢复和每一条 sysctl 回写都 || true，

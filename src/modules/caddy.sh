@@ -492,7 +492,18 @@ caddy_backup_before_change() {
     esac
 }
 
+# 统一写入入口：回滚快照包含 etc/caddy，一笔未确认的 DNS/SSH 变更到期回滚时会把这里的
+# 修改覆盖回去；Caddy 自己的锁只防 Caddy 内部并发，防不了这个。见 txn_write_begin。
 caddy_ensure_layout() {
+    local RC
+    txn_write_begin "初始化 Caddy 目录" || return 1
+    caddy_ensure_layout_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+caddy_ensure_layout_locked() {
     local REPLACE_EXISTING="${1:-false}" STAGE BACKUP ACTIVE=false NEW=false APPLY_FAILED=false
     caddy_config_permissions || return 1
     caddy_import_markers_valid || { error "Caddyfile 中的 Quench import 标记不完整"; return 1; }
@@ -1211,7 +1222,18 @@ caddy_local_health() {
     fi
 }
 
+# 统一写入入口：回滚快照包含 etc/caddy，一笔未确认的 DNS/SSH 变更到期回滚时会把这里的
+# 修改覆盖回去；Caddy 自己的锁只防 Caddy 内部并发，防不了这个。见 txn_write_begin。
 caddy_apply_managed_site() {
+    local RC
+    txn_write_begin "应用 Caddy 站点" || return 1
+    caddy_apply_managed_site_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+caddy_apply_managed_site_locked() {
     local TYPE="$1" ADDRESS="$2" TARGET="$3" CONTENT="$4"
     local SLUG FILE STAGE WAS_ACTIVE=false STARTED=false
     caddy_ensure_layout || return 1
@@ -1430,7 +1452,18 @@ caddy_list_sites() {
     menu_div
 }
 
+# 统一写入入口：回滚快照包含 etc/caddy，一笔未确认的 DNS/SSH 变更到期回滚时会把这里的
+# 修改覆盖回去；Caddy 自己的锁只防 Caddy 内部并发，防不了这个。见 txn_write_begin。
 caddy_delete_site() {
+    local RC
+    txn_write_begin "删除 Caddy 站点" || return 1
+    caddy_delete_site_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+caddy_delete_site_locked() {
     local FILE ADDRESS TYPE TARGET INDEX=0 CHOICE BACKUP WAS_ACTIVE=false APPLY_FAILED=false
     local FILES=()
     print_header "删除 Quench 管理的 Caddy 站点"
@@ -1583,7 +1616,18 @@ caddy_reload_config() {
     fi
 }
 
+# 统一写入入口：回滚快照包含 etc/caddy，一笔未确认的 DNS/SSH 变更到期回滚时会把这里的
+# 修改覆盖回去；Caddy 自己的锁只防 Caddy 内部并发，防不了这个。见 txn_write_begin。
 caddy_edit_raw() {
+    local RC
+    txn_write_begin "编辑 Caddyfile" || return 1
+    caddy_edit_raw_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+caddy_edit_raw_locked() {
     local BACKUP WAS_ACTIVE=false APPLY_FAILED=false
     print_header "高级：编辑 Caddy 主配置"
     warn "Quench 管理的站点位于 ${CADDY_SITES_DIR}；此入口编辑主 Caddyfile。"

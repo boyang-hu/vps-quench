@@ -3283,7 +3283,10 @@ bbr_menu() {
     if ! ensure_sysctl || ! has_sysctl_write; then
         _BBR_NO_SYSCTL=1
     fi
-    [ ! -s "$TC_STATE_FILE" ] || bbr_tc_reconcile_saved || true
+    # 进入菜单是只读动作：只提示运行值与保存值不一致，恢复由用户在 tc 子菜单明确触发。
+    if [ -s "$TC_STATE_FILE" ] && ! bbr_tc_saved_matches_runtime 2>/dev/null; then
+        warn "已保存的 tc 限速与当前运行值不一致；如需恢复，请进入「tc 智能整形」手动应用"
+    fi
     while true; do
         print_header "网络性能调优"
         bbr_print_status
