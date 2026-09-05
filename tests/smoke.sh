@@ -923,7 +923,7 @@ BANNER_COMPACT=$(COLUMNS=60 NO_COLOR=1 quench_art_banner)
 t_top_020() {
     [[ "$BANNER_COMPACT" = *'██████╗ ██╗   ██╗███████╗'* && "$BANNER_COMPACT" = *'╚══▀▀═╝'* ]] || { echo "Compact QUENCH banner is missing" >&2; exit 1; }
     [[ "$(COLUMNS=40 NO_COLOR=1 quench_art_banner)" = *'QUENCH'* ]] || { echo "Narrow QUENCH banner fallback is missing" >&2; exit 1; }
-    [[ "$(app_header_line)" = *'VPS INIT/MANAGEMENT TOOLS  ·  V0.1.0  ·  Boyang'* ]] || { echo "QUENCH header line is wrong" >&2; exit 1; }
+    [[ "$(app_header_line)" = *'VPS INIT/MANAGEMENT TOOLS  ·  V0.1.1  ·  Boyang'* ]] || { echo "QUENCH header line is wrong" >&2; exit 1; }
     [ "$(vis_len '用户管理')" = 8 ] || { echo "CJK width is wrong" >&2; exit 1; }
     [ "$(vis_len 'abc')" = 3 ] || { echo "ASCII width is wrong" >&2; exit 1; }
     [ "$(vis_len '')" = 0 ] || { echo "Empty string width is wrong" >&2; exit 1; }
