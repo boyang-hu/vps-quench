@@ -309,7 +309,17 @@ bbr_backup_sysctl() {
 }
 
 # ── 还原 sysctl ───────────────────────────────────────────
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 bbr_restore_sysctl() {
+    local RC
+    txn_write_begin "恢复 BBR 内核参数快照" || return 1
+    bbr_restore_sysctl_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_restore_sysctl_locked() {
     print_header "还原 TCP sysctl 配置"
 
     local LIST_FILE
@@ -370,7 +380,17 @@ bbr_restore_sysctl() {
     rm -f "$LIST_FILE"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 bbr_restore_initial_baseline() {
+    local RC
+    txn_write_begin "恢复首次调优前状态" || return 1
+    bbr_restore_initial_baseline_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_restore_initial_baseline_locked() {
     print_header "恢复首次调优前状态"
     [ -s "$BBR_BASELINE_FILE" ] || {
         warn "未找到首次调优前基线：${BBR_BASELINE_FILE}"

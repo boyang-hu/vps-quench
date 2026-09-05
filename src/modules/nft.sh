@@ -1289,7 +1289,17 @@ nft_delete_rule_locked() {
     rm -f "$rules_backup" "$access_backup" "${rules_backup}.new" "${access_backup}.new"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_toggle_rule() {
+    local RC
+    txn_write_begin "启用/停用转发规则" || return 1
+    nft_toggle_rule_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_toggle_rule_locked() {
     local id record rules_backup access_backup rid family proto lip ls le ttype thost tip ts te mode snat acl enabled comment
     print_header "启用 / 停用转发规则"
     nft_list_rules || { warn "暂无规则"; return; }
@@ -1559,7 +1569,17 @@ nft_diagnostics() {
     warn "云厂商安全组必须另行放行监听端口"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_reapply() {
+    local RC
+    txn_write_begin "重新应用转发规则" || return 1
+    nft_reapply_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_reapply_locked() {
     nft_install || return 1
     nft_lock_acquire || return 1
     nft_reconcile

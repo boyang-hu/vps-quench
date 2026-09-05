@@ -923,7 +923,7 @@ BANNER_COMPACT=$(COLUMNS=60 NO_COLOR=1 quench_art_banner)
 t_top_020() {
     [[ "$BANNER_COMPACT" = *'██████╗ ██╗   ██╗███████╗'* && "$BANNER_COMPACT" = *'╚══▀▀═╝'* ]] || { echo "Compact QUENCH banner is missing" >&2; exit 1; }
     [[ "$(COLUMNS=40 NO_COLOR=1 quench_art_banner)" = *'QUENCH'* ]] || { echo "Narrow QUENCH banner fallback is missing" >&2; exit 1; }
-    [[ "$(app_header_line)" = *'VPS INIT/MANAGEMENT TOOLS  ·  V0.1.3  ·  Boyang'* ]] || { echo "QUENCH header line is wrong" >&2; exit 1; }
+    [[ "$(app_header_line)" = *'VPS INIT/MANAGEMENT TOOLS  ·  V0.1.4  ·  Boyang'* ]] || { echo "QUENCH header line is wrong" >&2; exit 1; }
     [ "$(vis_len '用户管理')" = 8 ] || { echo "CJK width is wrong" >&2; exit 1; }
     [ "$(vis_len 'abc')" = 3 ] || { echo "ASCII width is wrong" >&2; exit 1; }
     [ "$(vis_len '')" = 0 ] || { echo "Empty string width is wrong" >&2; exit 1; }
@@ -2223,5 +2223,17 @@ t_build_001() {
     :
 }
 run_test "Rebuilding unchanged sources leaves the manifest untouched" t_build_001
+
+
+# 事务保护盘点：从菜单可达的入口出发，凡是写入回滚快照覆盖路径的函数都必须经过
+# txn_write_begin / safety_arm。名单式测试只能覆盖已知函数，这里用调用图兜底。
+t_txn_inventory() {
+    command -v python3 >/dev/null 2>&1 || { echo "python3 unavailable, inventory skipped"; return 0; }
+    local OUT
+    OUT=$(python3 "$ROOT/tests/txn-inventory.py" 2>&1) || { echo "inventory failed: $OUT" >&2; exit 1; }
+    [ -z "$OUT" ] || { echo "unguarded writers reachable from menus:" >&2; echo "$OUT" >&2; exit 1; }
+    :
+}
+run_test "Every menu-reachable writer of a snapshot-covered path is transaction-guarded" t_txn_inventory
 
 test_summary "Smoke ($OS)"

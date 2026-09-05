@@ -267,28 +267,17 @@ ip_v6_snapshot_create() {
 
 ip_v6_rollback_script_create() {
     local SNAPSHOT="$1" SCRIPT="$2" DELAY="$3"
-    local SNAPSHOT_Q SCRIPT_Q PROC_Q CONF_Q
+    local SNAPSHOT_Q PROC_Q CONF_Q PROLOGUE
     printf -v SNAPSHOT_Q '%q' "$SNAPSHOT"
-    printf -v SCRIPT_Q '%q' "$SCRIPT"
     printf -v PROC_Q '%q' "$IP_V6_PROC_ROOT"
     printf -v CONF_Q '%q' "$IP_V6_SYSCTL_FILE"
+    # 状态与信号协议与通用回滚脚本共用（.restoring / .failed / 恢复阶段忽略 TERM）
+    PROLOGUE=$(safety_script_prologue "$SCRIPT" "$DELAY") || return 1
     cat > "$SCRIPT" <<EOF
-#!/bin/bash
+$PROLOGUE
 SNAPSHOT=$SNAPSHOT_Q
-SELF=$SCRIPT_Q
 PROC_ROOT=$PROC_Q
 MANAGED_CONF=$CONF_Q
-ROLLBACK_SLEEP_PID=""
-rollback_cancel_wait() {
-    [ -z "\$ROLLBACK_SLEEP_PID" ] || kill "\$ROLLBACK_SLEEP_PID" 2>/dev/null || true
-    exit 0
-}
-trap rollback_cancel_wait TERM INT
-if [ "\${1:-}" != --now ]; then
-    sleep $DELAY & ROLLBACK_SLEEP_PID=\$!
-    wait "\$ROLLBACK_SLEEP_PID" || exit 0
-fi
-trap - TERM INT
 RC=0
 HAD=\$(cat "\$SNAPSHOT/had-managed" 2>/dev/null)
 if [ "\$HAD" = yes ]; then
@@ -321,11 +310,10 @@ while IFS='|' read -r IFACE VALUE; do
 done < "\$SNAPSHOT/runtime.state"
 if [ "\$RC" -eq 0 ]; then
     logger -t quench "未确认连接，已恢复 IPv6 内核运行时与持久化状态"
-    rm -f "\$SELF"
 else
     logger -t quench "IPv6 自动恢复失败，请立即检查网络状态；回滚脚本已保留：\$SELF"
 fi
-exit "\$RC"
+rollback_finish "\$RC"
 EOF
     chmod 700 "$SCRIPT"
 }
@@ -589,7 +577,7 @@ ip_source_safety_arm() {
 }
 
 ip_source_safety_arm_locked() {
-    local FAMILY="$1" ROUTE_LINE="$2" SCRIPT DELAY="${SAFETY_DELAY_SECONDS:-180}" TOKEN
+    local FAMILY="$1" ROUTE_LINE="$2" SCRIPT DELAY="${SAFETY_DELAY_SECONDS:-180}" TOKEN PROLOGUE
     local TOKENS=()
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
     if safety_timer_pending; then
@@ -602,23 +590,16 @@ ip_source_safety_arm_locked() {
     [ "${#TOKENS[@]}" -gt 0 ] || return 1
     mkdir -p "$QUENCH_DATA_DIR" || return 1
     SCRIPT="$QUENCH_DATA_DIR/rollback_ip_source_$$_$(date +%s)_${RANDOM}.sh"
-    # shellcheck disable=SC2016 # 这里是在“生成”回滚脚本：$ROLLBACK_SLEEP_PID / $! / $?
-    # 必须原样写进文件、留到那个脚本自己运行时再展开，不能在这里展开。
+    # 状态与信号协议与通用回滚脚本共用（.restoring / .failed / 恢复阶段忽略 TERM）
+    PROLOGUE=$(safety_script_prologue "$SCRIPT" "$DELAY") || return 1
+    # shellcheck disable=SC2016 # 这里是在“生成”回滚脚本：$? 必须原样写进文件，留到它自己运行时再展开
     {
-        echo '#!/bin/bash'
-        echo 'ROLLBACK_SLEEP_PID=""'
-        echo 'rollback_cancel_wait() {'
-        echo '    [ -z "$ROLLBACK_SLEEP_PID" ] || kill "$ROLLBACK_SLEEP_PID" 2>/dev/null || true'
-        echo '    exit 0'
-        echo '}'
-        echo 'trap rollback_cancel_wait TERM INT'
-        printf 'if [ "${1:-}" != --now ]; then sleep %q & ROLLBACK_SLEEP_PID=$!; wait "$ROLLBACK_SLEEP_PID" || exit 0; fi\n' "$DELAY"
-        echo 'trap - TERM INT'
+        printf '%s\n' "$PROLOGUE"
         printf 'ip -%q route replace' "$FAMILY"
         for TOKEN in "${TOKENS[@]}"; do printf ' %q' "$TOKEN"; done
         echo ' >/dev/null 2>&1'
-        printf 'RC=$?; if [ "$RC" -eq 0 ]; then logger -t quench %q; rm -f %q; else logger -t quench %q; fi; exit "$RC"\n' \
-            "未确认连接，已自动恢复 IPv${FAMILY} 首选源地址" "$SCRIPT" \
+        printf 'RC=$?; if [ "$RC" -eq 0 ]; then logger -t quench %q; else logger -t quench %q; fi; rollback_finish "$RC"\n' \
+            "未确认连接，已自动恢复 IPv${FAMILY} 首选源地址" \
             "IPv${FAMILY} 首选源地址自动恢复失败，请立即检查默认路由"
     } > "$SCRIPT" || { rm -f "$SCRIPT"; return 1; }
     chmod 700 "$SCRIPT" || { rm -f "$SCRIPT"; return 1; }

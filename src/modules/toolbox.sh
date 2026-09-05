@@ -199,6 +199,22 @@ safety_timer_pending() {
 # 只有确认计时器已停止，才能删除回滚脚本、事务记录并释放锁。
 # 停不掉就如实报错并把全部回滚材料留在原地，让上层据此决定后续动作。
 # 返回值：0 = 已取消；1 = 停不掉，材料保留；2 = 回滚已经执行（脚本自删），无可取消。
+# 回滚计时器进程是否还活着。不知道它在哪（既无 unit 也无 PID）时按活着处理，靠超时兜底。
+safety_timer_process_alive() {
+    local STATE
+    if [ -n "${SAFETY_UNIT:-}" ]; then
+        STATE=$(systemctl show -p ActiveState "$SAFETY_UNIT" 2>/dev/null || true)
+        case "${STATE#ActiveState=}" in inactive|failed) return 1 ;; *) return 0 ;; esac
+    fi
+    if [ -n "${SAFETY_PID:-}" ]; then
+        kill -0 "$SAFETY_PID" 2>/dev/null || return 1
+        # 已退出但未回收的子进程 kill -0 仍成功，按已死处理
+        ps -o stat= -p "$SAFETY_PID" 2>/dev/null | grep -q '^Z' && return 1
+        return 0
+    fi
+    return 0
+}
+
 # 四种事务状态：倒计时中（可取消）、恢复中（不可取消，等它完成）、已回滚（脚本自删）、
 # 恢复失败（脚本保留并留下 .failed）。最后一种绝不能当成“取消成功”把材料删掉。
 cancel_safety_timer() {
@@ -207,10 +223,16 @@ cancel_safety_timer() {
         warn "自动回滚正在执行，无法取消；等待它完成..."
         for I in $(seq 1 "${QUENCH_RESTORE_WAIT:-120}"); do
             [ -f "${SAFETY_SCRIPT}.restoring" ] || break
+            safety_timer_process_alive || break
             sleep 1
         done
         if [ -f "${SAFETY_SCRIPT}.restoring" ]; then
-            error "自动回滚仍在执行，未能等到结束；回滚材料全部保留"
+            if safety_timer_process_alive; then
+                error "自动回滚仍在执行，未能等到结束；回滚材料全部保留"
+            else
+                error "自动回滚进程在恢复阶段中止，配置可能处于中间状态；回滚脚本与事务记录已保留：$SAFETY_SCRIPT"
+                audit_action "自动回滚在恢复阶段中止，等待人工处理" FAILED
+            fi
             return 1
         fi
     fi
@@ -660,7 +682,7 @@ safety_arm_locked() {
     local LABEL="$1" SNAP SCRIPT UFW_STATE="inactive" FIREWALLD_STATE="inactive"
     local DELAY="${SAFETY_DELAY_SECONDS:-180}" RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     local RESOLV_IMMUTABLE="inactive" PATH_VALUE TARGET ROOTS_Q="" ROOT_ITEM ROOT_ITEM_Q
-    local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q MARKER_Q FAILED_Q
+    local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q PROLOGUE
     shift
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
     if safety_timer_pending; then
@@ -695,31 +717,12 @@ safety_arm_locked() {
     if [ "$RESTORE_ROOT" = / ]; then TARGET=/etc/resolv.conf; else TARGET="${RESTORE_ROOT%/}/etc/resolv.conf"; fi
     printf -v SNAP_Q '%q' "$SNAP"
     printf -v SCRIPT_Q '%q' "$SCRIPT"
-    printf -v MARKER_Q '%q' "${SCRIPT}.restoring"
-    printf -v FAILED_Q '%q' "${SCRIPT}.failed"
     printf -v ROOT_Q '%q' "$RESTORE_ROOT"
     printf -v LABEL_Q '%q' "$LABEL"
     printf -v RESOLV_Q '%q' "$TARGET"
+    PROLOGUE=$(safety_script_prologue "$SCRIPT" "$DELAY") || return 1
     cat > "$SCRIPT" <<ROLLBACK_EOF
-#!/bin/bash
-ROLLBACK_SLEEP_PID=""
-rollback_cancel_wait() {
-    [ -z "\$ROLLBACK_SLEEP_PID" ] || kill "\$ROLLBACK_SLEEP_PID" 2>/dev/null || true
-    exit 0
-}
-trap rollback_cancel_wait TERM INT
-if [ "\${1:-}" != --now ]; then
-    sleep $DELAY &
-    ROLLBACK_SLEEP_PID=\$!
-    wait "\$ROLLBACK_SLEEP_PID" || exit 0
-fi
-trap - TERM INT
-# ── 进入恢复阶段。从这里起不再接受取消：TERM/INT 一律忽略，并留下阶段标记，
-# 调用方看到标记就知道“正在恢复”而不是“正在倒计时”。之前只区分脚本在不在，
-# 取消操作会把恢复到一半的脚本杀掉，留下主路径缺失、旧文件停在 .quench-old 的半成品。
-trap '' TERM INT
-: > $MARKER_Q
-rm -f $FAILED_Q
+$PROLOGUE
 chattr -i $RESOLV_Q >/dev/null 2>&1 || true
 # 精确恢复，与配置导入同一语义。原来是 tar -xzf 直接解压合并：快照之后新增的文件
 # （例如导入带来的 sshd_config.d/99-deny.conf）会留下，回滚后的状态并不等于快照。
@@ -754,11 +757,7 @@ for ROOT in $ROOTS_Q; do
 done
 rm -rf "\$STAGE"
 if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
-if [ $ROOT_Q != / ]; then
-    rm -f $MARKER_Q
-    if [ "\$RC" -eq 0 ]; then rm -f $SCRIPT_Q; else : > $FAILED_Q; fi
-    exit "\$RC"
-fi
+if [ $ROOT_Q != / ]; then rollback_finish "\$RC"; fi
 # RC 汇总必要步骤的结果（延续上面文件恢复的结果）。原来这些全是 || true，任何一步
 # 失败都被吞掉，脚本照样记录成功并删掉自己，调用方据此认为回滚已完成。
 # 只统计该组件确实存在时的失败；组件本来就没装不算失败。
@@ -796,15 +795,12 @@ fi
 if [ -x /usr/local/libexec/quench-nft-forward-apply ]; then
     /usr/local/libexec/quench-nft-forward-apply >/dev/null 2>&1 || RC=1
 fi
-rm -f $MARKER_Q
 if [ "\$RC" -eq 0 ]; then
     logger -t quench "未确认连接，已自动恢复 $LABEL_Q 配置"
-    rm -f $SCRIPT_Q
 else
-    : > $FAILED_Q
     logger -t quench "自动恢复过程中有步骤失败，回滚脚本已保留：$SCRIPT_Q"
 fi
-exit "\$RC"
+rollback_finish "\$RC"
 ROLLBACK_EOF
     chmod 700 "$SCRIPT"
     safety_launch_timer "$SCRIPT" \

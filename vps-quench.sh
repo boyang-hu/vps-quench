@@ -2,7 +2,7 @@
 # 由 build.sh 从 src/ 生成；请修改模块源码后重新构建发行脚本。
 
 # ============================================================
-#  Quench V0.1.3 — VPS 初始化与管理工具
+#  Quench V0.1.4 — VPS 初始化与管理工具
 #  作者：Boyang
 #
 #  项目说明：
@@ -12,6 +12,7 @@
 #  - 支持配置备份、操作审计、离线安装、完整性校验和脚本自更新
 #
 #  发布版本：
+#  V0.1.4: 三个回滚脚本生成器（通用配置、IPv6、出口源地址）共用一套状态协议：.restoring/.failed 标记、恢复阶段忽略 TERM/INT、EXIT 兜底让快照损坏等提前退出也记为失败而不是永远“正在恢复”；取消时恢复进程已死而标记仍在直接判失败，不再等满超时；NFT 启停/重新应用、BBR 基线恢复/快照还原接入事务锁；新增 tests/txn-inventory.py 调用图盘点并纳入 smoke，菜单可达的快照范围写入必须受事务保护。
 #  V0.1.3: 回滚事务状态明确化：回滚脚本进入恢复阶段后留下 .restoring 标记并忽略 TERM/INT，取消与停止在恢复阶段只等待不打断，systemd 计时器单元设 SendSIGKILL=no；恢复执行失败留下 .failed 标记，确认时不再当作“已取消”删掉材料；普通文件回滚改为单次 rename 覆盖，快照外的根删除失败计入回滚结果；BBR 内核参数、端口转发规则与服务、hostname、自动安全更新、Fail2ban 编辑、Caddy 安装接入事务锁；SSH 策略与首次开荒基线的基准哈希改为取自未改动的候选副本，算不出即拒绝。
 #  V0.1.2: 安全回滚收口：自动回滚改为与配置导入一致的精确恢复（事务新增的文件回滚时删除）；Caddy 写入接入事务锁；SSH 策略与首次开荒基线在取锁后核对原文件未被改动；确认输入前计时器已到期时如实报告已回滚而非“已取消”；BBR 子菜单入口不再自动应用保存的限速。
 #  V0.1.1: 安全回滚与事务修复：回滚计时器改用 system 级 transient unit，取消/回滚前确认计时器已停，恢复未验证时保留安全网；事务锁覆盖全部写入路径并在无 flock 时退回 mkdir 锁，遗留事务落盘并阻断新变更；配置恢复改为原子替换与精确目录恢复；兼容 busybox（flock 无 -w、构建 SIGPIPE）；中文列宽在 bash 4+ 上修正；测试改为具名用例。
@@ -374,6 +375,45 @@ txn_record_field() {
     sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1
 }
 
+# 三个回滚脚本生成器（通用配置、IPv6、出口源地址）共用的状态与信号协议：
+#   倒计时阶段：TERM/INT = 取消，退出 0。
+#   恢复阶段：写 <脚本>.restoring，忽略 TERM/INT；任何退出都经 rollback_finish 收尾——
+#   成功删掉标记和脚本自身，失败删掉标记、写 <脚本>.failed、保留脚本。EXIT 兜底保证
+#   mktemp/解压之类的提前退出也算失败，而不是留下一个永远“正在恢复”的标记。
+# $1 脚本路径，$2 倒计时秒数；输出脚本开头，生成器接着写恢复正文，并以 rollback_finish "\$RC" 结束。
+safety_script_prologue() {
+    local SCRIPT_Q DELAY="$2"
+    printf -v SCRIPT_Q '%q' "$1"
+    case "$DELAY" in ''|*[!0-9]*) return 1 ;; esac
+    cat <<EOF
+#!/bin/bash
+SELF=$SCRIPT_Q
+MARKER="\$SELF.restoring"
+FAILED="\$SELF.failed"
+ROLLBACK_SLEEP_PID=""
+rollback_cancel_wait() {
+    [ -z "\$ROLLBACK_SLEEP_PID" ] || kill "\$ROLLBACK_SLEEP_PID" 2>/dev/null || true
+    exit 0
+}
+rollback_finish() {
+    trap - EXIT
+    rm -f "\$MARKER"
+    if [ "\$1" -eq 0 ]; then rm -f "\$SELF"; else : > "\$FAILED"; fi
+    exit "\$1"
+}
+trap rollback_cancel_wait TERM INT
+if [ "\${1:-}" != --now ]; then
+    sleep $DELAY &
+    ROLLBACK_SLEEP_PID=\$!
+    wait "\$ROLLBACK_SLEEP_PID" || exit 0
+fi
+trap '' TERM INT
+: > "\$MARKER"
+rm -f "\$FAILED"
+trap 'rollback_finish 1' EXIT
+EOF
+}
+
 safety_launch_timer() {
     local SCRIPT="$1" UNIT
     SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
@@ -521,7 +561,7 @@ vis_len() {
 BOX_W=64
 UI_COMPACT=0
 APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
-APP_VERSION="V0.1.3"
+APP_VERSION="V0.1.4"
 APP_AUTHOR="Boyang"
 
 # 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、
@@ -3660,7 +3700,17 @@ bbr_backup_sysctl() {
 }
 
 # ── 还原 sysctl ───────────────────────────────────────────
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 bbr_restore_sysctl() {
+    local RC
+    txn_write_begin "恢复 BBR 内核参数快照" || return 1
+    bbr_restore_sysctl_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_restore_sysctl_locked() {
     print_header "还原 TCP sysctl 配置"
 
     local LIST_FILE
@@ -3721,7 +3771,17 @@ bbr_restore_sysctl() {
     rm -f "$LIST_FILE"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 bbr_restore_initial_baseline() {
+    local RC
+    txn_write_begin "恢复首次调优前状态" || return 1
+    bbr_restore_initial_baseline_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_restore_initial_baseline_locked() {
     print_header "恢复首次调优前状态"
     [ -s "$BBR_BASELINE_FILE" ] || {
         warn "未找到首次调优前基线：${BBR_BASELINE_FILE}"
@@ -9062,28 +9122,17 @@ ip_v6_snapshot_create() {
 
 ip_v6_rollback_script_create() {
     local SNAPSHOT="$1" SCRIPT="$2" DELAY="$3"
-    local SNAPSHOT_Q SCRIPT_Q PROC_Q CONF_Q
+    local SNAPSHOT_Q PROC_Q CONF_Q PROLOGUE
     printf -v SNAPSHOT_Q '%q' "$SNAPSHOT"
-    printf -v SCRIPT_Q '%q' "$SCRIPT"
     printf -v PROC_Q '%q' "$IP_V6_PROC_ROOT"
     printf -v CONF_Q '%q' "$IP_V6_SYSCTL_FILE"
+    # 状态与信号协议与通用回滚脚本共用（.restoring / .failed / 恢复阶段忽略 TERM）
+    PROLOGUE=$(safety_script_prologue "$SCRIPT" "$DELAY") || return 1
     cat > "$SCRIPT" <<EOF
-#!/bin/bash
+$PROLOGUE
 SNAPSHOT=$SNAPSHOT_Q
-SELF=$SCRIPT_Q
 PROC_ROOT=$PROC_Q
 MANAGED_CONF=$CONF_Q
-ROLLBACK_SLEEP_PID=""
-rollback_cancel_wait() {
-    [ -z "\$ROLLBACK_SLEEP_PID" ] || kill "\$ROLLBACK_SLEEP_PID" 2>/dev/null || true
-    exit 0
-}
-trap rollback_cancel_wait TERM INT
-if [ "\${1:-}" != --now ]; then
-    sleep $DELAY & ROLLBACK_SLEEP_PID=\$!
-    wait "\$ROLLBACK_SLEEP_PID" || exit 0
-fi
-trap - TERM INT
 RC=0
 HAD=\$(cat "\$SNAPSHOT/had-managed" 2>/dev/null)
 if [ "\$HAD" = yes ]; then
@@ -9116,11 +9165,10 @@ while IFS='|' read -r IFACE VALUE; do
 done < "\$SNAPSHOT/runtime.state"
 if [ "\$RC" -eq 0 ]; then
     logger -t quench "未确认连接，已恢复 IPv6 内核运行时与持久化状态"
-    rm -f "\$SELF"
 else
     logger -t quench "IPv6 自动恢复失败，请立即检查网络状态；回滚脚本已保留：\$SELF"
 fi
-exit "\$RC"
+rollback_finish "\$RC"
 EOF
     chmod 700 "$SCRIPT"
 }
@@ -9384,7 +9432,7 @@ ip_source_safety_arm() {
 }
 
 ip_source_safety_arm_locked() {
-    local FAMILY="$1" ROUTE_LINE="$2" SCRIPT DELAY="${SAFETY_DELAY_SECONDS:-180}" TOKEN
+    local FAMILY="$1" ROUTE_LINE="$2" SCRIPT DELAY="${SAFETY_DELAY_SECONDS:-180}" TOKEN PROLOGUE
     local TOKENS=()
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
     if safety_timer_pending; then
@@ -9397,23 +9445,16 @@ ip_source_safety_arm_locked() {
     [ "${#TOKENS[@]}" -gt 0 ] || return 1
     mkdir -p "$QUENCH_DATA_DIR" || return 1
     SCRIPT="$QUENCH_DATA_DIR/rollback_ip_source_$$_$(date +%s)_${RANDOM}.sh"
-    # shellcheck disable=SC2016 # 这里是在“生成”回滚脚本：$ROLLBACK_SLEEP_PID / $! / $?
-    # 必须原样写进文件、留到那个脚本自己运行时再展开，不能在这里展开。
+    # 状态与信号协议与通用回滚脚本共用（.restoring / .failed / 恢复阶段忽略 TERM）
+    PROLOGUE=$(safety_script_prologue "$SCRIPT" "$DELAY") || return 1
+    # shellcheck disable=SC2016 # 这里是在“生成”回滚脚本：$? 必须原样写进文件，留到它自己运行时再展开
     {
-        echo '#!/bin/bash'
-        echo 'ROLLBACK_SLEEP_PID=""'
-        echo 'rollback_cancel_wait() {'
-        echo '    [ -z "$ROLLBACK_SLEEP_PID" ] || kill "$ROLLBACK_SLEEP_PID" 2>/dev/null || true'
-        echo '    exit 0'
-        echo '}'
-        echo 'trap rollback_cancel_wait TERM INT'
-        printf 'if [ "${1:-}" != --now ]; then sleep %q & ROLLBACK_SLEEP_PID=$!; wait "$ROLLBACK_SLEEP_PID" || exit 0; fi\n' "$DELAY"
-        echo 'trap - TERM INT'
+        printf '%s\n' "$PROLOGUE"
         printf 'ip -%q route replace' "$FAMILY"
         for TOKEN in "${TOKENS[@]}"; do printf ' %q' "$TOKEN"; done
         echo ' >/dev/null 2>&1'
-        printf 'RC=$?; if [ "$RC" -eq 0 ]; then logger -t quench %q; rm -f %q; else logger -t quench %q; fi; exit "$RC"\n' \
-            "未确认连接，已自动恢复 IPv${FAMILY} 首选源地址" "$SCRIPT" \
+        printf 'RC=$?; if [ "$RC" -eq 0 ]; then logger -t quench %q; else logger -t quench %q; fi; rollback_finish "$RC"\n' \
+            "未确认连接，已自动恢复 IPv${FAMILY} 首选源地址" \
             "IPv${FAMILY} 首选源地址自动恢复失败，请立即检查默认路由"
     } > "$SCRIPT" || { rm -f "$SCRIPT"; return 1; }
     chmod 700 "$SCRIPT" || { rm -f "$SCRIPT"; return 1; }
@@ -13204,6 +13245,22 @@ safety_timer_pending() {
 # 只有确认计时器已停止，才能删除回滚脚本、事务记录并释放锁。
 # 停不掉就如实报错并把全部回滚材料留在原地，让上层据此决定后续动作。
 # 返回值：0 = 已取消；1 = 停不掉，材料保留；2 = 回滚已经执行（脚本自删），无可取消。
+# 回滚计时器进程是否还活着。不知道它在哪（既无 unit 也无 PID）时按活着处理，靠超时兜底。
+safety_timer_process_alive() {
+    local STATE
+    if [ -n "${SAFETY_UNIT:-}" ]; then
+        STATE=$(systemctl show -p ActiveState "$SAFETY_UNIT" 2>/dev/null || true)
+        case "${STATE#ActiveState=}" in inactive|failed) return 1 ;; *) return 0 ;; esac
+    fi
+    if [ -n "${SAFETY_PID:-}" ]; then
+        kill -0 "$SAFETY_PID" 2>/dev/null || return 1
+        # 已退出但未回收的子进程 kill -0 仍成功，按已死处理
+        ps -o stat= -p "$SAFETY_PID" 2>/dev/null | grep -q '^Z' && return 1
+        return 0
+    fi
+    return 0
+}
+
 # 四种事务状态：倒计时中（可取消）、恢复中（不可取消，等它完成）、已回滚（脚本自删）、
 # 恢复失败（脚本保留并留下 .failed）。最后一种绝不能当成“取消成功”把材料删掉。
 cancel_safety_timer() {
@@ -13212,10 +13269,16 @@ cancel_safety_timer() {
         warn "自动回滚正在执行，无法取消；等待它完成..."
         for I in $(seq 1 "${QUENCH_RESTORE_WAIT:-120}"); do
             [ -f "${SAFETY_SCRIPT}.restoring" ] || break
+            safety_timer_process_alive || break
             sleep 1
         done
         if [ -f "${SAFETY_SCRIPT}.restoring" ]; then
-            error "自动回滚仍在执行，未能等到结束；回滚材料全部保留"
+            if safety_timer_process_alive; then
+                error "自动回滚仍在执行，未能等到结束；回滚材料全部保留"
+            else
+                error "自动回滚进程在恢复阶段中止，配置可能处于中间状态；回滚脚本与事务记录已保留：$SAFETY_SCRIPT"
+                audit_action "自动回滚在恢复阶段中止，等待人工处理" FAILED
+            fi
             return 1
         fi
     fi
@@ -13665,7 +13728,7 @@ safety_arm_locked() {
     local LABEL="$1" SNAP SCRIPT UFW_STATE="inactive" FIREWALLD_STATE="inactive"
     local DELAY="${SAFETY_DELAY_SECONDS:-180}" RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     local RESOLV_IMMUTABLE="inactive" PATH_VALUE TARGET ROOTS_Q="" ROOT_ITEM ROOT_ITEM_Q
-    local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q MARKER_Q FAILED_Q
+    local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q PROLOGUE
     shift
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
     if safety_timer_pending; then
@@ -13700,31 +13763,12 @@ safety_arm_locked() {
     if [ "$RESTORE_ROOT" = / ]; then TARGET=/etc/resolv.conf; else TARGET="${RESTORE_ROOT%/}/etc/resolv.conf"; fi
     printf -v SNAP_Q '%q' "$SNAP"
     printf -v SCRIPT_Q '%q' "$SCRIPT"
-    printf -v MARKER_Q '%q' "${SCRIPT}.restoring"
-    printf -v FAILED_Q '%q' "${SCRIPT}.failed"
     printf -v ROOT_Q '%q' "$RESTORE_ROOT"
     printf -v LABEL_Q '%q' "$LABEL"
     printf -v RESOLV_Q '%q' "$TARGET"
+    PROLOGUE=$(safety_script_prologue "$SCRIPT" "$DELAY") || return 1
     cat > "$SCRIPT" <<ROLLBACK_EOF
-#!/bin/bash
-ROLLBACK_SLEEP_PID=""
-rollback_cancel_wait() {
-    [ -z "\$ROLLBACK_SLEEP_PID" ] || kill "\$ROLLBACK_SLEEP_PID" 2>/dev/null || true
-    exit 0
-}
-trap rollback_cancel_wait TERM INT
-if [ "\${1:-}" != --now ]; then
-    sleep $DELAY &
-    ROLLBACK_SLEEP_PID=\$!
-    wait "\$ROLLBACK_SLEEP_PID" || exit 0
-fi
-trap - TERM INT
-# ── 进入恢复阶段。从这里起不再接受取消：TERM/INT 一律忽略，并留下阶段标记，
-# 调用方看到标记就知道“正在恢复”而不是“正在倒计时”。之前只区分脚本在不在，
-# 取消操作会把恢复到一半的脚本杀掉，留下主路径缺失、旧文件停在 .quench-old 的半成品。
-trap '' TERM INT
-: > $MARKER_Q
-rm -f $FAILED_Q
+$PROLOGUE
 chattr -i $RESOLV_Q >/dev/null 2>&1 || true
 # 精确恢复，与配置导入同一语义。原来是 tar -xzf 直接解压合并：快照之后新增的文件
 # （例如导入带来的 sshd_config.d/99-deny.conf）会留下，回滚后的状态并不等于快照。
@@ -13759,11 +13803,7 @@ for ROOT in $ROOTS_Q; do
 done
 rm -rf "\$STAGE"
 if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
-if [ $ROOT_Q != / ]; then
-    rm -f $MARKER_Q
-    if [ "\$RC" -eq 0 ]; then rm -f $SCRIPT_Q; else : > $FAILED_Q; fi
-    exit "\$RC"
-fi
+if [ $ROOT_Q != / ]; then rollback_finish "\$RC"; fi
 # RC 汇总必要步骤的结果（延续上面文件恢复的结果）。原来这些全是 || true，任何一步
 # 失败都被吞掉，脚本照样记录成功并删掉自己，调用方据此认为回滚已完成。
 # 只统计该组件确实存在时的失败；组件本来就没装不算失败。
@@ -13801,15 +13841,12 @@ fi
 if [ -x /usr/local/libexec/quench-nft-forward-apply ]; then
     /usr/local/libexec/quench-nft-forward-apply >/dev/null 2>&1 || RC=1
 fi
-rm -f $MARKER_Q
 if [ "\$RC" -eq 0 ]; then
     logger -t quench "未确认连接，已自动恢复 $LABEL_Q 配置"
-    rm -f $SCRIPT_Q
 else
-    : > $FAILED_Q
     logger -t quench "自动恢复过程中有步骤失败，回滚脚本已保留：$SCRIPT_Q"
 fi
-exit "\$RC"
+rollback_finish "\$RC"
 ROLLBACK_EOF
     chmod 700 "$SCRIPT"
     safety_launch_timer "$SCRIPT" \
@@ -17268,7 +17305,17 @@ nft_delete_rule_locked() {
     rm -f "$rules_backup" "$access_backup" "${rules_backup}.new" "${access_backup}.new"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_toggle_rule() {
+    local RC
+    txn_write_begin "启用/停用转发规则" || return 1
+    nft_toggle_rule_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_toggle_rule_locked() {
     local id record rules_backup access_backup rid family proto lip ls le ttype thost tip ts te mode snat acl enabled comment
     print_header "启用 / 停用转发规则"
     nft_list_rules || { warn "暂无规则"; return; }
@@ -17538,7 +17585,17 @@ nft_diagnostics() {
     warn "云厂商安全组必须另行放行监听端口"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_reapply() {
+    local RC
+    txn_write_begin "重新应用转发规则" || return 1
+    nft_reapply_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_reapply_locked() {
     nft_install || return 1
     nft_lock_acquire || return 1
     nft_reconcile

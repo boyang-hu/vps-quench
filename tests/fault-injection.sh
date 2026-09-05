@@ -2117,7 +2117,7 @@ t_genrb_001() {
         || { echo "the generated rollback script does not parse" >&2; exit 1; }
     grep -q '^RC=0$' "$SAFETY_SCRIPT" \
         || { echo "the generated script does not track a result code" >&2; exit 1; }
-    grep -q 'exit "\$RC"' "$SAFETY_SCRIPT" \
+    grep -q 'rollback_finish "\$RC"' "$SAFETY_SCRIPT" \
         || { echo "the generated script does not exit with its result code" >&2; exit 1; }
     grep -q 'sysctl --system >/dev/null 2>&1 || RC=1' "$SAFETY_SCRIPT" \
         || { echo "the generated script still swallows a failed sysctl reload" >&2; exit 1; }
@@ -2460,7 +2460,8 @@ run_test "Entering and leaving the BBR menu applies nothing" t_review_005
 t_review_006() {
     review_setup cross_module_writers
     safety_arm dns >/dev/null 2>&1 || { echo "could not arm the DNS transaction" >&2; exit 1; }
-    for FN in bbr_apply_sysctl nft_add_rule nft_delete_rule nft_edit_rule nft_edit_access nft_clear_all_rules \
+    for FN in bbr_apply_sysctl bbr_restore_initial_baseline bbr_restore_sysctl \
+              nft_add_rule nft_delete_rule nft_edit_rule nft_edit_access nft_clear_all_rules nft_toggle_rule nft_reapply \
               nft_uninstall nft_refresh_timer_enable nft_refresh_timer_disable nft_refresh_domain_targets \
               system_hostname_apply system_enable_auto_security_updates f2b_edit_config caddy_install; do
         eval "${FN}_locked() { : > \"$PROBE/witness-$FN\"; }"
@@ -2646,6 +2647,118 @@ t_review_012() {
     :
 }
 run_test "The onboarding SSH baseline hash comes from the untouched candidate" t_review_012
+
+# 三个回滚脚本生成器共用一套状态协议。下面用出口源地址、IPv6 两个生成器验证：
+# 恢复失败要留下 .failed、清掉 .restoring、保留脚本；之后的“确认”必须拒绝而不是删材料。
+review_ip_shims() {
+    mkdir -p "$PROBE/shim"
+    printf '#!/bin/bash\nexit 1\n' > "$PROBE/shim/ip"
+    printf '#!/bin/bash\nexit 0\n' > "$PROBE/shim/logger"
+    chmod +x "$PROBE/shim/ip" "$PROBE/shim/logger"
+}
+review_assert_failed_rollback() {
+    local WHAT="$1" RC="$2"
+    [ "$RC" -ne 0 ] || { echo "$WHAT: a failed restore exited 0" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT.failed" ] || { echo "$WHAT: no .failed marker after a failed restore" >&2; exit 1; }
+    [ ! -e "$SAFETY_SCRIPT.restoring" ] || { echo "$WHAT: .restoring left behind" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT" ] || { echo "$WHAT: the script deleted itself after failing" >&2; exit 1; }
+    RC=0
+    safety_confirm <<< 'y' >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "$WHAT: confirming after a failed rollback reported success" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT" ] || { echo "$WHAT: confirming deleted the failed rollback's script" >&2; exit 1; }
+}
+t_review_013() {
+    review_setup ip_source_failure
+    review_ip_shims
+    ip_source_safety_arm 4 'default via 192.0.2.1 dev eth0 src 192.0.2.10' >/dev/null 2>&1 \
+        || { echo "could not arm the IP-source transaction" >&2; exit 1; }
+    RC=0
+    PATH="$PROBE/shim:$PATH" bash "$SAFETY_SCRIPT" --now >/dev/null 2>&1 || RC=$?
+    review_assert_failed_rollback "ip-source" "$RC"
+    :
+}
+run_test "A failed IP-source rollback is marked failed and cannot be confirmed away" t_review_013
+
+t_review_014() {
+    review_setup ipv6_failure
+    review_ip_shims
+    IP_V6_PROC_ROOT="$PROBE/proc-ipv6"
+    IP_V6_SYSCTL_FILE="$CONFIG_RESTORE_ROOT/etc/sysctl.d/99-quench-ipv6.conf"
+    IP_STATE_DIR="$PROBE/ip-state"
+    local IFACE
+    for IFACE in all default eth0; do
+        mkdir -p "$IP_V6_PROC_ROOT/$IFACE"; printf '0\n' > "$IP_V6_PROC_ROOT/$IFACE/disable_ipv6"
+    done
+    ip_v6_safety_arm ipv6 >/dev/null 2>&1 || { echo "could not arm the IPv6 transaction" >&2; exit 1; }
+    rm -f "$IP_V6_PROC_ROOT/all/disable_ipv6"
+    RC=0
+    PATH="$PROBE/shim:$PATH" bash "$SAFETY_SCRIPT" --now >/dev/null 2>&1 || RC=$?
+    review_assert_failed_rollback "ipv6" "$RC"
+    :
+}
+run_test "A failed IPv6 rollback is marked failed and cannot be confirmed away" t_review_014
+
+# 恢复阶段收到 TERM 必须忽略：ip 垫片睡 3 秒后检查父进程还在才写见证文件。
+t_review_015() {
+    review_setup ip_source_term
+    review_ip_shims
+    printf '#!/bin/bash\nsleep 3\nkill -0 "$PPID" 2>/dev/null || exit 1\n: > "$QUENCH_TEST_IP_WITNESS"\nexit 1\n' > "$PROBE/shim/ip"
+    export QUENCH_TEST_IP_WITNESS="$PROBE/ip-finished"
+    ip_source_safety_arm 4 'default via 192.0.2.1 dev eth0 src 192.0.2.10' >/dev/null 2>&1 \
+        || { echo "could not arm the IP-source transaction" >&2; exit 1; }
+    PATH="$PROBE/shim:$PATH" bash "$SAFETY_SCRIPT" --now >/dev/null 2>&1 &
+    PID=$!
+    sleep 1
+    kill -TERM "$PID" 2>/dev/null || true
+    RC=0
+    wait "$PID" || RC=$?
+    [ -e "$QUENCH_TEST_IP_WITNESS" ] || { echo "TERM interrupted the IP-source restore" >&2; exit 1; }
+    [ "$RC" -eq 1 ] || { echo "the restore did not run to completion (exit $RC)" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT.failed" ] || { echo "no .failed marker after the interrupted-then-completed restore" >&2; exit 1; }
+    :
+}
+run_test "The IP-source rollback ignores TERM once it is restoring" t_review_015
+
+# 恢复正文之前就失败（快照损坏、mktemp 失败）：不能留下永远“正在恢复”的标记。
+t_review_016() {
+    review_setup early_exit
+    safety_arm dns >/dev/null 2>&1 || { echo "could not arm the DNS transaction" >&2; exit 1; }
+    printf 'corrupt archive\n' > "$QUENCH_BACKUP_DIR"/snapshot-*.tar.gz
+    RC=0
+    bash "$SAFETY_SCRIPT" --now >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "a corrupt snapshot restored successfully" >&2; exit 1; }
+    [ ! -e "$SAFETY_SCRIPT.restoring" ] || { echo "an early exit left the .restoring marker behind" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT.failed" ] || { echo "an early exit did not publish .failed" >&2; exit 1; }
+    START=$(date +%s); RC=0
+    QUENCH_RESTORE_WAIT=10 safety_confirm <<< 'y' >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "confirming after an early-exit failure reported success" >&2; exit 1; }
+    [ $(( $(date +%s) - START )) -lt 5 ] || { echo "confirm waited on a marker that no process owns" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT" ] || { echo "the failed rollback's script was deleted" >&2; exit 1; }
+    :
+}
+run_test "A rollback that dies before restoring is reported failed, not restoring" t_review_016
+
+# 标记还在但进程已经没了（SIGKILL、OOM）：取消要立刻判“恢复阶段中止”，不等满超时。
+t_review_017() {
+    review_setup dead_restorer
+    SAFETY_SCRIPT="$PROBE/rollback.sh"; : > "$SAFETY_SCRIPT"; : > "$SAFETY_SCRIPT.restoring"
+    ( sleep 0.2 & echo $! > "$PROBE/pid" ); SAFETY_PID=$(cat "$PROBE/pid"); sleep 1
+    START=$(date +%s); RC=0
+    QUENCH_RESTORE_WAIT=10 cancel_safety_timer >/dev/null 2>&1 || RC=$?
+    [ "$RC" -eq 1 ] || { echo "cancel returned $RC for a dead restorer, expected 1" >&2; exit 1; }
+    [ $(( $(date +%s) - START )) -lt 5 ] || { echo "cancel waited the full timeout for a dead PID" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT" ] || { echo "the dead rollback's script was deleted" >&2; exit 1; }
+    # systemd 单元同理
+    SAFETY_PID=""; SAFETY_UNIT="quench-rollback-test"
+    # shellcheck disable=SC2329 # review fixture: the unit is gone
+    systemctl() { [ "$1" = show ] && echo "ActiveState=inactive"; return 0; }
+    START=$(date +%s); RC=0
+    QUENCH_RESTORE_WAIT=10 cancel_safety_timer >/dev/null 2>&1 || RC=$?
+    [ "$RC" -eq 1 ] || { echo "cancel returned $RC for a dead unit, expected 1" >&2; exit 1; }
+    [ $(( $(date +%s) - START )) -lt 5 ] || { echo "cancel waited the full timeout for a dead unit" >&2; exit 1; }
+    :
+}
+run_test "Cancel treats a stale restoring marker with no live process as a failure" t_review_017
 
 # 9. SSH 策略的基准哈希必须取自尚未改动的候选副本：在“复制”和“算哈希”之间落地的
 #    另一笔写入，旧做法会把它算进基准，核对形同虚设，然后被旧候选原样覆盖掉。
