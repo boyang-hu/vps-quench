@@ -204,7 +204,10 @@ QUENCH_TXN_LOCK_MODE=""
 txn_lock_acquire() {
     [ "$QUENCH_TXN_LOCK_HELD" = 1 ] && return 0
     mkdir -p "$(dirname "$QUENCH_TXN_LOCK_FILE")" 2>/dev/null || true
-    if command -v flock >/dev/null 2>&1 && exec 9>"$QUENCH_TXN_LOCK_FILE" 2>/dev/null; then
+    # 注意不能写 `exec 9>file 2>/dev/null`：exec 不带命令时，重定向作用于当前
+    # shell，那一句会把整个进程的 stderr 永久指向 /dev/null，之后所有报错全部消失。
+    # 用花括号把 2>/dev/null 限定在打开锁文件这一步。
+    if command -v flock >/dev/null 2>&1 && { exec 9>"$QUENCH_TXN_LOCK_FILE"; } 2>/dev/null; then
         if flock -w "${QUENCH_TXN_LOCK_WAIT:-10}" 9 2>/dev/null; then
             QUENCH_TXN_LOCK_HELD=1
             QUENCH_TXN_LOCK_MODE="flock"

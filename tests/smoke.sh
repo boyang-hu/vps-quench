@@ -630,8 +630,9 @@ t_sm_022() {
     KEY_TARGET="$TMP/keyarg/explicit"
     : > "$KEY_TARGET"
 
-    printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExplicitTarget explicit@test' \
-        | add_key "$KEY_TARGET" >/dev/null 2>&1
+    KEY_ERR=$(printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExplicitTarget explicit@test' \
+        | add_key "$KEY_TARGET" 2>&1 >/dev/null) \
+        || { echo "add_key failed: $KEY_ERR" >&2; exit 1; }
     grep -qF ExplicitTarget "$KEY_TARGET" \
         || { echo "add_key ignored its explicit target file" >&2; exit 1; }
     [ ! -s "$AUTH_KEYS" ] \
