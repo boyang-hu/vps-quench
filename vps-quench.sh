@@ -223,18 +223,33 @@ txn_lock_mkdir_acquire() {
     local DIR="${QUENCH_TXN_LOCK_FILE}.d" OWNER I
     for I in 1 2; do
         if mkdir "$DIR" 2>/dev/null; then
-            printf '%s\n' "$$" > "$DIR/pid" 2>/dev/null || true
+            # mkdir 成功后立刻写 pid。写不进去就放弃锁：一个没有 pid 的锁目录
+            # 无法与“正在取锁”区分，会让后来者永远等待。
+            if ! printf '%s\n' "$$" > "$DIR/pid" 2>/dev/null; then
+                rmdir "$DIR" 2>/dev/null || true
+                error "无法写入事务锁持有者信息：$DIR"
+                return 1
+            fi
             QUENCH_TXN_LOCK_HELD=1
             QUENCH_TXN_LOCK_MODE="mkdir"
             return 0
         fi
         OWNER=$(cat "$DIR/pid" 2>/dev/null || true)
-        # 持有者进程还在 -> 真的有人在改；已经消失 -> 是陈旧锁，清掉重试一次
-        if printf '%s\n' "$OWNER" | grep -qE '^[0-9]+$' && kill -0 "$OWNER" 2>/dev/null; then
-            break
+        if printf '%s\n' "$OWNER" | grep -qE '^[0-9]+$'; then
+            # 有 pid：持有者还活着就是真的有人在改；已消失才是陈旧锁
+            kill -0 "$OWNER" 2>/dev/null && break
+            rm -f "$DIR/pid" 2>/dev/null || true
+            rmdir "$DIR" 2>/dev/null || break
+            continue
         fi
-        rm -f "$DIR/pid" 2>/dev/null || true
-        rmdir "$DIR" 2>/dev/null || break
+        # 没有 pid 文件：另一个进程刚 mkdir 完、还没来得及写 pid。这不是陈旧锁，
+        # 不能删——删了它就会两个进程同时持锁。只有目录已经空着放了很久
+        # （持有者在 mkdir 和写 pid 之间就崩了）才当作遗骸清理。
+        if [ -n "$(find "$DIR" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+            rmdir "$DIR" 2>/dev/null || break
+            continue
+        fi
+        break
     done
     if [ ! -d "$DIR" ]; then
         error "无法创建事务锁目录：$DIR"
@@ -259,6 +274,41 @@ txn_lock_release() {
     esac
     QUENCH_TXN_LOCK_HELD=0
     QUENCH_TXN_LOCK_MODE=""
+}
+
+# ── 不走 safety_arm 的配置写入：统一入口 ─────────────────
+# 事务锁原来只保护 safety_arm 一族；SSH 端口迁移、用户、公钥、Fail2ban、换源
+# 这些写入在锁外进行。而回滚快照是整套配置（含 sshd_config 等），一笔未确认的
+# DNS 变更还在倒计时时，这里写下去的东西会被那笔回滚到期时原样覆盖回去。
+# 所以这些写入必须：取锁（跨会话互斥）、核对遗留事务（别的会话有 armed 回滚
+# 就拒绝）、并拒绝在本会话自己还有未确认回滚时进行。深度计数允许嵌套调用。
+QUENCH_TXN_WRITE_DEPTH=0
+
+txn_write_begin() {
+    local LABEL="$1"
+    if [ "$QUENCH_TXN_WRITE_DEPTH" -gt 0 ]; then
+        QUENCH_TXN_WRITE_DEPTH=$((QUENCH_TXN_WRITE_DEPTH + 1))
+        return 0
+    fi
+    txn_lock_acquire || return 1
+    if ! txn_reconcile_stale; then
+        txn_lock_release
+        return 1
+    fi
+    if safety_timer_pending; then
+        txn_lock_release
+        error "本会话还有一笔未确认的变更，自动回滚仍在计时；它到期会覆盖掉这次修改"
+        error "请先确认或回滚那笔变更，再进行：${LABEL}"
+        return 1
+    fi
+    QUENCH_TXN_WRITE_DEPTH=1
+}
+
+txn_write_end() {
+    [ "$QUENCH_TXN_WRITE_DEPTH" -gt 0 ] || return 0
+    QUENCH_TXN_WRITE_DEPTH=$((QUENCH_TXN_WRITE_DEPTH - 1))
+    [ "$QUENCH_TXN_WRITE_DEPTH" -gt 0 ] || txn_lock_release
+    return 0
 }
 
 # ── 事务记录（只写盘，不打扰）──────────────────────────────
@@ -1211,7 +1261,17 @@ show_keys() {
     list_keys "$AUTH_FILE"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 add_key() {
+    local RC
+    txn_write_begin "添加 SSH 公钥" || return 1
+    add_key_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+add_key_locked() {
     local AUTH_FILE="${1:-}"
     [ -n "$AUTH_FILE" ] || { error "内部错误：add_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "添加 SSH 公钥"
@@ -1254,7 +1314,17 @@ add_key() {
     info "公钥已添加！当前共 $TOTAL 个公钥 ✓"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 delete_key() {
+    local RC
+    txn_write_begin "删除 SSH 公钥" || return 1
+    delete_key_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+delete_key_locked() {
     local AUTH_FILE="${1:-}"
     [ -n "$AUTH_FILE" ] || { error "内部错误：delete_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "删除 SSH 公钥"
@@ -1300,7 +1370,17 @@ delete_key() {
     info "公钥已删除 ✓"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 generate_key() {
+    local RC
+    txn_write_begin "生成 SSH 密钥对" || return 1
+    generate_key_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+generate_key_locked() {
     local AUTH_FILE="${1:-}"
     [ -n "$AUTH_FILE" ] || { error "内部错误：generate_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "生成 SSH 密钥对"
@@ -1666,7 +1746,17 @@ ssh_firewall_close_port() {
     [ "$FAILED" = false ]
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 ssh_port_finalize() {
+    local RC
+    txn_write_begin "完成 SSH 端口迁移" || return 1
+    ssh_port_finalize_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+ssh_port_finalize_locked() {
     local TOKEN CLOSE_OLD OLD_PORT NEW_PORT
     ssh_read_port_state || { warn "没有待完成的 SSH 端口迁移"; return 1; }
     warn "必须已在另一个终端通过端口 $NEW_PORT 成功登录。"
@@ -1696,7 +1786,17 @@ ssh_port_finalize() {
     info "SSH 已仅监听新端口 $NEW_PORT ✓"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 ssh_port_rollback() {
+    local RC
+    txn_write_begin "回滚 SSH 端口迁移" || return 1
+    ssh_port_rollback_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+ssh_port_rollback_locked() {
     local CLOSE_NEW OLD_PORT NEW_PORT
     ssh_read_port_state || { warn "没有待回滚的 SSH 端口迁移"; return 1; }
     if ! firewall_port_ready "$OLD_PORT"; then
@@ -1719,7 +1819,17 @@ ssh_port_rollback() {
     info "SSH 端口迁移已回滚 ✓"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 change_port() {
+    local RC
+    txn_write_begin "修改 SSH 端口" || return 1
+    change_port_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+change_port_locked() {
     print_header "SSH 端口双端口迁移"
     local CURRENT_PORT INPUT_PORT CHOICE OLD_PORT NEW_PORT TEST_NOW
     if ssh_read_port_state; then
@@ -2324,7 +2434,17 @@ user_key_menu_for() {
     done
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 user_create() {
+    local RC
+    txn_write_begin "创建用户" || return 1
+    user_create_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+user_create_locked() {
     local FORCE_ADMIN="${1:-no}" USERNAME TYPE SET_PASSWORD ADD_KEY
     print_header "创建用户"
     read -rp "  新用户名（回车取消）: " USERNAME
@@ -2361,7 +2481,17 @@ user_create() {
     CREATED_USER="$USERNAME"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 user_admin_manage() {
+    local RC
+    txn_write_begin "管理员权限" || return 1
+    user_admin_manage_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+user_admin_manage_locked() {
     print_header "管理员权限"
     local USERNAME CHOICE TOKEN CONFIRM
     USERNAME=$(user_select no "选择要管理的用户") || return
@@ -2403,7 +2533,17 @@ user_admin_manage() {
     fi
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 user_password_manage() {
+    local RC
+    txn_write_begin "密码与账户锁定" || return 1
+    user_password_manage_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+user_password_manage_locked() {
     print_header "密码与账户锁定"
     local USERNAME CHOICE TOKEN ACTOR
     USERNAME=$(user_select yes "选择用户") || return
@@ -2430,7 +2570,17 @@ user_password_manage() {
     esac
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 user_delete() {
+    local RC
+    txn_write_begin "删除用户" || return 1
+    user_delete_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+user_delete_locked() {
     print_header "删除用户"
     local USERNAME USER_ID ACTOR TOKEN REMOVE_HOME
     USERNAME=$(user_select no "选择要删除的用户") || return
@@ -2681,7 +2831,17 @@ f2b_status() {
     fi
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 f2b_install() {
+    local RC
+    txn_write_begin "安装 Fail2ban" || return 1
+    f2b_install_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+f2b_install_locked() {
     print_header "安装 Fail2ban"
     info "正在安装 fail2ban..."
     if ! pkg_install fail2ban; then
@@ -2840,7 +3000,17 @@ f2b_set_param_jail() {
     info "[sshd] ${KEY} 已设置为 ${VAL} ✓"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 f2b_config_params() {
+    local RC
+    txn_write_begin "Fail2ban 参数" || return 1
+    f2b_config_params_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+f2b_config_params_locked() {
     print_header "Fail2ban SSH 防护参数"
     local JAIL_FILE CUR_BAN CUR_FIND CUR_MAX CUR_PORT BAN_SEC FIND_SEC CH VAL PRESET
     local APPLY_BAN="" APPLY_FIND="" APPLY_MAX="" APPLY_PORT="" BACKUP WAS_RUNNING
@@ -4014,6 +4184,19 @@ bbr_tc_restore_owned() {
 bbr_tc_persistence_current() {
     [ -x "$TC_HELPER" ] \
         && grep -qxF '# QUENCH_TC_HELPER_VERSION=3' "$TC_HELPER" 2>/dev/null
+}
+
+# 只比较、不动系统，供主菜单刷新使用。返回 0 = 无保存值或运行值与保存值一致。
+# 主菜单原来每次刷新都直接调 bbr_tc_reconcile_saved 并隐藏输出：用户临时调过
+# 速率，仅仅回到菜单就会被改回保存值。恢复必须由用户明确触发。
+bbr_tc_saved_matches_runtime() {
+    local SAVED_VALUES SAVED_DEV SAVED_RATE TC_BIN
+    SAVED_VALUES=$(bbr_tc_saved_values) || return 0
+    SAVED_DEV=${SAVED_VALUES%% *}
+    SAVED_RATE=${SAVED_VALUES#* }; SAVED_RATE=${SAVED_RATE%% *}
+    TC_BIN=$(command -v tc 2>/dev/null || echo /sbin/tc)
+    [ -x "$TC_BIN" ] || return 1
+    bbr_tc_is_owned "$SAVED_DEV" "$TC_BIN" && bbr_tc_rate_matches "$SAVED_DEV" "$TC_BIN" "$SAVED_RATE"
 }
 
 bbr_tc_reconcile_saved() {
@@ -8048,7 +8231,17 @@ mirror_latest_read() {
     printf '%s\n' "$PATH_VALUE"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 mirror_apply_apt() {
+    local RC
+    txn_write_begin "切换 APT 软件源" || return 1
+    mirror_apply_apt_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+mirror_apply_apt_locked() {
     local KEY="$1" OS_ID VERSION_VALUE CODENAME ARCH_VALUE CANDIDATE MAIN_URI MIRROR_SECURITY LABEL SECURITY_URI OFFICIAL_SECURITY RC
     OS_ID=$(mirror_os_release_value ID 2>/dev/null || true)
     VERSION_VALUE=$(mirror_os_release_value VERSION_ID 2>/dev/null || true)
@@ -8127,7 +8320,17 @@ mirror_apply_apt() {
     info "恢复点：$MIRROR_APT_BACKUP"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 mirror_restore_apt() {
+    local RC
+    txn_write_begin "恢复 APT 软件源" || return 1
+    mirror_restore_apt_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+mirror_restore_apt_locked() {
     local TARGET CURRENT
     TARGET=$(mirror_latest_read apt 2>/dev/null || true)
     [ -n "$TARGET" ] || { warn "没有可恢复的 APT 软件源快照"; return 1; }
@@ -8312,7 +8515,17 @@ mirror_rpm_core_id() {
     case "$1" in baseos|appstream|crb|powertools|extras|extras-common) return 0 ;; *) return 1 ;; esac
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 mirror_apply_rpm() {
+    local RC
+    txn_write_begin "切换 RPM 软件源" || return 1
+    mirror_apply_rpm_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+mirror_apply_rpm_locked() {
     local KEY="$1" OS_ID VERSION_VALUE MAJOR ARCH_VALUE DATA BASE LABEL GPGKEY PREFIX PROBE_URL RC RID
     OS_ID=$(mirror_os_release_value ID 2>/dev/null || true)
     VERSION_VALUE=$(mirror_os_release_value VERSION_ID 2>/dev/null || true)
@@ -8380,7 +8593,17 @@ mirror_apply_rpm() {
     info "恢复点：$MIRROR_RPM_BACKUP"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 mirror_restore_rpm() {
+    local RC
+    txn_write_begin "恢复 RPM 软件源" || return 1
+    mirror_restore_rpm_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+mirror_restore_rpm_locked() {
     local TARGET CURRENT
     TARGET=$(mirror_latest_read rpm 2>/dev/null || true)
     [ -n "$TARGET" ] || { warn "没有可恢复的 RPM 软件源快照"; return 1; }
@@ -12727,7 +12950,7 @@ config_archive_validate() {
 }
 
 config_archive_extract() {
-    local FILE="$1" STAGE LINK REL TARGET ROOT SRC DEST RESTORE_ROOT SAVED
+    local FILE="$1" STAGE LINK REL TARGET ROOT SRC DEST RESTORE_ROOT SAVED NEW
     RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     STAGE=$(quench_mktemp_d) || return 1
     if ! tar -xzf "$FILE" -C "$STAGE" --no-same-owner 2>/dev/null; then
@@ -12762,23 +12985,29 @@ config_archive_extract() {
         [ -e "$SRC" ] || [ -L "$SRC" ] || continue
         mkdir -p "$(dirname "$DEST")" || { rm -rf "$STAGE"; return 1; }
         if [ -d "$SRC" ] && [ ! -L "$SRC" ]; then
-            # 目录必须精确恢复。cp -a 进父目录是“合并”：快照之后新增的文件会
-            # 原样留下，恢复结果并不等于快照状态。先把现有目录挪开，拷贝成功
-            # 才删除它；失败则挪回，避免中途出错把目录整个弄丢。
-            SAVED=""
-            if [ -e "$DEST" ] || [ -L "$DEST" ]; then
-                SAVED="${DEST}.quench-restore-$$"
-                rm -rf "$SAVED"
-                mv "$DEST" "$SAVED" || { rm -rf "$STAGE"; error "无法暂存原目录：$ROOT"; return 1; }
-            fi
-            if cp -a "$SRC" "$DEST"; then
-                [ -z "$SAVED" ] || rm -rf "$SAVED"
-            else
-                [ -z "$SAVED" ] || mv "$SAVED" "$DEST"
-                rm -rf "$STAGE"
-                error "恢复路径失败：$ROOT"
+            # 目录必须精确恢复。cp -a 进父目录是合并：快照之后新增的文件会留下。
+            # 顺序很关键：先在目标同一文件系统上把新目录完整复制好，复制失败时
+            # 原目录一个字节都没动过；然后两次 rename 切换，最后才删旧目录。
+            # 之前是先挪走原目录再复制，复制到一半失败时 DEST 已经是个残缺目录，
+            # `mv SAVED DEST` 会把原目录塞进那个残缺目录里，原路径反而空了。
+            NEW="${DEST}.quench-new-$$"
+            SAVED="${DEST}.quench-restore-$$"
+            rm -rf "$NEW" "$SAVED"
+            if ! cp -a "$SRC" "$NEW"; then
+                rm -rf "$NEW" "$STAGE"
+                error "恢复路径失败（原目录未改动）：$ROOT"
                 return 1
             fi
+            if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+                mv "$DEST" "$SAVED" || { rm -rf "$NEW" "$STAGE"; error "无法暂存原目录：$ROOT"; return 1; }
+            fi
+            if ! mv "$NEW" "$DEST"; then
+                [ ! -e "$SAVED" ] || mv "$SAVED" "$DEST"
+                rm -rf "$NEW" "$STAGE"
+                error "恢复路径失败，已放回原目录：$ROOT"
+                return 1
+            fi
+            rm -rf "$SAVED"
         else
             cp -a "$SRC" "$(dirname "$DEST")/" || { rm -rf "$STAGE"; error "恢复路径失败：$ROOT"; return 1; }
         fi
@@ -12820,8 +13049,10 @@ safety_stop_timer_process() {
             # 查询本身失败，绝不能当成已停止——那会让调用方删掉回滚材料。
             STATE=$(systemctl show -p ActiveState "$UNIT" 2>/dev/null | sed -n 's/^ActiveState=//p')
             case "$STATE" in
-                inactive|failed|deactivating) return 0 ;;
+                inactive|failed) return 0 ;;
                 '') return 1 ;;
+                # deactivating / activating / active 都是未到终态，继续等；
+                # 把 deactivating 当已停止，调用方就会在它还在跑时删掉回滚材料。
                 *) sleep 1 ;;
             esac
         done
@@ -17214,7 +17445,11 @@ main_menu() {
             FW_STAT="${FW_TYPE} 已停止"; FW_STATE="inactive"
         fi
         local BBR_CC; BBR_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-        [ ! -s "$TC_STATE_FILE" ] || bbr_tc_reconcile_saved >/dev/null 2>&1 || true
+        # 状态页是只读的：只报告运行值与保存值是否一致，不再悄悄改回保存值。
+        local TC_MISMATCH=""
+        if [ -s "$TC_STATE_FILE" ] && ! bbr_tc_saved_matches_runtime 2>/dev/null; then
+            TC_MISMATCH=" · 与保存值不一致"
+        fi
         local TC_RATE TC_DEV TC_BIN
         TC_DEV=$(default_iface)
         TC_BIN=$(command -v tc 2>/dev/null || echo /sbin/tc)
@@ -17245,7 +17480,9 @@ main_menu() {
         elif [ "$CUR_PWD" = "yes" ]; then AUTH_LABEL="允许密码"; AUTH_STATE="warning"
         else AUTH_LABEL="未确认"; AUTH_STATE="unknown"; fi
         [ "$CADDY_ST" = "running" ] && CADDY_STATE="active" || CADDY_STATE="$CADDY_ST"
-        [ "$BBR_CC" = "bbr" ] && BBR_STATE="active" || BBR_STATE="unknown"
+        if [ -n "$TC_MISMATCH" ]; then BBR_STATE="warning"
+        elif [ "$BBR_CC" = "bbr" ]; then BBR_STATE="active"
+        else BBR_STATE="unknown"; fi
         case "$F2B_STAT" in
             running) F2B_LABEL="运行中"; F2B_STATE="active" ;;
             stopped) F2B_LABEL="已停止"; F2B_STATE="inactive" ;;
@@ -17254,7 +17491,7 @@ main_menu() {
 
         menu_group "系统概览"
         status_pair "用户" "$USER_TOTAL · 管理员 $ADMIN_TOTAL" "active" "SSH" "${CUR_PORT:-22} · $AUTH_LABEL" "$AUTH_STATE"
-        status_pair "BBR" "$BBR_CC · $TC_RATE" "$BBR_STATE" "Fail2ban" "$F2B_LABEL" "$F2B_STATE"
+        status_pair "BBR" "$BBR_CC · ${TC_RATE}${TC_MISMATCH}" "$BBR_STATE" "Fail2ban" "$F2B_LABEL" "$F2B_STATE"
         status_pair "防火墙" "$FW_STAT" "$FW_STATE" "Caddy" "$CADDY_LABEL" "$CADDY_STATE"
         status_pair "Docker" "$DOCKER_LABEL" "$DOCKER_STATE" "时间" "$SYS_TIME" "active"
         ui_hint "时区 $SYS_TZ"

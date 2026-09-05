@@ -56,7 +56,7 @@ config_archive_validate() {
 }
 
 config_archive_extract() {
-    local FILE="$1" STAGE LINK REL TARGET ROOT SRC DEST RESTORE_ROOT SAVED
+    local FILE="$1" STAGE LINK REL TARGET ROOT SRC DEST RESTORE_ROOT SAVED NEW
     RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     STAGE=$(quench_mktemp_d) || return 1
     if ! tar -xzf "$FILE" -C "$STAGE" --no-same-owner 2>/dev/null; then
@@ -91,23 +91,29 @@ config_archive_extract() {
         [ -e "$SRC" ] || [ -L "$SRC" ] || continue
         mkdir -p "$(dirname "$DEST")" || { rm -rf "$STAGE"; return 1; }
         if [ -d "$SRC" ] && [ ! -L "$SRC" ]; then
-            # 目录必须精确恢复。cp -a 进父目录是“合并”：快照之后新增的文件会
-            # 原样留下，恢复结果并不等于快照状态。先把现有目录挪开，拷贝成功
-            # 才删除它；失败则挪回，避免中途出错把目录整个弄丢。
-            SAVED=""
-            if [ -e "$DEST" ] || [ -L "$DEST" ]; then
-                SAVED="${DEST}.quench-restore-$$"
-                rm -rf "$SAVED"
-                mv "$DEST" "$SAVED" || { rm -rf "$STAGE"; error "无法暂存原目录：$ROOT"; return 1; }
-            fi
-            if cp -a "$SRC" "$DEST"; then
-                [ -z "$SAVED" ] || rm -rf "$SAVED"
-            else
-                [ -z "$SAVED" ] || mv "$SAVED" "$DEST"
-                rm -rf "$STAGE"
-                error "恢复路径失败：$ROOT"
+            # 目录必须精确恢复。cp -a 进父目录是合并：快照之后新增的文件会留下。
+            # 顺序很关键：先在目标同一文件系统上把新目录完整复制好，复制失败时
+            # 原目录一个字节都没动过；然后两次 rename 切换，最后才删旧目录。
+            # 之前是先挪走原目录再复制，复制到一半失败时 DEST 已经是个残缺目录，
+            # `mv SAVED DEST` 会把原目录塞进那个残缺目录里，原路径反而空了。
+            NEW="${DEST}.quench-new-$$"
+            SAVED="${DEST}.quench-restore-$$"
+            rm -rf "$NEW" "$SAVED"
+            if ! cp -a "$SRC" "$NEW"; then
+                rm -rf "$NEW" "$STAGE"
+                error "恢复路径失败（原目录未改动）：$ROOT"
                 return 1
             fi
+            if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+                mv "$DEST" "$SAVED" || { rm -rf "$NEW" "$STAGE"; error "无法暂存原目录：$ROOT"; return 1; }
+            fi
+            if ! mv "$NEW" "$DEST"; then
+                [ ! -e "$SAVED" ] || mv "$SAVED" "$DEST"
+                rm -rf "$NEW" "$STAGE"
+                error "恢复路径失败，已放回原目录：$ROOT"
+                return 1
+            fi
+            rm -rf "$SAVED"
         else
             cp -a "$SRC" "$(dirname "$DEST")/" || { rm -rf "$STAGE"; error "恢复路径失败：$ROOT"; return 1; }
         fi
@@ -149,8 +155,10 @@ safety_stop_timer_process() {
             # 查询本身失败，绝不能当成已停止——那会让调用方删掉回滚材料。
             STATE=$(systemctl show -p ActiveState "$UNIT" 2>/dev/null | sed -n 's/^ActiveState=//p')
             case "$STATE" in
-                inactive|failed|deactivating) return 0 ;;
+                inactive|failed) return 0 ;;
                 '') return 1 ;;
+                # deactivating / activating / active 都是未到终态，继续等；
+                # 把 deactivating 当已停止，调用方就会在它还在跑时删掉回滚材料。
                 *) sleep 1 ;;
             esac
         done

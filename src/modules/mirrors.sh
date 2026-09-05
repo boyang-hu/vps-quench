@@ -526,7 +526,17 @@ mirror_latest_read() {
     printf '%s\n' "$PATH_VALUE"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 mirror_apply_apt() {
+    local RC
+    txn_write_begin "切换 APT 软件源" || return 1
+    mirror_apply_apt_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+mirror_apply_apt_locked() {
     local KEY="$1" OS_ID VERSION_VALUE CODENAME ARCH_VALUE CANDIDATE MAIN_URI MIRROR_SECURITY LABEL SECURITY_URI OFFICIAL_SECURITY RC
     OS_ID=$(mirror_os_release_value ID 2>/dev/null || true)
     VERSION_VALUE=$(mirror_os_release_value VERSION_ID 2>/dev/null || true)
@@ -605,7 +615,17 @@ mirror_apply_apt() {
     info "恢复点：$MIRROR_APT_BACKUP"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 mirror_restore_apt() {
+    local RC
+    txn_write_begin "恢复 APT 软件源" || return 1
+    mirror_restore_apt_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+mirror_restore_apt_locked() {
     local TARGET CURRENT
     TARGET=$(mirror_latest_read apt 2>/dev/null || true)
     [ -n "$TARGET" ] || { warn "没有可恢复的 APT 软件源快照"; return 1; }
@@ -790,7 +810,17 @@ mirror_rpm_core_id() {
     case "$1" in baseos|appstream|crb|powertools|extras|extras-common) return 0 ;; *) return 1 ;; esac
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 mirror_apply_rpm() {
+    local RC
+    txn_write_begin "切换 RPM 软件源" || return 1
+    mirror_apply_rpm_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+mirror_apply_rpm_locked() {
     local KEY="$1" OS_ID VERSION_VALUE MAJOR ARCH_VALUE DATA BASE LABEL GPGKEY PREFIX PROBE_URL RC RID
     OS_ID=$(mirror_os_release_value ID 2>/dev/null || true)
     VERSION_VALUE=$(mirror_os_release_value VERSION_ID 2>/dev/null || true)
@@ -858,7 +888,17 @@ mirror_apply_rpm() {
     info "恢复点：$MIRROR_RPM_BACKUP"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 mirror_restore_rpm() {
+    local RC
+    txn_write_begin "恢复 RPM 软件源" || return 1
+    mirror_restore_rpm_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+mirror_restore_rpm_locked() {
     local TARGET CURRENT
     TARGET=$(mirror_latest_read rpm 2>/dev/null || true)
     [ -n "$TARGET" ] || { warn "没有可恢复的 RPM 软件源快照"; return 1; }

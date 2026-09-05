@@ -879,6 +879,19 @@ bbr_tc_persistence_current() {
         && grep -qxF '# QUENCH_TC_HELPER_VERSION=3' "$TC_HELPER" 2>/dev/null
 }
 
+# 只比较、不动系统，供主菜单刷新使用。返回 0 = 无保存值或运行值与保存值一致。
+# 主菜单原来每次刷新都直接调 bbr_tc_reconcile_saved 并隐藏输出：用户临时调过
+# 速率，仅仅回到菜单就会被改回保存值。恢复必须由用户明确触发。
+bbr_tc_saved_matches_runtime() {
+    local SAVED_VALUES SAVED_DEV SAVED_RATE TC_BIN
+    SAVED_VALUES=$(bbr_tc_saved_values) || return 0
+    SAVED_DEV=${SAVED_VALUES%% *}
+    SAVED_RATE=${SAVED_VALUES#* }; SAVED_RATE=${SAVED_RATE%% *}
+    TC_BIN=$(command -v tc 2>/dev/null || echo /sbin/tc)
+    [ -x "$TC_BIN" ] || return 1
+    bbr_tc_is_owned "$SAVED_DEV" "$TC_BIN" && bbr_tc_rate_matches "$SAVED_DEV" "$TC_BIN" "$SAVED_RATE"
+}
+
 bbr_tc_reconcile_saved() {
     local CURRENT_DEV SAVED_VALUES SAVED_REST SAVED_DEV SAVED_RATE SAVED_BURST SAVED_FORCE TC_BIN
     [ "${QUENCH_TEST_MODE:-0}" != 1 ] || return 2

@@ -521,7 +521,17 @@ user_key_menu_for() {
     done
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 user_create() {
+    local RC
+    txn_write_begin "创建用户" || return 1
+    user_create_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+user_create_locked() {
     local FORCE_ADMIN="${1:-no}" USERNAME TYPE SET_PASSWORD ADD_KEY
     print_header "创建用户"
     read -rp "  新用户名（回车取消）: " USERNAME
@@ -558,7 +568,17 @@ user_create() {
     CREATED_USER="$USERNAME"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 user_admin_manage() {
+    local RC
+    txn_write_begin "管理员权限" || return 1
+    user_admin_manage_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+user_admin_manage_locked() {
     print_header "管理员权限"
     local USERNAME CHOICE TOKEN CONFIRM
     USERNAME=$(user_select no "选择要管理的用户") || return
@@ -600,7 +620,17 @@ user_admin_manage() {
     fi
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 user_password_manage() {
+    local RC
+    txn_write_begin "密码与账户锁定" || return 1
+    user_password_manage_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+user_password_manage_locked() {
     print_header "密码与账户锁定"
     local USERNAME CHOICE TOKEN ACTOR
     USERNAME=$(user_select yes "选择用户") || return
@@ -627,7 +657,17 @@ user_password_manage() {
     esac
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 user_delete() {
+    local RC
+    txn_write_begin "删除用户" || return 1
+    user_delete_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+user_delete_locked() {
     print_header "删除用户"
     local USERNAME USER_ID ACTOR TOKEN REMOVE_HOME
     USERNAME=$(user_select no "选择要删除的用户") || return

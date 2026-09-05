@@ -223,18 +223,33 @@ txn_lock_mkdir_acquire() {
     local DIR="${QUENCH_TXN_LOCK_FILE}.d" OWNER I
     for I in 1 2; do
         if mkdir "$DIR" 2>/dev/null; then
-            printf '%s\n' "$$" > "$DIR/pid" 2>/dev/null || true
+            # mkdir 成功后立刻写 pid。写不进去就放弃锁：一个没有 pid 的锁目录
+            # 无法与“正在取锁”区分，会让后来者永远等待。
+            if ! printf '%s\n' "$$" > "$DIR/pid" 2>/dev/null; then
+                rmdir "$DIR" 2>/dev/null || true
+                error "无法写入事务锁持有者信息：$DIR"
+                return 1
+            fi
             QUENCH_TXN_LOCK_HELD=1
             QUENCH_TXN_LOCK_MODE="mkdir"
             return 0
         fi
         OWNER=$(cat "$DIR/pid" 2>/dev/null || true)
-        # 持有者进程还在 -> 真的有人在改；已经消失 -> 是陈旧锁，清掉重试一次
-        if printf '%s\n' "$OWNER" | grep -qE '^[0-9]+$' && kill -0 "$OWNER" 2>/dev/null; then
-            break
+        if printf '%s\n' "$OWNER" | grep -qE '^[0-9]+$'; then
+            # 有 pid：持有者还活着就是真的有人在改；已消失才是陈旧锁
+            kill -0 "$OWNER" 2>/dev/null && break
+            rm -f "$DIR/pid" 2>/dev/null || true
+            rmdir "$DIR" 2>/dev/null || break
+            continue
         fi
-        rm -f "$DIR/pid" 2>/dev/null || true
-        rmdir "$DIR" 2>/dev/null || break
+        # 没有 pid 文件：另一个进程刚 mkdir 完、还没来得及写 pid。这不是陈旧锁，
+        # 不能删——删了它就会两个进程同时持锁。只有目录已经空着放了很久
+        # （持有者在 mkdir 和写 pid 之间就崩了）才当作遗骸清理。
+        if [ -n "$(find "$DIR" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+            rmdir "$DIR" 2>/dev/null || break
+            continue
+        fi
+        break
     done
     if [ ! -d "$DIR" ]; then
         error "无法创建事务锁目录：$DIR"
@@ -259,6 +274,41 @@ txn_lock_release() {
     esac
     QUENCH_TXN_LOCK_HELD=0
     QUENCH_TXN_LOCK_MODE=""
+}
+
+# ── 不走 safety_arm 的配置写入：统一入口 ─────────────────
+# 事务锁原来只保护 safety_arm 一族；SSH 端口迁移、用户、公钥、Fail2ban、换源
+# 这些写入在锁外进行。而回滚快照是整套配置（含 sshd_config 等），一笔未确认的
+# DNS 变更还在倒计时时，这里写下去的东西会被那笔回滚到期时原样覆盖回去。
+# 所以这些写入必须：取锁（跨会话互斥）、核对遗留事务（别的会话有 armed 回滚
+# 就拒绝）、并拒绝在本会话自己还有未确认回滚时进行。深度计数允许嵌套调用。
+QUENCH_TXN_WRITE_DEPTH=0
+
+txn_write_begin() {
+    local LABEL="$1"
+    if [ "$QUENCH_TXN_WRITE_DEPTH" -gt 0 ]; then
+        QUENCH_TXN_WRITE_DEPTH=$((QUENCH_TXN_WRITE_DEPTH + 1))
+        return 0
+    fi
+    txn_lock_acquire || return 1
+    if ! txn_reconcile_stale; then
+        txn_lock_release
+        return 1
+    fi
+    if safety_timer_pending; then
+        txn_lock_release
+        error "本会话还有一笔未确认的变更，自动回滚仍在计时；它到期会覆盖掉这次修改"
+        error "请先确认或回滚那笔变更，再进行：${LABEL}"
+        return 1
+    fi
+    QUENCH_TXN_WRITE_DEPTH=1
+}
+
+txn_write_end() {
+    [ "$QUENCH_TXN_WRITE_DEPTH" -gt 0 ] || return 0
+    QUENCH_TXN_WRITE_DEPTH=$((QUENCH_TXN_WRITE_DEPTH - 1))
+    [ "$QUENCH_TXN_WRITE_DEPTH" -gt 0 ] || txn_lock_release
+    return 0
 }
 
 # ── 事务记录（只写盘，不打扰）──────────────────────────────

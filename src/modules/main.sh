@@ -99,7 +99,11 @@ main_menu() {
             FW_STAT="${FW_TYPE} 已停止"; FW_STATE="inactive"
         fi
         local BBR_CC; BBR_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
-        [ ! -s "$TC_STATE_FILE" ] || bbr_tc_reconcile_saved >/dev/null 2>&1 || true
+        # 状态页是只读的：只报告运行值与保存值是否一致，不再悄悄改回保存值。
+        local TC_MISMATCH=""
+        if [ -s "$TC_STATE_FILE" ] && ! bbr_tc_saved_matches_runtime 2>/dev/null; then
+            TC_MISMATCH=" · 与保存值不一致"
+        fi
         local TC_RATE TC_DEV TC_BIN
         TC_DEV=$(default_iface)
         TC_BIN=$(command -v tc 2>/dev/null || echo /sbin/tc)
@@ -130,7 +134,9 @@ main_menu() {
         elif [ "$CUR_PWD" = "yes" ]; then AUTH_LABEL="允许密码"; AUTH_STATE="warning"
         else AUTH_LABEL="未确认"; AUTH_STATE="unknown"; fi
         [ "$CADDY_ST" = "running" ] && CADDY_STATE="active" || CADDY_STATE="$CADDY_ST"
-        [ "$BBR_CC" = "bbr" ] && BBR_STATE="active" || BBR_STATE="unknown"
+        if [ -n "$TC_MISMATCH" ]; then BBR_STATE="warning"
+        elif [ "$BBR_CC" = "bbr" ]; then BBR_STATE="active"
+        else BBR_STATE="unknown"; fi
         case "$F2B_STAT" in
             running) F2B_LABEL="运行中"; F2B_STATE="active" ;;
             stopped) F2B_LABEL="已停止"; F2B_STATE="inactive" ;;
@@ -139,7 +145,7 @@ main_menu() {
 
         menu_group "系统概览"
         status_pair "用户" "$USER_TOTAL · 管理员 $ADMIN_TOTAL" "active" "SSH" "${CUR_PORT:-22} · $AUTH_LABEL" "$AUTH_STATE"
-        status_pair "BBR" "$BBR_CC · $TC_RATE" "$BBR_STATE" "Fail2ban" "$F2B_LABEL" "$F2B_STATE"
+        status_pair "BBR" "$BBR_CC · ${TC_RATE}${TC_MISMATCH}" "$BBR_STATE" "Fail2ban" "$F2B_LABEL" "$F2B_STATE"
         status_pair "防火墙" "$FW_STAT" "$FW_STATE" "Caddy" "$CADDY_LABEL" "$CADDY_STATE"
         status_pair "Docker" "$DOCKER_LABEL" "$DOCKER_STATE" "时间" "$SYS_TIME" "active"
         ui_hint "时区 $SYS_TZ"

@@ -164,7 +164,17 @@ f2b_status() {
     fi
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 f2b_install() {
+    local RC
+    txn_write_begin "安装 Fail2ban" || return 1
+    f2b_install_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+f2b_install_locked() {
     print_header "安装 Fail2ban"
     info "正在安装 fail2ban..."
     if ! pkg_install fail2ban; then
@@ -323,7 +333,17 @@ f2b_set_param_jail() {
     info "[sshd] ${KEY} 已设置为 ${VAL} ✓"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 f2b_config_params() {
+    local RC
+    txn_write_begin "Fail2ban 参数" || return 1
+    f2b_config_params_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+f2b_config_params_locked() {
     print_header "Fail2ban SSH 防护参数"
     local JAIL_FILE CUR_BAN CUR_FIND CUR_MAX CUR_PORT BAN_SEC FIND_SEC CH VAL PRESET
     local APPLY_BAN="" APPLY_FIND="" APPLY_MAX="" APPLY_PORT="" BACKUP WAS_RUNNING

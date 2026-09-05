@@ -9,7 +9,17 @@ show_keys() {
     list_keys "$AUTH_FILE"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 add_key() {
+    local RC
+    txn_write_begin "添加 SSH 公钥" || return 1
+    add_key_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+add_key_locked() {
     local AUTH_FILE="${1:-}"
     [ -n "$AUTH_FILE" ] || { error "内部错误：add_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "添加 SSH 公钥"
@@ -52,7 +62,17 @@ add_key() {
     info "公钥已添加！当前共 $TOTAL 个公钥 ✓"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 delete_key() {
+    local RC
+    txn_write_begin "删除 SSH 公钥" || return 1
+    delete_key_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+delete_key_locked() {
     local AUTH_FILE="${1:-}"
     [ -n "$AUTH_FILE" ] || { error "内部错误：delete_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "删除 SSH 公钥"
@@ -98,7 +118,17 @@ delete_key() {
     info "公钥已删除 ✓"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 generate_key() {
+    local RC
+    txn_write_begin "生成 SSH 密钥对" || return 1
+    generate_key_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+generate_key_locked() {
     local AUTH_FILE="${1:-}"
     [ -n "$AUTH_FILE" ] || { error "内部错误：generate_key 未收到目标 authorized_keys 路径"; return 1; }
     print_header "生成 SSH 密钥对"
@@ -464,7 +494,17 @@ ssh_firewall_close_port() {
     [ "$FAILED" = false ]
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 ssh_port_finalize() {
+    local RC
+    txn_write_begin "完成 SSH 端口迁移" || return 1
+    ssh_port_finalize_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+ssh_port_finalize_locked() {
     local TOKEN CLOSE_OLD OLD_PORT NEW_PORT
     ssh_read_port_state || { warn "没有待完成的 SSH 端口迁移"; return 1; }
     warn "必须已在另一个终端通过端口 $NEW_PORT 成功登录。"
@@ -494,7 +534,17 @@ ssh_port_finalize() {
     info "SSH 已仅监听新端口 $NEW_PORT ✓"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 ssh_port_rollback() {
+    local RC
+    txn_write_begin "回滚 SSH 端口迁移" || return 1
+    ssh_port_rollback_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+ssh_port_rollback_locked() {
     local CLOSE_NEW OLD_PORT NEW_PORT
     ssh_read_port_state || { warn "没有待回滚的 SSH 端口迁移"; return 1; }
     if ! firewall_port_ready "$OLD_PORT"; then
@@ -517,7 +567,17 @@ ssh_port_rollback() {
     info "SSH 端口迁移已回滚 ✓"
 }
 
+# 统一写入入口：取锁、核对遗留事务、拒绝在未确认回滚期间修改。见 txn_write_begin。
 change_port() {
+    local RC
+    txn_write_begin "修改 SSH 端口" || return 1
+    change_port_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+change_port_locked() {
     print_header "SSH 端口双端口迁移"
     local CURRENT_PORT INPUT_PORT CHOICE OLD_PORT NEW_PORT TEST_NOW
     if ssh_read_port_state; then

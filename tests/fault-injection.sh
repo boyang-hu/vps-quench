@@ -2145,4 +2145,111 @@ t_exact_001() {
 }
 run_test "Snapshot restore reproduces the directory exactly" t_exact_001
 
+# The exact-restore path moved the old directory aside before copying. If the copy
+# died halfway, DEST already existed as a partial tree and `mv SAVED DEST` nested the
+# original inside it: the Caddyfile ended up at etc/caddy/caddy.quench-restore-PID/.
+t_exact_002() {
+    EF_DIR="$TMP/exact-fail"
+    mkdir -p "$EF_DIR/src/etc/caddy" "$EF_DIR/dest/etc/caddy"
+    printf 'snapshot\n' > "$EF_DIR/src/etc/caddy/Caddyfile"
+    ( cd "$EF_DIR/src" && tar -czf "$EF_DIR/snap.tar.gz" etc/caddy )
+    printf 'live\n' > "$EF_DIR/dest/etc/caddy/Caddyfile"
+    CONFIG_RESTORE_ROOT="$EF_DIR/dest"
+    # 让复制中途失败：cp 一律返回 1
+    # shellcheck disable=SC2329 # test stub forces the copy to fail
+    cp() { command cp "$@" >/dev/null 2>&1; return 1; }
+    config_archive_extract "$EF_DIR/snap.tar.gz" >/dev/null 2>&1 \
+        && { unset -f cp; echo "a failed directory copy was reported as a successful restore" >&2; exit 1; }
+    unset -f cp
+    [ "$(cat "$EF_DIR/dest/etc/caddy/Caddyfile" 2>/dev/null)" = live ] \
+        || { echo "a failed restore did not leave the original directory in place" >&2; exit 1; }
+    find "$EF_DIR/dest/etc/caddy" -mindepth 1 -type d | grep -q . \
+        && { echo "a failed restore nested a directory inside the original" >&2; exit 1; }
+    find "$EF_DIR/dest/etc" -maxdepth 1 -name 'caddy.quench-*' | grep -q . \
+        && { echo "a failed restore left a staging directory behind" >&2; exit 1; }
+    :
+}
+run_test "A restore whose directory copy fails leaves the original untouched" t_exact_002
+
+# deactivating is a transition, not a terminal state.
+t_stop_002() {
+    SAFETY_UNIT=quench-rollback-slow
+    SAFETY_PID=""
+    # shellcheck disable=SC2329 # test stub: the unit never leaves deactivating
+    systemctl() {
+        case "${1:-}" in
+            is-active) return 1 ;;
+            show) printf 'ActiveState=deactivating\n'; return 0 ;;
+        esac
+        return 0
+    }
+    safety_stop_timer_process >/dev/null 2>&1 \
+        && { echo "a unit still deactivating was treated as stopped" >&2; exit 1; }
+    :
+}
+run_test "A unit stuck in deactivating is not reported as stopped" t_stop_002
+
+# Between mkdir and writing the pid the lock directory is empty. A second caller must
+# read that as "being acquired", not as stale, or both callers end up holding the lock.
+t_lock_002() {
+    LK2="$TMP/mkdir-lock-race"
+    mkdir -p "$LK2"
+    QUENCH_TXN_LOCK_FILE="$LK2/lock"
+    QUENCH_TXN_LOCK_HELD=0
+    QUENCH_TXN_LOCK_MODE=""
+    mkdir "$LK2/lock.d"                     # 模拟：另一进程刚 mkdir 完、pid 还没写
+    txn_lock_mkdir_acquire >/dev/null 2>&1 \
+        && { echo "an empty, freshly created lock directory was taken over" >&2; exit 1; }
+    [ -d "$LK2/lock.d" ] \
+        || { echo "the in-progress lock directory was removed" >&2; exit 1; }
+    :
+}
+run_test "An empty lock directory is treated as in progress, not stale" t_lock_002
+
+# Writes outside safety_arm must refuse while a rollback is armed: the full snapshot it
+# restores would otherwise overwrite them when the timer fires.
+t_write_001() {
+    WG="$TMP/write-guard"
+    mkdir -p "$WG"
+    QUENCH_TXN_LOCK_FILE="$WG/lock"
+    QUENCH_TXN_DIR="$WG/txn"
+    QUENCH_TXN_LOCK_HELD=0
+    QUENCH_TXN_WRITE_DEPTH=0
+    SAFETY_SCRIPT="$WG/rollback.sh"
+    printf '#!/bin/bash\n' > "$SAFETY_SCRIPT"
+    SAFETY_UNIT=""; SAFETY_PID=""
+    txn_write_begin "probe" >/dev/null 2>&1 \
+        && { echo "a write was allowed while this session's rollback was armed" >&2; exit 1; }
+    [ "$QUENCH_TXN_LOCK_HELD" = 0 ] \
+        || { echo "a refused write left the lock held" >&2; exit 1; }
+
+    # 没有未确认回滚时正常放行，嵌套调用共享一把锁，最外层释放
+    rm -f "$SAFETY_SCRIPT"; SAFETY_SCRIPT=""
+    txn_write_begin outer || { echo "a clean write was refused" >&2; exit 1; }
+    txn_write_begin inner || { echo "a nested write was refused" >&2; exit 1; }
+    [ "$QUENCH_TXN_WRITE_DEPTH" = 2 ] || { echo "nesting depth was not tracked" >&2; exit 1; }
+    txn_write_end
+    [ "$QUENCH_TXN_LOCK_HELD" = 1 ] || { echo "the inner write released the outer lock" >&2; exit 1; }
+    txn_write_end
+    [ "$QUENCH_TXN_LOCK_HELD" = 0 ] || { echo "the outer write did not release the lock" >&2; exit 1; }
+    :
+}
+run_test "Writes outside safety_arm are refused while a rollback is armed" t_write_001
+
+# The dashboard must never apply the saved tc rate on its own.
+t_dash_001() {
+    RECONCILED=0
+    # shellcheck disable=SC2329 # test stub observes whether the menu applies anything
+    bbr_tc_reconcile_saved() { RECONCILED=1; return 0; }
+    # 只允许通过只读比较函数得到结论
+    # shellcheck disable=SC2329 # test stub reports a mismatch
+    bbr_tc_saved_matches_runtime() { return 1; }
+    grep -q 'bbr_tc_saved_matches_runtime' <(sed -n '/^main_menu() {/,/^}/p' "$ROOT/src/modules/main.sh") \
+        || { echo "main_menu no longer uses the read-only comparison" >&2; exit 1; }
+    grep -q 'bbr_tc_reconcile_saved' <(sed -n '/^main_menu() {/,/^}/p' "$ROOT/src/modules/main.sh") \
+        && { echo "main_menu still applies the saved tc rate during a refresh" >&2; exit 1; }
+    :
+}
+run_test "The dashboard reports a tc mismatch instead of silently applying the saved rate" t_dash_001
+
 test_summary "Fault injection"
