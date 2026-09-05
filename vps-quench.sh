@@ -3325,13 +3325,13 @@ fail2ban_menu() {
 #  网络性能调优模块
 # ══════════════════════════════════════════════════════════
 
-SERVICE_TC="/etc/systemd/system/tc-fq.service"
-SERVICE_TC_INIT="/etc/init.d/tc-fq"
+SERVICE_TC="/etc/systemd/system/quench-tc-fq.service"
+SERVICE_TC_INIT="/etc/init.d/quench-tc-fq"
 TC_HELPER="/usr/local/libexec/quench-tc-fq"
 TC_STATE_FILE="/var/lib/quench/tc-fq.state"
 TC_BACKUP_DIR="/var/lib/quench/tc-backups"
-SERVICE_CWND="/etc/systemd/system/initcwnd.service"
-SERVICE_CWND_INIT="/etc/init.d/initcwnd"
+SERVICE_CWND="/etc/systemd/system/quench-initcwnd.service"
+SERVICE_CWND_INIT="/etc/init.d/quench-initcwnd"
 CWND_HELPER="/usr/local/libexec/quench-initcwnd"
 CWND_STATE_FILE="/var/lib/quench/initcwnd.state"
 SYSCTL_FILE="/etc/sysctl.d/99-quench-bbr.conf"
@@ -4188,11 +4188,11 @@ bbr_tc_restore_owned() {
         return 0
     fi
     if systemd_available && [ -f "$SERVICE_TC" ]; then
-        systemctl restart tc-fq >/dev/null 2>&1 && return 0
+        systemctl restart quench-tc-fq >/dev/null 2>&1 && return 0
     elif command -v rc-service >/dev/null 2>&1 && [ -f "$SERVICE_TC_INIT" ]; then
-        rc-service tc-fq restart >/dev/null 2>&1 && return 0
+        rc-service quench-tc-fq restart >/dev/null 2>&1 && return 0
     elif command -v service >/dev/null 2>&1 && [ -f "$SERVICE_TC_INIT" ]; then
-        service tc-fq restart >/dev/null 2>&1 && return 0
+        service quench-tc-fq restart >/dev/null 2>&1 && return 0
     fi
     return 1
 }
@@ -4436,24 +4436,24 @@ EOF
         mv "$TMP" "$SERVICE_TC" || { rm -f "$TMP"; return 1; }
         # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         systemctl daemon-reload >/dev/null 2>&1 \
-            && systemctl enable tc-fq --quiet >/dev/null 2>&1 \
-            && systemctl restart tc-fq >/dev/null 2>&1 || {
+            && systemctl enable quench-tc-fq --quiet >/dev/null 2>&1 \
+            && systemctl restart quench-tc-fq >/dev/null 2>&1 || {
                 error "tc 已立即生效，但 systemd 持久化失败"
                 return 1
             }
     elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_TC_INIT" "$TC_HELPER" openrc || return 1
         # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
-        rc-update add tc-fq default >/dev/null 2>&1 \
-            && rc-service tc-fq restart >/dev/null 2>&1 || {
+        rc-update add quench-tc-fq default >/dev/null 2>&1 \
+            && rc-service quench-tc-fq restart >/dev/null 2>&1 || {
                 error "tc 已立即生效，但 OpenRC 持久化失败"
                 return 1
             }
     elif command -v update-rc.d >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_TC_INIT" "$TC_HELPER" sysv || return 1
         # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
-        update-rc.d tc-fq defaults >/dev/null 2>&1 \
-            && service tc-fq restart >/dev/null 2>&1 || {
+        update-rc.d quench-tc-fq defaults >/dev/null 2>&1 \
+            && service quench-tc-fq restart >/dev/null 2>&1 || {
                 error "tc 已立即生效，但 SysV 持久化失败"
                 return 1
             }
@@ -4566,15 +4566,15 @@ bbr_remove_tc() {
     fi
 
     if systemd_available; then
-        systemctl disable --now tc-fq >/dev/null 2>&1 || true
+        systemctl disable --now quench-tc-fq >/dev/null 2>&1 || true
         rm -f "$SERVICE_TC"
         systemctl daemon-reload >/dev/null 2>&1 || FAILED=1
     elif command -v rc-update >/dev/null 2>&1; then
-        rc-service tc-fq stop >/dev/null 2>&1 || true
-        rc-update del tc-fq default >/dev/null 2>&1 || true
+        rc-service quench-tc-fq stop >/dev/null 2>&1 || true
+        rc-update del quench-tc-fq default >/dev/null 2>&1 || true
     elif command -v update-rc.d >/dev/null 2>&1; then
-        service tc-fq stop >/dev/null 2>&1 || true
-        update-rc.d -f tc-fq remove >/dev/null 2>&1 || true
+        service quench-tc-fq stop >/dev/null 2>&1 || true
+        update-rc.d -f quench-tc-fq remove >/dev/null 2>&1 || true
     fi
     rm -f "$SERVICE_TC_INIT" "$TC_HELPER" "$TC_STATE_FILE"
     if [ "$FAILED" -ne 0 ]; then
@@ -6149,24 +6149,24 @@ EOF
         mv "$TMP" "$SERVICE_CWND" || { rm -f "$TMP"; return 1; }
         # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         systemctl daemon-reload >/dev/null 2>&1 \
-            && systemctl enable initcwnd --quiet >/dev/null 2>&1 \
-            && systemctl restart initcwnd >/dev/null 2>&1 || {
+            && systemctl enable quench-initcwnd --quiet >/dev/null 2>&1 \
+            && systemctl restart quench-initcwnd >/dev/null 2>&1 || {
                 error "initcwnd 已立即生效，但 systemd 持久化失败"
                 return 1
             }
     elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_CWND_INIT" "$CWND_HELPER" openrc || return 1
         # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
-        rc-update add initcwnd default >/dev/null 2>&1 \
-            && rc-service initcwnd restart >/dev/null 2>&1 || {
+        rc-update add quench-initcwnd default >/dev/null 2>&1 \
+            && rc-service quench-initcwnd restart >/dev/null 2>&1 || {
                 error "initcwnd 已立即生效，但 OpenRC 持久化失败"
                 return 1
             }
     elif command -v update-rc.d >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
         bbr_write_init_script "$SERVICE_CWND_INIT" "$CWND_HELPER" sysv || return 1
         # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
-        update-rc.d initcwnd defaults >/dev/null 2>&1 \
-            && service initcwnd restart >/dev/null 2>&1 || {
+        update-rc.d quench-initcwnd defaults >/dev/null 2>&1 \
+            && service quench-initcwnd restart >/dev/null 2>&1 || {
                 error "initcwnd 已立即生效，但 SysV 持久化失败"
                 return 1
             }
@@ -6184,15 +6184,15 @@ bbr_remove_initcwnd() {
     done < <(bbr_default_routes)
 
     if systemd_available; then
-        systemctl disable --now initcwnd >/dev/null 2>&1 || true
+        systemctl disable --now quench-initcwnd >/dev/null 2>&1 || true
         rm -f "$SERVICE_CWND"
         systemctl daemon-reload >/dev/null 2>&1 || FAILED=1
     elif command -v rc-update >/dev/null 2>&1; then
-        rc-service initcwnd stop >/dev/null 2>&1 || true
-        rc-update del initcwnd default >/dev/null 2>&1 || true
+        rc-service quench-initcwnd stop >/dev/null 2>&1 || true
+        rc-update del quench-initcwnd default >/dev/null 2>&1 || true
     elif command -v update-rc.d >/dev/null 2>&1; then
-        service initcwnd stop >/dev/null 2>&1 || true
-        update-rc.d -f initcwnd remove >/dev/null 2>&1 || true
+        service quench-initcwnd stop >/dev/null 2>&1 || true
+        update-rc.d -f quench-initcwnd remove >/dev/null 2>&1 || true
     fi
     rm -f "$SERVICE_CWND_INIT" "$CWND_HELPER" "$CWND_STATE_FILE"
     if [ "$FAILED" -ne 0 ]; then
@@ -6553,9 +6553,9 @@ bbr_diagnose() {
 
     SERVICE_STATE="未安装"
     if systemd_available && [ -f "$SERVICE_TC" ]; then
-        SERVICE_STATE=$(systemctl is-enabled tc-fq 2>/dev/null || echo "已安装未启用")
+        SERVICE_STATE=$(systemctl is-enabled quench-tc-fq 2>/dev/null || echo "已安装未启用")
     elif [ -f "$SERVICE_TC_INIT" ]; then
-        if command -v rc-service >/dev/null 2>&1 && rc-service tc-fq status >/dev/null 2>&1; then
+        if command -v rc-service >/dev/null 2>&1 && rc-service quench-tc-fq status >/dev/null 2>&1; then
             SERVICE_STATE="已启用"
         else
             SERVICE_STATE="已安装未运行"
