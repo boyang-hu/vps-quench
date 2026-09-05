@@ -630,9 +630,10 @@ t_sm_022() {
     KEY_TARGET="$TMP/keyarg/explicit"
     : > "$KEY_TARGET"
 
-    KEY_ERR=$(printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExplicitTarget explicit@test' \
-        | add_key "$KEY_TARGET" 2>&1 >/dev/null) \
-        || { echo "add_key failed: $KEY_ERR" >&2; exit 1; }
+    # error/warn 打到 stdout，失败信息必须把 stdout 一并收进来，否则只剩一句空白
+    KEY_OUT=$(printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExplicitTarget explicit@test' \
+        | add_key "$KEY_TARGET" 2>&1) \
+        || { echo "add_key failed (flock=$(command -v flock || echo none) lock_mode=${QUENCH_TXN_LOCK_MODE:-} lock_file=$QUENCH_TXN_LOCK_FILE): $KEY_OUT" >&2; ls -la "$QUENCH_TXN_LOCK_FILE"* >&2 2>/dev/null; exit 1; }
     grep -qF ExplicitTarget "$KEY_TARGET" \
         || { echo "add_key ignored its explicit target file" >&2; exit 1; }
     [ ! -s "$AUTH_KEYS" ] \
