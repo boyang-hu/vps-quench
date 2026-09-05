@@ -445,7 +445,17 @@ f2b_config_params_locked() {
     fi
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 f2b_edit_config() {
+    local RC
+    txn_write_begin "编辑 Fail2ban 配置" || return 1
+    f2b_edit_config_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+f2b_edit_config_locked() {
     print_header "编辑 Quench Fail2ban 配置"
     local JAIL_FILE BACKUP RESTART
     JAIL_FILE=$(f2b_config_file)

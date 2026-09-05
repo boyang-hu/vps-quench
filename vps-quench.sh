@@ -2,7 +2,7 @@
 # 由 build.sh 从 src/ 生成；请修改模块源码后重新构建发行脚本。
 
 # ============================================================
-#  Quench V0.1.2 — VPS 初始化与管理工具
+#  Quench V0.1.3 — VPS 初始化与管理工具
 #  作者：Boyang
 #
 #  项目说明：
@@ -12,6 +12,7 @@
 #  - 支持配置备份、操作审计、离线安装、完整性校验和脚本自更新
 #
 #  发布版本：
+#  V0.1.3: 回滚事务状态明确化：回滚脚本进入恢复阶段后留下 .restoring 标记并忽略 TERM/INT，取消与停止在恢复阶段只等待不打断，systemd 计时器单元设 SendSIGKILL=no；恢复执行失败留下 .failed 标记，确认时不再当作“已取消”删掉材料；普通文件回滚改为单次 rename 覆盖，快照外的根删除失败计入回滚结果；BBR 内核参数、端口转发规则与服务、hostname、自动安全更新、Fail2ban 编辑、Caddy 安装接入事务锁；SSH 策略与首次开荒基线的基准哈希改为取自未改动的候选副本，算不出即拒绝。
 #  V0.1.2: 安全回滚收口：自动回滚改为与配置导入一致的精确恢复（事务新增的文件回滚时删除）；Caddy 写入接入事务锁；SSH 策略与首次开荒基线在取锁后核对原文件未被改动；确认输入前计时器已到期时如实报告已回滚而非“已取消”；BBR 子菜单入口不再自动应用保存的限速。
 #  V0.1.1: 安全回滚与事务修复：回滚计时器改用 system 级 transient unit，取消/回滚前确认计时器已停，恢复未验证时保留安全网；事务锁覆盖全部写入路径并在无 flock 时退回 mkdir 锁，遗留事务落盘并阻断新变更；配置恢复改为原子替换与精确目录恢复；兼容 busybox（flock 无 -w、构建 SIGPIPE）；中文列宽在 bash 4+ 上修正；测试改为具名用例。
 #  V0.1.0: 首个完整版本，提供 VPS 初始化、安全接管、网络调优与日常服务管理
@@ -380,8 +381,12 @@ safety_launch_timer() {
     if systemd_available && command -v systemd-run >/dev/null 2>&1; then
         UNIT="quench-rollback-$$-$(date +%s)-${RANDOM}"
         # --collect 需要 systemd 236+，不支持时退回不带该参数的写法。
-        if systemd-run --quiet --collect --unit="$UNIT" /bin/bash "$SCRIPT" >/dev/null 2>&1 \
-            || systemd-run --quiet --unit="$UNIT" /bin/bash "$SCRIPT" >/dev/null 2>&1; then
+        # SendSIGKILL=no + 足够长的 TimeoutStopSec：脚本进入恢复阶段后会忽略 TERM，
+        # systemctl stop 必须等它自己跑完，而不是超时后 SIGKILL 打断恢复。
+        if systemd-run --quiet --collect --unit="$UNIT" \
+                --property=SendSIGKILL=no --property=TimeoutStopSec=300 /bin/bash "$SCRIPT" >/dev/null 2>&1 \
+            || systemd-run --quiet --unit="$UNIT" \
+                --property=SendSIGKILL=no --property=TimeoutStopSec=300 /bin/bash "$SCRIPT" >/dev/null 2>&1; then
             SAFETY_UNIT="$UNIT"
             SAFETY_SCRIPT="$SCRIPT"
             return 0
@@ -516,7 +521,7 @@ vis_len() {
 BOX_W=64
 UI_COMPACT=0
 APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
-APP_VERSION="V0.1.2"
+APP_VERSION="V0.1.3"
 APP_AUTHOR="Boyang"
 
 # 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、
@@ -1504,7 +1509,10 @@ ssh_apply_policy() {
     local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE APPLY_RC BASE_SUM
     CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
-    BASE_SUM=$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)
+    # 基准必须来自这份尚未改动的候选副本：对实时原文件算哈希，在“复制”和“算哈希”
+    # 之间完成的另一笔写入会让基准等于新内容，核对就形同虚设。
+    BASE_SUM=$(file_sha256 "$CANDIDATE" 2>/dev/null || true)
+    [ -n "$BASE_SUM" ] || { rm -f "$CANDIDATE"; error "无法计算配置基准哈希，拒绝应用"; return 1; }
     set_config_file "$CANDIDATE" PasswordAuthentication "$PASSWORD"
     set_config_file "$CANDIDATE" KbdInteractiveAuthentication "$KEYBOARD"
     set_config_file "$CANDIDATE" PubkeyAuthentication "$PUBKEY"
@@ -3138,7 +3146,17 @@ f2b_config_params_locked() {
     fi
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 f2b_edit_config() {
+    local RC
+    txn_write_begin "编辑 Fail2ban 配置" || return 1
+    f2b_edit_config_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+f2b_edit_config_locked() {
     print_header "编辑 Quench Fail2ban 配置"
     local JAIL_FILE BACKUP RESTART
     JAIL_FILE=$(f2b_config_file)
@@ -3748,7 +3766,17 @@ bbr_restore_initial_baseline() {
 }
 
 # ── 应用 sysctl ───────────────────────────────────────────
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 bbr_apply_sysctl() {
+    local RC
+    txn_write_begin "应用 BBR 内核参数" || return 1
+    bbr_apply_sysctl_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_apply_sysctl_locked() {
     local CONFIG="$1" STALE_MODE="${2:-ask}" TX_SNAPSHOT SNAPSHOT_CONFIG="$1"
     ensure_sysctl || return 1
     bbr_ensure_baseline || return 1
@@ -10214,7 +10242,17 @@ caddy_post_install() {
     fi
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 caddy_install() {
+    local RC
+    txn_write_begin "安装 Caddy" || return 1
+    caddy_install_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+caddy_install_locked() {
     local MODE="${1:-install}" METHOD BIN_BACKUP="" WAS_ACTIVE=false HAD_CONFIG=false REPLACE_FRESH=false
     print_header "安装 / 更新 Caddy"
     [ -e "$CADDYFILE" ] && HAD_CONFIG=true
@@ -13106,8 +13144,11 @@ config_backup_prune() {
 # 之前这里把 systemctl stop / kill 的失败一律 || true 吞掉，调用方随后无条件
 # 删除脚本与句柄，于是界面显示“已取消”，后台却仍会在倒计时结束后回滚。
 # 参数可选，便于回滚中心停止别的会话留下的计时器。
+# 第三个参数是回滚脚本路径（默认本会话的）：存在 <脚本>.restoring 说明它已进入恢复阶段，
+# 这时只能等它自己跑完，绝不能 SIGKILL——杀在两次 mv 之间就是半成品配置。
 safety_stop_timer_process() {
-    local UNIT="${1-${SAFETY_UNIT:-}}" PID="${2-${SAFETY_PID:-}}" I STATE
+    local UNIT="${1-${SAFETY_UNIT:-}}" PID="${2-${SAFETY_PID:-}}" SCRIPT="${3-${SAFETY_SCRIPT:-}}" I STATE
+    local MARKER="${SCRIPT:+${SCRIPT}.restoring}"
     if [ -n "$UNIT" ]; then
         command -v systemctl >/dev/null 2>&1 || return 1
         systemctl stop "$UNIT" >/dev/null 2>&1 || true
@@ -13138,6 +13179,14 @@ safety_stop_timer_process() {
             kill -0 "$PID" 2>/dev/null || return 0
             sleep 1
         done
+        if [ -n "$MARKER" ] && [ -f "$MARKER" ]; then
+            # 已在恢复阶段：等它做完（默认最多 120 秒），不发 SIGKILL
+            for I in $(seq 1 "${QUENCH_RESTORE_WAIT:-120}"); do
+                kill -0 "$PID" 2>/dev/null || return 0
+                sleep 1
+            done
+            return 1
+        fi
         kill -9 "$PID" 2>/dev/null || true
         sleep 1
         kill -0 "$PID" 2>/dev/null && return 1
@@ -13155,7 +13204,27 @@ safety_timer_pending() {
 # 只有确认计时器已停止，才能删除回滚脚本、事务记录并释放锁。
 # 停不掉就如实报错并把全部回滚材料留在原地，让上层据此决定后续动作。
 # 返回值：0 = 已取消；1 = 停不掉，材料保留；2 = 回滚已经执行（脚本自删），无可取消。
+# 四种事务状态：倒计时中（可取消）、恢复中（不可取消，等它完成）、已回滚（脚本自删）、
+# 恢复失败（脚本保留并留下 .failed）。最后一种绝不能当成“取消成功”把材料删掉。
 cancel_safety_timer() {
+    local I
+    if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "${SAFETY_SCRIPT}.restoring" ]; then
+        warn "自动回滚正在执行，无法取消；等待它完成..."
+        for I in $(seq 1 "${QUENCH_RESTORE_WAIT:-120}"); do
+            [ -f "${SAFETY_SCRIPT}.restoring" ] || break
+            sleep 1
+        done
+        if [ -f "${SAFETY_SCRIPT}.restoring" ]; then
+            error "自动回滚仍在执行，未能等到结束；回滚材料全部保留"
+            return 1
+        fi
+    fi
+    if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ] && [ -f "${SAFETY_SCRIPT}.failed" ]; then
+        error "自动回滚已执行但未成功，配置可能处于中间状态；回滚脚本与事务记录已保留：$SAFETY_SCRIPT"
+        error "请在回滚中心手动重新执行，或人工核对配置"
+        audit_action "自动回滚执行失败，等待人工处理" FAILED
+        return 1
+    fi
     if [ -n "${SAFETY_SCRIPT:-}" ] && [ ! -f "$SAFETY_SCRIPT" ]; then
         # 脚本只会在回滚成功后自删：走到这里说明倒计时已到期并已恢复配置。
         # 此时报“已取消”会让用户以为新配置保住了。
@@ -13170,6 +13239,19 @@ cancel_safety_timer() {
             error "回滚脚本与事务记录已保留：$SAFETY_SCRIPT"
             error "它仍可能在倒计时结束后恢复配置，请立即人工确认"
             audit_action "取消自动回滚失败，计时器仍在运行" FAILED
+            return 1
+        fi
+        # 停止请求与“进入恢复阶段”可能交错：停下来之后重新核对。
+        # 脚本已自删 = 恢复已经执行完；脚本还在但留有阶段标记 = 恢复失败，材料保留。
+        if [ ! -f "$SAFETY_SCRIPT" ]; then
+            SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+            txn_record_end
+            txn_lock_release
+            return 2
+        fi
+        if [ -f "${SAFETY_SCRIPT}.restoring" ] || [ -f "${SAFETY_SCRIPT}.failed" ]; then
+            error "自动回滚已执行但未成功，配置可能处于中间状态；回滚脚本与事务记录已保留：$SAFETY_SCRIPT"
+            audit_action "自动回滚执行失败，等待人工处理" FAILED
             return 1
         fi
     fi
@@ -13494,7 +13576,7 @@ txn_review_menu() {
                 # 必须先停掉这笔事务自己的计时器：否则脚本会被执行两次——
                 # 一次是现在手动跑，一次是原 unit 倒计时到期后自己跑。
                 if ! safety_stop_timer_process \
-                    "$(txn_record_field "$FILE" UNIT)" "$(txn_record_field "$FILE" TIMER_PID)"; then
+                    "$(txn_record_field "$FILE" UNIT)" "$(txn_record_field "$FILE" TIMER_PID)" "$SCRIPT"; then
                     error "无法停止该记录的回滚计时器，拒绝手动执行以免回滚两次"
                     ui_pause
                     continue
@@ -13583,7 +13665,7 @@ safety_arm_locked() {
     local LABEL="$1" SNAP SCRIPT UFW_STATE="inactive" FIREWALLD_STATE="inactive"
     local DELAY="${SAFETY_DELAY_SECONDS:-180}" RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     local RESOLV_IMMUTABLE="inactive" PATH_VALUE TARGET ROOTS_Q="" ROOT_ITEM ROOT_ITEM_Q
-    local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q
+    local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q MARKER_Q FAILED_Q
     shift
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
     if safety_timer_pending; then
@@ -13618,6 +13700,8 @@ safety_arm_locked() {
     if [ "$RESTORE_ROOT" = / ]; then TARGET=/etc/resolv.conf; else TARGET="${RESTORE_ROOT%/}/etc/resolv.conf"; fi
     printf -v SNAP_Q '%q' "$SNAP"
     printf -v SCRIPT_Q '%q' "$SCRIPT"
+    printf -v MARKER_Q '%q' "${SCRIPT}.restoring"
+    printf -v FAILED_Q '%q' "${SCRIPT}.failed"
     printf -v ROOT_Q '%q' "$RESTORE_ROOT"
     printf -v LABEL_Q '%q' "$LABEL"
     printf -v RESOLV_Q '%q' "$TARGET"
@@ -13635,6 +13719,12 @@ if [ "\${1:-}" != --now ]; then
     wait "\$ROLLBACK_SLEEP_PID" || exit 0
 fi
 trap - TERM INT
+# ── 进入恢复阶段。从这里起不再接受取消：TERM/INT 一律忽略，并留下阶段标记，
+# 调用方看到标记就知道“正在恢复”而不是“正在倒计时”。之前只区分脚本在不在，
+# 取消操作会把恢复到一半的脚本杀掉，留下主路径缺失、旧文件停在 .quench-old 的半成品。
+trap '' TERM INT
+: > $MARKER_Q
+rm -f $FAILED_Q
 chattr -i $RESOLV_Q >/dev/null 2>&1 || true
 # 精确恢复，与配置导入同一语义。原来是 tar -xzf 直接解压合并：快照之后新增的文件
 # （例如导入带来的 sshd_config.d/99-deny.conf）会留下，回滚后的状态并不等于快照。
@@ -13649,21 +13739,29 @@ for ROOT in $ROOTS_Q; do
     if [ -e "\$SRC" ] || [ -L "\$SRC" ]; then
         mkdir -p "\$(dirname "\$DEST")" || { RC=1; continue; }
         rm -rf "\$DEST.quench-new" "\$DEST.quench-old"
-        if [ -d "\$SRC" ] && [ ! -L "\$SRC" ]; then cp -a "\$SRC" "\$DEST.quench-new" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }
-        else cp -a "\$SRC" "\$DEST.quench-new" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
-        fi
-        if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then mv "\$DEST" "\$DEST.quench-old" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }; fi
-        if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old"
-        else [ ! -e "\$DEST.quench-old" ] || mv "\$DEST.quench-old" "\$DEST"; rm -rf "\$DEST.quench-new"; RC=1
+        if [ -d "\$SRC" ] && [ ! -L "\$SRC" ]; then
+            # 目录不能 rename 覆盖，只能两步：复制好 -> 挪走旧的 -> 换上新的
+            cp -a "\$SRC" "\$DEST.quench-new" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }
+            if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then mv "\$DEST" "\$DEST.quench-old" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }; fi
+            if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old"
+            else [ ! -e "\$DEST.quench-old" ] || mv "\$DEST.quench-old" "\$DEST"; rm -rf "\$DEST.quench-new"; RC=1
+            fi
+        else
+            # 普通文件：同目录一次 rename 直接覆盖，主路径任何时刻都存在
+            cp -a "\$SRC" "\$DEST.quench-new" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
+            mv -f "\$DEST.quench-new" "\$DEST" || { rm -f "\$DEST.quench-new"; RC=1; }
         fi
     else
-        rm -rf "\$DEST"
+        # 快照里没有 = 快照时不存在；删不掉就没有恢复到快照状态，必须计入
+        rm -rf "\$DEST" || RC=1
+        if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then RC=1; fi
     fi
 done
 rm -rf "\$STAGE"
 if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
 if [ $ROOT_Q != / ]; then
-    if [ "\$RC" -eq 0 ]; then rm -f $SCRIPT_Q; fi
+    rm -f $MARKER_Q
+    if [ "\$RC" -eq 0 ]; then rm -f $SCRIPT_Q; else : > $FAILED_Q; fi
     exit "\$RC"
 fi
 # RC 汇总必要步骤的结果（延续上面文件恢复的结果）。原来这些全是 || true，任何一步
@@ -13703,10 +13801,12 @@ fi
 if [ -x /usr/local/libexec/quench-nft-forward-apply ]; then
     /usr/local/libexec/quench-nft-forward-apply >/dev/null 2>&1 || RC=1
 fi
+rm -f $MARKER_Q
 if [ "\$RC" -eq 0 ]; then
     logger -t quench "未确认连接，已自动恢复 $LABEL_Q 配置"
     rm -f $SCRIPT_Q
 else
+    : > $FAILED_Q
     logger -t quench "自动恢复过程中有步骤失败，回滚脚本已保留：$SCRIPT_Q"
 fi
 exit "\$RC"
@@ -14048,7 +14148,17 @@ system_hostname_sync_hosts() {
     fi
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 system_hostname_apply() {
+    local RC
+    txn_write_begin "修改 hostname" || return 1
+    system_hostname_apply_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+system_hostname_apply_locked() {
     local OLD_NAME NEW_NAME
     OLD_NAME=$(system_hostname_current)
     print_header "修改系统 Hostname"
@@ -14129,7 +14239,17 @@ system_auto_updates_enabled() {
     esac
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 system_enable_auto_security_updates() {
+    local RC
+    txn_write_begin "启用自动安全更新" || return 1
+    system_enable_auto_security_updates_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+system_enable_auto_security_updates_locked() {
     local PM PERIODIC REBOOT_CFG DNF_CFG TMP1 TMP2
     PM=$(system_package_manager)
     PERIODIC="${QUENCH_APT_AUTO_UPGRADES_FILE:-/etc/apt/apt.conf.d/20auto-upgrades}"
@@ -14523,7 +14643,8 @@ first_run_ssh_baseline_apply() {
     local CANDIDATE BASE_SUM
     CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
-    BASE_SUM=$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)
+    BASE_SUM=$(file_sha256 "$CANDIDATE" 2>/dev/null || true)
+    [ -n "$BASE_SUM" ] || { rm -f "$CANDIDATE"; error "无法计算配置基准哈希，拒绝应用"; return 1; }
     first_run_ssh_baseline_render "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "SSH 基础加固"; then
         rm -f "$CANDIDATE"
@@ -16878,7 +16999,17 @@ nft_restore_snapshot() {
     nft_reconcile >/dev/null 2>&1 || true
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_add_rule() {
+    local RC
+    txn_write_begin "添加转发规则" || return 1
+    nft_add_rule_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_add_rule_locked() {
     local kind="$1" id lip family proto ls le thost ttype tip ts te map_mode snat acl comment count
     local rules_backup access_backup choice confirm
     print_header "添加线路机 → 落地机转发"
@@ -16983,7 +17114,17 @@ nft_add_rule() {
     rm -f "$rules_backup" "$access_backup"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_edit_rule() {
+    local RC
+    txn_write_begin "编辑转发规则" || return 1
+    nft_edit_rule_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_edit_rule_locked() {
     local id rid family proto lip ls le ttype thost tip ts te mode snat acl enabled comment
     local value old_family new_family new_ttype count record rules_backup access_backup confirm
     print_header "修改线路转发规则"
@@ -17082,7 +17223,17 @@ nft_edit_rule() {
     nft_lock_release; rm -f "$rules_backup" "$access_backup"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_delete_rule() {
+    local RC
+    txn_write_begin "删除转发规则" || return 1
+    nft_delete_rule_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_delete_rule_locked() {
     local id rules_backup access_backup confirm
     print_header "删除线路转发规则"
     nft_list_rules || { warn "暂无规则"; return; }
@@ -17157,7 +17308,17 @@ nft_replace_access_for_rule() {
     return "$rc"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_edit_access() {
+    local RC
+    txn_write_begin "编辑转发访问控制" || return 1
+    nft_edit_access_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_edit_access_locked() {
     local id rid family proto lip ls le ttype thost tip ts te mode snat acl enabled comment record
     local rules_backup access_backup
     print_header "修改规则访问名单"
@@ -17190,7 +17351,17 @@ nft_edit_access() {
     nft_lock_release; rm -f "$rules_backup" "$access_backup"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_refresh_domain_targets() {
+    local RC
+    txn_write_begin "刷新域名目标" || return 1
+    nft_refresh_domain_targets_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_refresh_domain_targets_locked() {
     local tmp rules_backup access_backup changed=0 domains=0
     local id family proto lip ls le ttype thost tip ts te mode snat acl enabled comment new_ip
     nft_ensure_state_dir || return 1
@@ -17252,7 +17423,17 @@ nft_refresh_timer_status() {
         && echo active || echo inactive
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_refresh_timer_enable() {
+    local RC
+    txn_write_begin "启用域名目标刷新" || return 1
+    nft_refresh_timer_enable_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_refresh_timer_enable_locked() {
     local interval tmp
     systemd_available || { error "自动刷新当前仅支持 systemd"; return 1; }
     nft_ensure_runtime_script || return 1
@@ -17292,7 +17473,17 @@ EOF
         || { error "自动刷新启用失败"; return 1; }
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_refresh_timer_disable() {
+    local RC
+    txn_write_begin "停用域名目标刷新" || return 1
+    nft_refresh_timer_disable_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_refresh_timer_disable_locked() {
     systemd_available && systemctl disable --now quench-nft-target-refresh.timer >/dev/null 2>&1 || true
     rm -f "$NFT_REFRESH_TIMER_FILE" "$NFT_REFRESH_SERVICE_FILE"
     systemd_available && systemctl daemon-reload >/dev/null 2>&1 || true
@@ -17356,7 +17547,17 @@ nft_reapply() {
     return "$rc"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_clear_all_rules() {
+    local RC
+    txn_write_begin "清空转发规则" || return 1
+    nft_clear_all_rules_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_clear_all_rules_locked() {
     local rules_backup access_backup confirm
     warn "这会删除 Quench 管理的全部线路转发规则"
     read -rp "  输入 CLEAR 确认: " confirm
@@ -17391,7 +17592,17 @@ nft_remove_services() {
     rm -f "$NFT_OPENRC_FILE" "$NFT_APPLY_HELPER"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_uninstall() {
+    local RC
+    txn_write_begin "卸载端口转发" || return 1
+    nft_uninstall_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_uninstall_locked() {
     local confirm family table cleanup_failed=0
     print_header "卸载 Quench 线路转发模块"
     warn "只删除 Quench 自己的规则、服务和参数；不会卸载 nftables 或清空其他规则"

@@ -215,7 +215,8 @@ first_run_ssh_baseline_apply() {
     local CANDIDATE BASE_SUM
     CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
-    BASE_SUM=$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)
+    BASE_SUM=$(file_sha256 "$CANDIDATE" 2>/dev/null || true)
+    [ -n "$BASE_SUM" ] || { rm -f "$CANDIDATE"; error "无法计算配置基准哈希，拒绝应用"; return 1; }
     first_run_ssh_baseline_render "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
     if ! confirm_file_diff "$SSHD_CONFIG" "$CANDIDATE" "SSH 基础加固"; then
         rm -f "$CANDIDATE"

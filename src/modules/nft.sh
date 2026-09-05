@@ -1020,7 +1020,17 @@ nft_restore_snapshot() {
     nft_reconcile >/dev/null 2>&1 || true
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_add_rule() {
+    local RC
+    txn_write_begin "添加转发规则" || return 1
+    nft_add_rule_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_add_rule_locked() {
     local kind="$1" id lip family proto ls le thost ttype tip ts te map_mode snat acl comment count
     local rules_backup access_backup choice confirm
     print_header "添加线路机 → 落地机转发"
@@ -1125,7 +1135,17 @@ nft_add_rule() {
     rm -f "$rules_backup" "$access_backup"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_edit_rule() {
+    local RC
+    txn_write_begin "编辑转发规则" || return 1
+    nft_edit_rule_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_edit_rule_locked() {
     local id rid family proto lip ls le ttype thost tip ts te mode snat acl enabled comment
     local value old_family new_family new_ttype count record rules_backup access_backup confirm
     print_header "修改线路转发规则"
@@ -1224,7 +1244,17 @@ nft_edit_rule() {
     nft_lock_release; rm -f "$rules_backup" "$access_backup"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_delete_rule() {
+    local RC
+    txn_write_begin "删除转发规则" || return 1
+    nft_delete_rule_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_delete_rule_locked() {
     local id rules_backup access_backup confirm
     print_header "删除线路转发规则"
     nft_list_rules || { warn "暂无规则"; return; }
@@ -1299,7 +1329,17 @@ nft_replace_access_for_rule() {
     return "$rc"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_edit_access() {
+    local RC
+    txn_write_begin "编辑转发访问控制" || return 1
+    nft_edit_access_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_edit_access_locked() {
     local id rid family proto lip ls le ttype thost tip ts te mode snat acl enabled comment record
     local rules_backup access_backup
     print_header "修改规则访问名单"
@@ -1332,7 +1372,17 @@ nft_edit_access() {
     nft_lock_release; rm -f "$rules_backup" "$access_backup"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_refresh_domain_targets() {
+    local RC
+    txn_write_begin "刷新域名目标" || return 1
+    nft_refresh_domain_targets_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_refresh_domain_targets_locked() {
     local tmp rules_backup access_backup changed=0 domains=0
     local id family proto lip ls le ttype thost tip ts te mode snat acl enabled comment new_ip
     nft_ensure_state_dir || return 1
@@ -1394,7 +1444,17 @@ nft_refresh_timer_status() {
         && echo active || echo inactive
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_refresh_timer_enable() {
+    local RC
+    txn_write_begin "启用域名目标刷新" || return 1
+    nft_refresh_timer_enable_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_refresh_timer_enable_locked() {
     local interval tmp
     systemd_available || { error "自动刷新当前仅支持 systemd"; return 1; }
     nft_ensure_runtime_script || return 1
@@ -1434,7 +1494,17 @@ EOF
         || { error "自动刷新启用失败"; return 1; }
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_refresh_timer_disable() {
+    local RC
+    txn_write_begin "停用域名目标刷新" || return 1
+    nft_refresh_timer_disable_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_refresh_timer_disable_locked() {
     systemd_available && systemctl disable --now quench-nft-target-refresh.timer >/dev/null 2>&1 || true
     rm -f "$NFT_REFRESH_TIMER_FILE" "$NFT_REFRESH_SERVICE_FILE"
     systemd_available && systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1498,7 +1568,17 @@ nft_reapply() {
     return "$rc"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_clear_all_rules() {
+    local RC
+    txn_write_begin "清空转发规则" || return 1
+    nft_clear_all_rules_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_clear_all_rules_locked() {
     local rules_backup access_backup confirm
     warn "这会删除 Quench 管理的全部线路转发规则"
     read -rp "  输入 CLEAR 确认: " confirm
@@ -1533,7 +1613,17 @@ nft_remove_services() {
     rm -f "$NFT_OPENRC_FILE" "$NFT_APPLY_HELPER"
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 nft_uninstall() {
+    local RC
+    txn_write_begin "卸载端口转发" || return 1
+    nft_uninstall_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+nft_uninstall_locked() {
     local confirm family table cleanup_failed=0
     print_header "卸载 Quench 线路转发模块"
     warn "只删除 Quench 自己的规则、服务和参数；不会卸载 nftables 或清空其他规则"

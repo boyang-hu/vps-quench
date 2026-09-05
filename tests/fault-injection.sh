@@ -1217,6 +1217,7 @@ if self_resolve_script_source /dev/fd/0 >/dev/null 2>&1; then
 fi
 BROKEN_LINK_TARGET="$TMP/removed-script.sh"
 rm -f "$LOCAL_BIN_DIR/v"
+mkdir -p "$LOCAL_BIN_DIR"   # 顶层夹具，不能依赖前一个用例（可能被 QUENCH_TEST_FILTER 跳过）建目录
 ln -s "$BROKEN_LINK_TARGET" "$LOCAL_BIN_DIR/v"
 self_install_shortcut v >/dev/null
 t_fitop_012() {
@@ -2453,5 +2454,234 @@ t_review_005() {
     :
 }
 run_test "Entering and leaving the BBR menu applies nothing" t_review_005
+
+# 6. 回滚快照覆盖的资源，其它模块的写入入口必须走事务锁：有未确认的回滚时一律拒绝。
+#    每个入口的 _locked 实体换成“写见证文件”，外壳被去掉时见证文件就会出现。
+t_review_006() {
+    review_setup cross_module_writers
+    safety_arm dns >/dev/null 2>&1 || { echo "could not arm the DNS transaction" >&2; exit 1; }
+    for FN in bbr_apply_sysctl nft_add_rule nft_delete_rule nft_edit_rule nft_edit_access nft_clear_all_rules \
+              nft_uninstall nft_refresh_timer_enable nft_refresh_timer_disable nft_refresh_domain_targets \
+              system_hostname_apply system_enable_auto_security_updates f2b_edit_config caddy_install; do
+        eval "${FN}_locked() { : > \"$PROBE/witness-$FN\"; }"
+        RC=0
+        "$FN" dummy-arg >/dev/null 2>&1 || RC=$?
+        [ "$RC" -ne 0 ] || { echo "$FN ran while a rollback was armed" >&2; exit 1; }
+        [ ! -e "$PROBE/witness-$FN" ] || { echo "$FN reached its body while a rollback was armed" >&2; exit 1; }
+    done
+    :
+}
+run_test "Every writer of a snapshot-covered path is refused while a rollback is armed" t_review_006
+
+# 7. 快照里没有的根，回滚时要删掉；删不掉必须计入 RC，脚本不能自删。
+t_review_007() {
+    review_setup remove_failure
+    SAFETY_DELAY_SECONDS=1
+    config_backup_allowed_roots | grep -qx 'etc/hostname' || { echo "etc/hostname is not a snapshot root" >&2; exit 1; }
+    safety_arm dns >/dev/null 2>&1 || { echo "could not arm the DNS transaction" >&2; exit 1; }
+    printf 'added-after-snapshot\n' > "$CONFIG_RESTORE_ROOT/etc/hostname"
+    mkdir -p "$PROBE/shim"
+    printf '#!/bin/bash\nfor A in "$@"; do [ "$A" != "$QUENCH_TEST_RM_DENY" ] || exit 1; done\nexec /bin/rm "$@"\n' > "$PROBE/shim/rm"
+    chmod +x "$PROBE/shim/rm"
+    RC=0
+    QUENCH_TEST_RM_DENY="$CONFIG_RESTORE_ROOT/etc/hostname" PATH="$PROBE/shim:$PATH" bash "$SAFETY_SCRIPT" >/dev/null 2>&1 || RC=$?
+    [ -f "$CONFIG_RESTORE_ROOT/etc/hostname" ] || { echo "the rm shim did not hold" >&2; exit 1; }
+    [ "$RC" -ne 0 ] || { echo "a failed removal was reported as a successful rollback" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT" ] || { echo "the script deleted itself after a failed removal" >&2; exit 1; }
+    [ ! -e "${SAFETY_SCRIPT}.restoring" ] || { echo "the restore-phase marker was left behind" >&2; exit 1; }
+    [ -f "${SAFETY_SCRIPT}.failed" ] || { echo "the failed rollback left no .failed marker" >&2; exit 1; }
+    :
+}
+run_test "A root that cannot be removed fails the rollback and keeps the script" t_review_007
+
+# 8. 回滚一旦进入恢复阶段就不能被取消：确认动作必须等它做完，并如实报告“已回滚”。
+#    mv 换成会在覆盖 sshd_config 时停住的垫片，在停住期间发起确认。
+t_review_008() {
+    REAL_STOP=$(declare -f safety_stop_timer_process)
+    review_setup cancel_during_restore
+    SAFETY_DELAY_SECONDS=1
+    mkdir -p "$PROBE/shim"
+    cat > "$PROBE/shim/mv" <<'SHIM'
+#!/bin/bash
+LAST=""
+for A in "$@"; do LAST="$A"; done
+if [ "$LAST" = "$QUENCH_TEST_MV_TARGET" ]; then
+    : > "$QUENCH_TEST_MV_BARRIER"
+    I=0
+    # 父进程（回滚脚本）被杀就跟着退出：不能让孤儿垫片替它把恢复做完
+    while [ ! -e "$QUENCH_TEST_MV_GO" ] && [ "$I" -lt 300 ]; do
+        kill -0 "$PPID" 2>/dev/null || exit 1
+        sleep 0.1; I=$((I + 1))
+    done
+fi
+exec /bin/mv "$@"
+SHIM
+    chmod +x "$PROBE/shim/mv"
+    export QUENCH_TEST_MV_TARGET="$SSHD_CONFIG" QUENCH_TEST_MV_BARRIER="$PROBE/barrier" QUENCH_TEST_MV_GO="$PROBE/go"
+    # shellcheck disable=SC2329 # review fixture: a real background timer running with the mv shim
+    safety_launch_timer() {
+        SAFETY_PID=""; SAFETY_UNIT=""; SAFETY_SCRIPT=""
+        [ -f "$1" ] || return 1
+        PATH="$PROBE/shim:$PATH" nohup bash "$1" >/dev/null 2>&1 &
+        SAFETY_PID=$!; SAFETY_SCRIPT="$1"
+    }
+    eval "$REAL_STOP"
+    QUENCH_RESTORE_WAIT=15
+    safety_arm ssh >/dev/null 2>&1 || { echo "could not arm the SSH transaction" >&2; exit 1; }
+    printf 'Port 2222\n' > "$SSHD_CONFIG"
+    I=0
+    while [ ! -e "$PROBE/barrier" ] && [ "$I" -lt 100 ]; do sleep 0.1; I=$((I + 1)); done
+    [ -e "$PROBE/barrier" ] || { echo "the rollback never reached the sshd_config restore" >&2; exit 1; }
+    # 停在覆盖 sshd_config 的那一刻：主路径必须仍然存在（单次 rename，没有“先挪走”的窗口）
+    [ -f "$SSHD_CONFIG" ] || { echo "sshd_config vanished mid-restore: the file replace is not a single rename" >&2; exit 1; }
+    # 恢复阶段收到 TERM（另一会话的 stop、systemctl stop）必须被忽略，恢复要跑完
+    kill -TERM "$SAFETY_PID" 2>/dev/null || true
+    ( sleep 5; : > "$PROBE/go" ) &
+    RC=0
+    safety_confirm <<< 'y' >/dev/null 2>&1 || RC=$?
+    wait 2>/dev/null || true
+    [ "$RC" -ne 0 ] || { echo "confirming during the restore phase reported success" >&2; exit 1; }
+    [ -f "$SSHD_CONFIG" ] || { echo "sshd_config is missing after the interrupted restore" >&2; exit 1; }
+    grep -qx 'Port 22' "$SSHD_CONFIG" && ! grep -q 'Port 2222' "$SSHD_CONFIG" \
+        || { echo "sshd_config is neither restored nor intact: $(cat "$SSHD_CONFIG")" >&2; exit 1; }
+    [ ! -e "$SSHD_CONFIG.quench-old" ] && [ ! -e "$SSHD_CONFIG.quench-new" ] \
+        || { echo "restore leftovers remain next to sshd_config" >&2; exit 1; }
+    [ -z "$(find "$QUENCH_DATA_DIR" -name '*.restoring' 2>/dev/null)" ] \
+        || { echo "the restore-phase marker was left behind" >&2; exit 1; }
+    :
+}
+run_test "Cancelling during the restore phase waits for it and reports the rollback" t_review_008
+
+# 10. 停止计时器：进程已进入恢复阶段（有 .restoring 标记）时只能等它自己结束，绝不 SIGKILL。
+#     用一个不是本 shell 子进程、且忽略 TERM 的进程模拟（子进程会被 wait 挡住，测不到 SIGKILL 分支）。
+t_review_010() {
+    REAL_STOP=$(declare -f safety_stop_timer_process)
+    review_setup stop_during_restore
+    eval "$REAL_STOP"
+    QUENCH_RESTORE_WAIT=15
+    SCRIPT="$PROBE/rollback.sh"; : > "$SCRIPT"; : > "$SCRIPT.restoring"
+    ( bash -c 'trap "" TERM; sleep 6; : > "$1"' _ "$PROBE/done" >/dev/null 2>&1 & echo $! > "$PROBE/pid" )
+    PID=$(cat "$PROBE/pid")
+    RC=0
+    safety_stop_timer_process "" "$PID" "$SCRIPT" || RC=$?
+    [ "$RC" -eq 0 ] || { echo "stop returned $RC for a process that finished on its own" >&2; exit 1; }
+    [ -e "$PROBE/done" ] || { echo "the restoring process was killed instead of waited for" >&2; exit 1; }
+    # 没有标记 = 还在倒计时：照旧可以强制停止
+    rm -f "$SCRIPT.restoring" "$PROBE/done"
+    ( bash -c 'trap "" TERM; sleep 6; : > "$1"' _ "$PROBE/done" >/dev/null 2>&1 & echo $! > "$PROBE/pid" )
+    PID=$(cat "$PROBE/pid")
+    RC=0
+    safety_stop_timer_process "" "$PID" "$SCRIPT" || RC=$?
+    [ "$RC" -eq 0 ] || { echo "stop returned $RC for a countdown process" >&2; exit 1; }
+    kill -0 "$PID" 2>/dev/null && { echo "a countdown process that ignores TERM was not force-stopped" >&2; exit 1; }
+    :
+}
+run_test "Stopping a timer that is already restoring waits instead of killing it" t_review_010
+
+# 11. 取消动作按事务状态分支：恢复中 -> 等完并报告已回滚；停止时恰好回滚完成 -> 报告已回滚；
+#     恢复执行过但失败 -> 拒绝“取消”，材料保留。
+t_review_011() {
+    review_setup cancel_states
+    QUENCH_RESTORE_WAIT=15
+    SAFETY_SCRIPT="$PROBE/rollback.sh"; : > "$SAFETY_SCRIPT"; : > "$SAFETY_SCRIPT.restoring"
+    # shellcheck disable=SC2329 # review fixture: stopping while restoring must never happen
+    safety_stop_timer_process() { : > "$PROBE/witness-stop"; return 0; }
+    ( sleep 2; rm -f "$SAFETY_SCRIPT.restoring" "$SAFETY_SCRIPT" ) &
+    RC=0
+    cancel_safety_timer >/dev/null 2>&1 || RC=$?
+    wait 2>/dev/null || true
+    [ "$RC" -eq 2 ] || { echo "cancelling during a restore returned $RC, expected 2 (rolled back)" >&2; exit 1; }
+    [ ! -e "$PROBE/witness-stop" ] || { echo "the timer was stopped while the restore was running" >&2; exit 1; }
+    SAFETY_SCRIPT="$PROBE/rollback2.sh"; : > "$SAFETY_SCRIPT"
+    # shellcheck disable=SC2329 # review fixture: the rollback completes while we are stopping it
+    safety_stop_timer_process() { rm -f "$SAFETY_SCRIPT"; return 0; }
+    RC=0
+    cancel_safety_timer >/dev/null 2>&1 || RC=$?
+    [ "$RC" -eq 2 ] || { echo "a rollback that completed during stop was reported as $RC, expected 2" >&2; exit 1; }
+    SAFETY_SCRIPT="$PROBE/rollback3.sh"; : > "$SAFETY_SCRIPT"; : > "$SAFETY_SCRIPT.failed"
+    # shellcheck disable=SC2329 # review fixture: nothing left to stop
+    safety_stop_timer_process() { return 0; }
+    RC=0
+    cancel_safety_timer >/dev/null 2>&1 || RC=$?
+    [ "$RC" -eq 1 ] || { echo "a failed rollback was reported as $RC, expected 1" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT" ] || { echo "the failed rollback's script was deleted" >&2; exit 1; }
+    :
+}
+run_test "Cancel distinguishes restoring, rolled back and failed transactions" t_review_011
+
+# 12. 首次开荒的 SSH 基线与 ssh_apply_policy 同源：基准哈希取自未改动的候选副本，且不可缺席。
+t_review_012() {
+    review_setup onboarding_hash_gap
+    # shellcheck disable=SC2329 # review fixture stubs
+    first_run_ssh_baseline_ready() { return 1; }
+    # shellcheck disable=SC2329 # review fixture: satisfy command -v sshd
+    sshd() { :; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    print_header() { :; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    confirm_file_diff() { return 0; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    backup_config() { return 0; }
+    # shellcheck disable=SC2329 # review fixture: reaching the replace means the stale candidate won
+    atomic_replace_file() { : > "$PROBE/witness-replace"; return 1; }
+    # shellcheck disable=SC2329 # review fixture: a concurrent write between cp and the hash
+    cp() {
+        command cp "$@"
+        if [ "$1" = "$SSHD_CONFIG" ] && [ ! -e "$PROBE/raced" ]; then
+            : > "$PROBE/raced"; printf 'Port 2222\n' >> "$SSHD_CONFIG"
+        fi
+    }
+    RC=0
+    first_run_ssh_baseline_apply >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "the baseline was applied over a concurrently modified sshd_config" >&2; exit 1; }
+    [ ! -e "$PROBE/witness-replace" ] || { echo "the stale candidate was written over the concurrent change" >&2; exit 1; }
+    grep -q '^Port 2222$' "$SSHD_CONFIG" || { echo "the concurrent change was lost" >&2; exit 1; }
+    unset -f cp
+    # shellcheck disable=SC2329 # review fixture: hashing is unavailable
+    file_sha256() { return 1; }
+    RC=0
+    first_run_ssh_baseline_apply >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "the baseline was applied without a baseline hash" >&2; exit 1; }
+    [ ! -e "$PROBE/witness-replace" ] || { echo "the baseline was written without a baseline hash" >&2; exit 1; }
+    :
+}
+run_test "The onboarding SSH baseline hash comes from the untouched candidate" t_review_012
+
+# 9. SSH 策略的基准哈希必须取自尚未改动的候选副本：在“复制”和“算哈希”之间落地的
+#    另一笔写入，旧做法会把它算进基准，核对形同虚设，然后被旧候选原样覆盖掉。
+t_review_009() {
+    review_setup ssh_hash_gap
+    # shellcheck disable=SC2329 # review fixture stubs
+    confirm_file_diff() { return 0; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    backup_config() { return 0; }
+    # shellcheck disable=SC2329 # review fixture: reaching the replace means the stale candidate won
+    atomic_replace_file() { : > "$PROBE/witness-replace"; return 1; }
+    # 第一次复制 sshd_config 之后立刻模拟另一会话写入
+    # shellcheck disable=SC2329 # review fixture: a concurrent write between cp and the hash
+    cp() {
+        command cp "$@"
+        if [ "$1" = "$SSHD_CONFIG" ] && [ ! -e "$PROBE/raced" ]; then
+            : > "$PROBE/raced"; printf 'Port 2222\n' >> "$SSHD_CONFIG"
+        fi
+    }
+    RC=0
+    ssh_apply_policy "策略" no no yes prohibit-password >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "applying over a concurrently modified sshd_config reported success" >&2; exit 1; }
+    [ ! -e "$PROBE/witness-replace" ] || { echo "the stale candidate was written over the concurrent change" >&2; exit 1; }
+    grep -q '^Port 2222$' "$SSHD_CONFIG" || { echo "the concurrent change was lost" >&2; exit 1; }
+    # 算不出基准就必须拒绝，而不是拿空串去核对
+    unset -f cp
+    # shellcheck disable=SC2329 # review fixture: hashing is unavailable
+    file_sha256() { return 1; }
+    RC=0
+    ssh_apply_policy "策略" no no yes prohibit-password >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "applying without a baseline hash reported success" >&2; exit 1; }
+    [ ! -e "$PROBE/witness-replace" ] || { echo "the policy was written without a baseline hash" >&2; exit 1; }
+    :
+}
+run_test "The SSH baseline hash comes from the untouched candidate and is mandatory" t_review_009
+
+
 
 test_summary "Fault injection"

@@ -2,7 +2,7 @@
 # 由 build.sh 从 src/ 生成；请修改模块源码后重新构建发行脚本。
 
 # ============================================================
-#  Quench V0.1.2 — VPS 初始化与管理工具
+#  Quench V0.1.3 — VPS 初始化与管理工具
 #  作者：Boyang
 #
 #  项目说明：
@@ -12,6 +12,7 @@
 #  - 支持配置备份、操作审计、离线安装、完整性校验和脚本自更新
 #
 #  发布版本：
+#  V0.1.3: 回滚事务状态明确化：回滚脚本进入恢复阶段后留下 .restoring 标记并忽略 TERM/INT，取消与停止在恢复阶段只等待不打断，systemd 计时器单元设 SendSIGKILL=no；恢复执行失败留下 .failed 标记，确认时不再当作“已取消”删掉材料；普通文件回滚改为单次 rename 覆盖，快照外的根删除失败计入回滚结果；BBR 内核参数、端口转发规则与服务、hostname、自动安全更新、Fail2ban 编辑、Caddy 安装接入事务锁；SSH 策略与首次开荒基线的基准哈希改为取自未改动的候选副本，算不出即拒绝。
 #  V0.1.2: 安全回滚收口：自动回滚改为与配置导入一致的精确恢复（事务新增的文件回滚时删除）；Caddy 写入接入事务锁；SSH 策略与首次开荒基线在取锁后核对原文件未被改动；确认输入前计时器已到期时如实报告已回滚而非“已取消”；BBR 子菜单入口不再自动应用保存的限速。
 #  V0.1.1: 安全回滚与事务修复：回滚计时器改用 system 级 transient unit，取消/回滚前确认计时器已停，恢复未验证时保留安全网；事务锁覆盖全部写入路径并在无 flock 时退回 mkdir 锁，遗留事务落盘并阻断新变更；配置恢复改为原子替换与精确目录恢复；兼容 busybox（flock 无 -w、构建 SIGPIPE）；中文列宽在 bash 4+ 上修正；测试改为具名用例。
 #  V0.1.0: 首个完整版本，提供 VPS 初始化、安全接管、网络调优与日常服务管理
@@ -380,8 +381,12 @@ safety_launch_timer() {
     if systemd_available && command -v systemd-run >/dev/null 2>&1; then
         UNIT="quench-rollback-$$-$(date +%s)-${RANDOM}"
         # --collect 需要 systemd 236+，不支持时退回不带该参数的写法。
-        if systemd-run --quiet --collect --unit="$UNIT" /bin/bash "$SCRIPT" >/dev/null 2>&1 \
-            || systemd-run --quiet --unit="$UNIT" /bin/bash "$SCRIPT" >/dev/null 2>&1; then
+        # SendSIGKILL=no + 足够长的 TimeoutStopSec：脚本进入恢复阶段后会忽略 TERM，
+        # systemctl stop 必须等它自己跑完，而不是超时后 SIGKILL 打断恢复。
+        if systemd-run --quiet --collect --unit="$UNIT" \
+                --property=SendSIGKILL=no --property=TimeoutStopSec=300 /bin/bash "$SCRIPT" >/dev/null 2>&1 \
+            || systemd-run --quiet --unit="$UNIT" \
+                --property=SendSIGKILL=no --property=TimeoutStopSec=300 /bin/bash "$SCRIPT" >/dev/null 2>&1; then
             SAFETY_UNIT="$UNIT"
             SAFETY_SCRIPT="$SCRIPT"
             return 0
@@ -516,7 +521,7 @@ vis_len() {
 BOX_W=64
 UI_COMPACT=0
 APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
-APP_VERSION="V0.1.2"
+APP_VERSION="V0.1.3"
 APP_AUTHOR="Boyang"
 
 # 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、

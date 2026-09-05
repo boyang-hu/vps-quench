@@ -234,7 +234,10 @@ ssh_apply_policy() {
     local LABEL="$1" PASSWORD="$2" KEYBOARD="$3" PUBKEY="$4" ROOT_LOGIN="$5" CANDIDATE APPLY_RC BASE_SUM
     CANDIDATE=$(quench_mktemp) || return 1
     cp "$SSHD_CONFIG" "$CANDIDATE" || { rm -f "$CANDIDATE"; return 1; }
-    BASE_SUM=$(file_sha256 "$SSHD_CONFIG" 2>/dev/null || true)
+    # 基准必须来自这份尚未改动的候选副本：对实时原文件算哈希，在“复制”和“算哈希”
+    # 之间完成的另一笔写入会让基准等于新内容，核对就形同虚设。
+    BASE_SUM=$(file_sha256 "$CANDIDATE" 2>/dev/null || true)
+    [ -n "$BASE_SUM" ] || { rm -f "$CANDIDATE"; error "无法计算配置基准哈希，拒绝应用"; return 1; }
     set_config_file "$CANDIDATE" PasswordAuthentication "$PASSWORD"
     set_config_file "$CANDIDATE" KbdInteractiveAuthentication "$KEYBOARD"
     set_config_file "$CANDIDATE" PubkeyAuthentication "$PUBKEY"

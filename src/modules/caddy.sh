@@ -611,7 +611,17 @@ caddy_post_install() {
     fi
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 caddy_install() {
+    local RC
+    txn_write_begin "安装 Caddy" || return 1
+    caddy_install_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+caddy_install_locked() {
     local MODE="${1:-install}" METHOD BIN_BACKUP="" WAS_ACTIVE=false HAD_CONFIG=false REPLACE_FRESH=false
     print_header "安装 / 更新 Caddy"
     [ -e "$CADDYFILE" ] && HAD_CONFIG=true

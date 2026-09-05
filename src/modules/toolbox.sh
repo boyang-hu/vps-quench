@@ -139,8 +139,11 @@ config_backup_prune() {
 # 之前这里把 systemctl stop / kill 的失败一律 || true 吞掉，调用方随后无条件
 # 删除脚本与句柄，于是界面显示“已取消”，后台却仍会在倒计时结束后回滚。
 # 参数可选，便于回滚中心停止别的会话留下的计时器。
+# 第三个参数是回滚脚本路径（默认本会话的）：存在 <脚本>.restoring 说明它已进入恢复阶段，
+# 这时只能等它自己跑完，绝不能 SIGKILL——杀在两次 mv 之间就是半成品配置。
 safety_stop_timer_process() {
-    local UNIT="${1-${SAFETY_UNIT:-}}" PID="${2-${SAFETY_PID:-}}" I STATE
+    local UNIT="${1-${SAFETY_UNIT:-}}" PID="${2-${SAFETY_PID:-}}" SCRIPT="${3-${SAFETY_SCRIPT:-}}" I STATE
+    local MARKER="${SCRIPT:+${SCRIPT}.restoring}"
     if [ -n "$UNIT" ]; then
         command -v systemctl >/dev/null 2>&1 || return 1
         systemctl stop "$UNIT" >/dev/null 2>&1 || true
@@ -171,6 +174,14 @@ safety_stop_timer_process() {
             kill -0 "$PID" 2>/dev/null || return 0
             sleep 1
         done
+        if [ -n "$MARKER" ] && [ -f "$MARKER" ]; then
+            # 已在恢复阶段：等它做完（默认最多 120 秒），不发 SIGKILL
+            for I in $(seq 1 "${QUENCH_RESTORE_WAIT:-120}"); do
+                kill -0 "$PID" 2>/dev/null || return 0
+                sleep 1
+            done
+            return 1
+        fi
         kill -9 "$PID" 2>/dev/null || true
         sleep 1
         kill -0 "$PID" 2>/dev/null && return 1
@@ -188,7 +199,27 @@ safety_timer_pending() {
 # 只有确认计时器已停止，才能删除回滚脚本、事务记录并释放锁。
 # 停不掉就如实报错并把全部回滚材料留在原地，让上层据此决定后续动作。
 # 返回值：0 = 已取消；1 = 停不掉，材料保留；2 = 回滚已经执行（脚本自删），无可取消。
+# 四种事务状态：倒计时中（可取消）、恢复中（不可取消，等它完成）、已回滚（脚本自删）、
+# 恢复失败（脚本保留并留下 .failed）。最后一种绝不能当成“取消成功”把材料删掉。
 cancel_safety_timer() {
+    local I
+    if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "${SAFETY_SCRIPT}.restoring" ]; then
+        warn "自动回滚正在执行，无法取消；等待它完成..."
+        for I in $(seq 1 "${QUENCH_RESTORE_WAIT:-120}"); do
+            [ -f "${SAFETY_SCRIPT}.restoring" ] || break
+            sleep 1
+        done
+        if [ -f "${SAFETY_SCRIPT}.restoring" ]; then
+            error "自动回滚仍在执行，未能等到结束；回滚材料全部保留"
+            return 1
+        fi
+    fi
+    if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ] && [ -f "${SAFETY_SCRIPT}.failed" ]; then
+        error "自动回滚已执行但未成功，配置可能处于中间状态；回滚脚本与事务记录已保留：$SAFETY_SCRIPT"
+        error "请在回滚中心手动重新执行，或人工核对配置"
+        audit_action "自动回滚执行失败，等待人工处理" FAILED
+        return 1
+    fi
     if [ -n "${SAFETY_SCRIPT:-}" ] && [ ! -f "$SAFETY_SCRIPT" ]; then
         # 脚本只会在回滚成功后自删：走到这里说明倒计时已到期并已恢复配置。
         # 此时报“已取消”会让用户以为新配置保住了。
@@ -203,6 +234,19 @@ cancel_safety_timer() {
             error "回滚脚本与事务记录已保留：$SAFETY_SCRIPT"
             error "它仍可能在倒计时结束后恢复配置，请立即人工确认"
             audit_action "取消自动回滚失败，计时器仍在运行" FAILED
+            return 1
+        fi
+        # 停止请求与“进入恢复阶段”可能交错：停下来之后重新核对。
+        # 脚本已自删 = 恢复已经执行完；脚本还在但留有阶段标记 = 恢复失败，材料保留。
+        if [ ! -f "$SAFETY_SCRIPT" ]; then
+            SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+            txn_record_end
+            txn_lock_release
+            return 2
+        fi
+        if [ -f "${SAFETY_SCRIPT}.restoring" ] || [ -f "${SAFETY_SCRIPT}.failed" ]; then
+            error "自动回滚已执行但未成功，配置可能处于中间状态；回滚脚本与事务记录已保留：$SAFETY_SCRIPT"
+            audit_action "自动回滚执行失败，等待人工处理" FAILED
             return 1
         fi
     fi
@@ -527,7 +571,7 @@ txn_review_menu() {
                 # 必须先停掉这笔事务自己的计时器：否则脚本会被执行两次——
                 # 一次是现在手动跑，一次是原 unit 倒计时到期后自己跑。
                 if ! safety_stop_timer_process \
-                    "$(txn_record_field "$FILE" UNIT)" "$(txn_record_field "$FILE" TIMER_PID)"; then
+                    "$(txn_record_field "$FILE" UNIT)" "$(txn_record_field "$FILE" TIMER_PID)" "$SCRIPT"; then
                     error "无法停止该记录的回滚计时器，拒绝手动执行以免回滚两次"
                     ui_pause
                     continue
@@ -616,7 +660,7 @@ safety_arm_locked() {
     local LABEL="$1" SNAP SCRIPT UFW_STATE="inactive" FIREWALLD_STATE="inactive"
     local DELAY="${SAFETY_DELAY_SECONDS:-180}" RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     local RESOLV_IMMUTABLE="inactive" PATH_VALUE TARGET ROOTS_Q="" ROOT_ITEM ROOT_ITEM_Q
-    local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q
+    local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q MARKER_Q FAILED_Q
     shift
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
     if safety_timer_pending; then
@@ -651,6 +695,8 @@ safety_arm_locked() {
     if [ "$RESTORE_ROOT" = / ]; then TARGET=/etc/resolv.conf; else TARGET="${RESTORE_ROOT%/}/etc/resolv.conf"; fi
     printf -v SNAP_Q '%q' "$SNAP"
     printf -v SCRIPT_Q '%q' "$SCRIPT"
+    printf -v MARKER_Q '%q' "${SCRIPT}.restoring"
+    printf -v FAILED_Q '%q' "${SCRIPT}.failed"
     printf -v ROOT_Q '%q' "$RESTORE_ROOT"
     printf -v LABEL_Q '%q' "$LABEL"
     printf -v RESOLV_Q '%q' "$TARGET"
@@ -668,6 +714,12 @@ if [ "\${1:-}" != --now ]; then
     wait "\$ROLLBACK_SLEEP_PID" || exit 0
 fi
 trap - TERM INT
+# ── 进入恢复阶段。从这里起不再接受取消：TERM/INT 一律忽略，并留下阶段标记，
+# 调用方看到标记就知道“正在恢复”而不是“正在倒计时”。之前只区分脚本在不在，
+# 取消操作会把恢复到一半的脚本杀掉，留下主路径缺失、旧文件停在 .quench-old 的半成品。
+trap '' TERM INT
+: > $MARKER_Q
+rm -f $FAILED_Q
 chattr -i $RESOLV_Q >/dev/null 2>&1 || true
 # 精确恢复，与配置导入同一语义。原来是 tar -xzf 直接解压合并：快照之后新增的文件
 # （例如导入带来的 sshd_config.d/99-deny.conf）会留下，回滚后的状态并不等于快照。
@@ -682,21 +734,29 @@ for ROOT in $ROOTS_Q; do
     if [ -e "\$SRC" ] || [ -L "\$SRC" ]; then
         mkdir -p "\$(dirname "\$DEST")" || { RC=1; continue; }
         rm -rf "\$DEST.quench-new" "\$DEST.quench-old"
-        if [ -d "\$SRC" ] && [ ! -L "\$SRC" ]; then cp -a "\$SRC" "\$DEST.quench-new" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }
-        else cp -a "\$SRC" "\$DEST.quench-new" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
-        fi
-        if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then mv "\$DEST" "\$DEST.quench-old" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }; fi
-        if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old"
-        else [ ! -e "\$DEST.quench-old" ] || mv "\$DEST.quench-old" "\$DEST"; rm -rf "\$DEST.quench-new"; RC=1
+        if [ -d "\$SRC" ] && [ ! -L "\$SRC" ]; then
+            # 目录不能 rename 覆盖，只能两步：复制好 -> 挪走旧的 -> 换上新的
+            cp -a "\$SRC" "\$DEST.quench-new" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }
+            if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then mv "\$DEST" "\$DEST.quench-old" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }; fi
+            if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old"
+            else [ ! -e "\$DEST.quench-old" ] || mv "\$DEST.quench-old" "\$DEST"; rm -rf "\$DEST.quench-new"; RC=1
+            fi
+        else
+            # 普通文件：同目录一次 rename 直接覆盖，主路径任何时刻都存在
+            cp -a "\$SRC" "\$DEST.quench-new" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
+            mv -f "\$DEST.quench-new" "\$DEST" || { rm -f "\$DEST.quench-new"; RC=1; }
         fi
     else
-        rm -rf "\$DEST"
+        # 快照里没有 = 快照时不存在；删不掉就没有恢复到快照状态，必须计入
+        rm -rf "\$DEST" || RC=1
+        if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then RC=1; fi
     fi
 done
 rm -rf "\$STAGE"
 if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
 if [ $ROOT_Q != / ]; then
-    if [ "\$RC" -eq 0 ]; then rm -f $SCRIPT_Q; fi
+    rm -f $MARKER_Q
+    if [ "\$RC" -eq 0 ]; then rm -f $SCRIPT_Q; else : > $FAILED_Q; fi
     exit "\$RC"
 fi
 # RC 汇总必要步骤的结果（延续上面文件恢复的结果）。原来这些全是 || true，任何一步
@@ -736,10 +796,12 @@ fi
 if [ -x /usr/local/libexec/quench-nft-forward-apply ]; then
     /usr/local/libexec/quench-nft-forward-apply >/dev/null 2>&1 || RC=1
 fi
+rm -f $MARKER_Q
 if [ "\$RC" -eq 0 ]; then
     logger -t quench "未确认连接，已自动恢复 $LABEL_Q 配置"
     rm -f $SCRIPT_Q
 else
+    : > $FAILED_Q
     logger -t quench "自动恢复过程中有步骤失败，回滚脚本已保留：$SCRIPT_Q"
 fi
 exit "\$RC"
@@ -1081,7 +1143,17 @@ system_hostname_sync_hosts() {
     fi
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 system_hostname_apply() {
+    local RC
+    txn_write_begin "修改 hostname" || return 1
+    system_hostname_apply_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+system_hostname_apply_locked() {
     local OLD_NAME NEW_NAME
     OLD_NAME=$(system_hostname_current)
     print_header "修改系统 Hostname"
@@ -1162,7 +1234,17 @@ system_auto_updates_enabled() {
     esac
 }
 
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 system_enable_auto_security_updates() {
+    local RC
+    txn_write_begin "启用自动安全更新" || return 1
+    system_enable_auto_security_updates_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+system_enable_auto_security_updates_locked() {
     local PM PERIODIC REBOOT_CFG DNF_CFG TMP1 TMP2
     PM=$(system_package_manager)
     PERIODIC="${QUENCH_APT_AUTO_UPGRADES_FILE:-/etc/apt/apt.conf.d/20auto-upgrades}"

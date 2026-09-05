@@ -415,7 +415,17 @@ bbr_restore_initial_baseline() {
 }
 
 # ── 应用 sysctl ───────────────────────────────────────────
+# 统一写入入口：本文件写入的路径在回滚快照范围内，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 bbr_apply_sysctl() {
+    local RC
+    txn_write_begin "应用 BBR 内核参数" || return 1
+    bbr_apply_sysctl_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_apply_sysctl_locked() {
     local CONFIG="$1" STALE_MODE="${2:-ask}" TX_SNAPSHOT SNAPSHOT_CONFIG="$1"
     ensure_sysctl || return 1
     bbr_ensure_baseline || return 1
