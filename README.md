@@ -1,4 +1,4 @@
-# Quench — VPS 初始化与管理工具 V0.1.1
+# Quench — VPS 初始化与管理工具 V0.1.2
 
 > 首次开荒 · 用户与 SSH · Fail2ban · Firewall · BBR/FQ · DNS · Caddy 网站入口 · 系统与服务管理
 
@@ -28,24 +28,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 适合不能访问 GitHub 的中国内地 VPS。先在一台可以访问 GitHub 的电脑或跳板机下载：
 
 ```bash
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.1/quench-offline-V0.1.1.tar.gz
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.1/quench-offline-V0.1.1.tar.gz.sha256
-sha256sum -c quench-offline-V0.1.1.tar.gz.sha256
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.2/quench-offline-V0.1.2.tar.gz
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.2/quench-offline-V0.1.2.tar.gz.sha256
+sha256sum -c quench-offline-V0.1.2.tar.gz.sha256
 ```
 
 再通过 `scp`、SFTP 或 WinSCP 将两个文件传到 VPS。Linux/macOS 示例：
 
 ```bash
-scp quench-offline-V0.1.1.tar.gz* root@你的VPS地址:/root/
+scp quench-offline-V0.1.2.tar.gz* root@你的VPS地址:/root/
 ```
 
 登录 VPS 后离线安装：
 
 ```bash
 cd /root
-sha256sum -c quench-offline-V0.1.1.tar.gz.sha256
-tar -xzf quench-offline-V0.1.1.tar.gz
-cd quench-offline-V0.1.1
+sha256sum -c quench-offline-V0.1.2.tar.gz.sha256
+tar -xzf quench-offline-V0.1.2.tar.gz
+cd quench-offline-V0.1.2
 bash install.sh
 v
 ```
@@ -112,7 +112,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
  ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.1  ·  Boyang
+  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.2  ·  Boyang
 ────────────────────────────────────────────────────────────────
   SSH · BBR · DNS · Caddy · Firewall · NFT · Docker
 
@@ -608,5 +608,6 @@ BBR、FQ、tc 与 initcwnd 统一由 `src/modules/bbr.sh` 管理。修改网络�
 
 | 版本 | Quench 主要变更 |
 |------|----------------|
+| **V0.1.2** | 安全回滚收口：自动回滚改为与配置导入一致的精确恢复（事务新增的文件回滚时删除）；Caddy 写入接入事务锁；SSH 策略与首次开荒基线在取锁后核对原文件未被改动；确认输入前计时器已到期时如实报告已回滚而非“已取消”；BBR 子菜单入口不再自动应用保存的限速。 |
 | **V0.1.1** | 安全回滚与事务修复：回滚计时器改用 system 级 transient unit，取消/回滚前确认计时器已停，恢复未验证时保留安全网；事务锁覆盖全部写入路径并在无 flock 时退回 mkdir 锁，遗留事务落盘并阻断新变更；配置恢复改为原子替换与精确目录恢复；兼容 busybox（flock 无 -w、构建 SIGPIPE）；中文列宽在 bash 4+ 上修正；测试改为具名用例。 |
 | **V0.1.0** | 首个完整版本：提供可重复执行的 VPS 开荒向导、用户与 SSH 安全接管、Fail2ban、防火墙、BBR/FQ 与线路实测、DNS、软件源、IP 出口、Caddy、NFT 四层转发、时间同步、Swap、Docker、常用软件、系统诊断、配置备份和脚本更新；关键配置变更包含预检、确认、验证、审计与失败恢复。 |
