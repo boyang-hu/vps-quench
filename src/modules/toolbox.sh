@@ -56,7 +56,7 @@ config_archive_validate() {
 }
 
 config_archive_extract() {
-    local FILE="$1" STAGE LINK REL TARGET ROOT SRC DEST RESTORE_ROOT
+    local FILE="$1" STAGE LINK REL TARGET ROOT SRC DEST RESTORE_ROOT SAVED
     RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     STAGE=$(quench_mktemp_d) || return 1
     if ! tar -xzf "$FILE" -C "$STAGE" --no-same-owner 2>/dev/null; then
@@ -90,7 +90,27 @@ config_archive_extract() {
         DEST="${RESTORE_ROOT%/}/$ROOT"
         [ -e "$SRC" ] || [ -L "$SRC" ] || continue
         mkdir -p "$(dirname "$DEST")" || { rm -rf "$STAGE"; return 1; }
-        cp -a "$SRC" "$(dirname "$DEST")/" || { rm -rf "$STAGE"; error "恢复路径失败：$ROOT"; return 1; }
+        if [ -d "$SRC" ] && [ ! -L "$SRC" ]; then
+            # 目录必须精确恢复。cp -a 进父目录是“合并”：快照之后新增的文件会
+            # 原样留下，恢复结果并不等于快照状态。先把现有目录挪开，拷贝成功
+            # 才删除它；失败则挪回，避免中途出错把目录整个弄丢。
+            SAVED=""
+            if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+                SAVED="${DEST}.quench-restore-$$"
+                rm -rf "$SAVED"
+                mv "$DEST" "$SAVED" || { rm -rf "$STAGE"; error "无法暂存原目录：$ROOT"; return 1; }
+            fi
+            if cp -a "$SRC" "$DEST"; then
+                [ -z "$SAVED" ] || rm -rf "$SAVED"
+            else
+                [ -z "$SAVED" ] || mv "$SAVED" "$DEST"
+                rm -rf "$STAGE"
+                error "恢复路径失败：$ROOT"
+                return 1
+            fi
+        else
+            cp -a "$SRC" "$(dirname "$DEST")/" || { rm -rf "$STAGE"; error "恢复路径失败：$ROOT"; return 1; }
+        fi
     done < <(config_backup_allowed_roots)
     rm -rf "$STAGE"
 }
@@ -114,14 +134,25 @@ config_backup_prune() {
 # 删除脚本与句柄，于是界面显示“已取消”，后台却仍会在倒计时结束后回滚。
 # 参数可选，便于回滚中心停止别的会话留下的计时器。
 safety_stop_timer_process() {
-    local UNIT="${1-${SAFETY_UNIT:-}}" PID="${2-${SAFETY_PID:-}}" I
+    local UNIT="${1-${SAFETY_UNIT:-}}" PID="${2-${SAFETY_PID:-}}" I STATE
     if [ -n "$UNIT" ]; then
         command -v systemctl >/dev/null 2>&1 || return 1
         systemctl stop "$UNIT" >/dev/null 2>&1 || true
         systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
         for I in 1 2 3 4 5; do
-            systemctl is-active --quiet "$UNIT" 2>/dev/null || return 0
-            sleep 1
+            if systemctl is-active --quiet "$UNIT" 2>/dev/null; then
+                sleep 1
+                continue
+            fi
+            # is-active 返回非零既可能是“确实停了”，也可能是根本查不到状态
+            # （systemd 总线不可用等）。用 ActiveState 复核：读不到属性说明是
+            # 查询本身失败，绝不能当成已停止——那会让调用方删掉回滚材料。
+            STATE=$(systemctl show -p ActiveState "$UNIT" 2>/dev/null | sed -n 's/^ActiveState=//p')
+            case "$STATE" in
+                inactive|failed|deactivating) return 0 ;;
+                '') return 1 ;;
+                *) sleep 1 ;;
+            esac
         done
         return 1
     fi
@@ -164,23 +195,34 @@ cancel_safety_timer() {
     txn_lock_release
 }
 
+# 立即执行回滚。顺序很重要，之前是反的：先删记录、放锁，再跑脚本，
+# 而且不管跑没跑成都把脚本删掉——一旦回滚失败，恢复材料全没了，
+# 上层还照着 safety_rollback_after_failure 的话术说“事务记录已保留”。
+# 现在：确认计时器停住 -> 执行回滚 -> 只有成功才清理记录、放锁、删脚本。
 safety_rollback_now() {
     local SCRIPT="${SAFETY_SCRIPT:-}" RC=0
     [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ] || {
         SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
         return 0
     }
-    safety_stop_timer_process
+    if ! safety_stop_timer_process; then
+        error "无法停止自动回滚计时器（${SAFETY_UNIT:-PID ${SAFETY_PID:-未知}}）"
+        error "拒绝立即回滚以免执行两次；回滚脚本与事务记录已保留：$SCRIPT"
+        audit_action "立即回滚前停止计时器失败" FAILED
+        return 1
+    fi
+    if ! bash "$SCRIPT" --now >/dev/null 2>&1; then
+        RC=$?
+        [ "$RC" -ne 0 ] || RC=1
+        audit_action "立即执行防断联回滚失败" FAILED
+        error "自动回滚执行失败，回滚脚本与事务记录已保留：$SCRIPT"
+        error "锁也保持持有，请立即检查当前 SSH 与网络配置"
+        return "$RC"
+    fi
+    rm -f "$SCRIPT"
     SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
     txn_record_end
     txn_lock_release
-    bash "$SCRIPT" --now >/dev/null 2>&1 || RC=$?
-    rm -f "$SCRIPT"
-    [ "$RC" -eq 0 ] || {
-        audit_action "立即执行防断联回滚失败" FAILED
-        error "自动回滚执行失败，请立即检查当前 SSH 与网络配置"
-        return "$RC"
-    }
     audit_action "立即执行防断联回滚" SUCCESS
 }
 
@@ -563,6 +605,9 @@ safety_arm_locked() {
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
         safety_rollback_now || return 1
+        # 上一笔回滚成功即代表那笔事务结束，safety_rollback_now 会释放锁。
+        # 本笔必须重新持有，否则接下来整段变更是在无锁状态下进行的。
+        txn_lock_acquire || return 1
     fi
     for PATH_VALUE in "$@"; do
         config_path_allowed "$PATH_VALUE" || {
@@ -611,26 +656,61 @@ tar -tzf $SNAP_Q 2>/dev/null | grep -qx 'etc/sysctl.d/98-vps-quench-network-secu
 tar -tzf $SNAP_Q 2>/dev/null | grep -qx 'etc/sysctl.d/99-quench-ipv6.conf' || rm -f ${RESTORE_ROOT%/}/etc/sysctl.d/99-quench-ipv6.conf
 if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
 if [ $ROOT_Q != / ]; then rm -f $SCRIPT_Q; exit 0; fi
-sysctl --system >/dev/null 2>&1 || true
-sshd -t >/dev/null 2>&1 && (systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null)
+# RC 汇总必要步骤的结果。原来这些全是 || true，任何一步失败都被吞掉，
+# 脚本照样记录成功并删掉自己，调用方据此认为回滚已完成。
+# 只统计该组件确实存在时的失败；组件本来就没装不算失败。
+RC=0
+if command -v sysctl >/dev/null 2>&1; then
+    sysctl --system >/dev/null 2>&1 || RC=1
+fi
+if command -v sshd >/dev/null 2>&1; then
+    if sshd -t >/dev/null 2>&1; then
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null \
+            || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || RC=1
+    else
+        RC=1
+    fi
+fi
 systemctl restart systemd-resolved >/dev/null 2>&1 || true
 systemctl restart NetworkManager >/dev/null 2>&1 || true
 if command -v ufw >/dev/null 2>&1; then
-    if [ '$UFW_STATE' = active ]; then ufw --force enable >/dev/null 2>&1; else ufw --force disable >/dev/null 2>&1; fi
+    if [ '$UFW_STATE' = active ]; then
+        ufw --force enable >/dev/null 2>&1 || RC=1
+    else
+        ufw --force disable >/dev/null 2>&1 || RC=1
+    fi
 fi
 if command -v firewall-cmd >/dev/null 2>&1; then
-    if [ '$FIREWALLD_STATE' = active ]; then systemctl start firewalld >/dev/null 2>&1; else systemctl stop firewalld >/dev/null 2>&1; fi
+    if [ '$FIREWALLD_STATE' = active ]; then
+        systemctl start firewalld >/dev/null 2>&1 || RC=1
+    else
+        systemctl stop firewalld >/dev/null 2>&1 || RC=1
+    fi
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
-nft -f /etc/nftables.conf >/dev/null 2>&1 || true
-[ -x /usr/local/libexec/quench-nft-forward-apply ] && /usr/local/libexec/quench-nft-forward-apply >/dev/null 2>&1 || true
-logger -t quench "未确认连接，已自动恢复 $LABEL_Q 配置"
-rm -f $SCRIPT_Q
+if command -v nft >/dev/null 2>&1 && [ -f /etc/nftables.conf ]; then
+    nft -f /etc/nftables.conf >/dev/null 2>&1 || RC=1
+fi
+if [ -x /usr/local/libexec/quench-nft-forward-apply ]; then
+    /usr/local/libexec/quench-nft-forward-apply >/dev/null 2>&1 || RC=1
+fi
+if [ "\$RC" -eq 0 ]; then
+    logger -t quench "未确认连接，已自动恢复 $LABEL_Q 配置"
+    rm -f $SCRIPT_Q
+else
+    logger -t quench "自动恢复过程中有步骤失败，回滚脚本已保留：$SCRIPT_Q"
+fi
+exit "\$RC"
 ROLLBACK_EOF
     chmod 700 "$SCRIPT"
     safety_launch_timer "$SCRIPT" \
         || { rm -f "$SCRIPT"; error "无法启动防断联回滚计时器"; return 1; }
-    txn_record_begin "$LABEL" "$SCRIPT"
+    txn_record_begin "$LABEL" "$SCRIPT" || {
+        safety_stop_timer_process || true
+        rm -f "$SCRIPT"
+        SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+        return 1
+    }
     audit_action "启动防断联保护 $LABEL" SUCCESS
     warn "防断联保护已启动：${DELAY} 秒内未确认将自动恢复。"
 }

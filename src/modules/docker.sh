@@ -195,7 +195,7 @@ docker_config_validate() {
 docker_apply_production_baseline() {
     docker_require_ready || return 1
     command -v python3 >/dev/null 2>&1 || pkg_install python3 || { error "无法安装 python3"; return 1; }
-    local DIR STAGE BACKUP="" HAD_CONFIG=false RUNNING_COUNT FAILED=false
+    local DIR STAGE BACKUP="" HAD_CONFIG=false RUNNING_COUNT FAILED=false RESTORED
     DIR=$(dirname "$QUENCH_DOCKER_CONFIG")
     mkdir -p "$DIR" "$QUENCH_DOCKER_STATE_DIR" || return 1
     chmod 700 "$QUENCH_DOCKER_STATE_DIR" 2>/dev/null || true
@@ -221,11 +221,21 @@ docker_apply_production_baseline() {
         fi
     fi
     if [ "$FAILED" = true ]; then
-        if [ "$HAD_CONFIG" = true ]; then cp -p "$BACKUP" "$QUENCH_DOCKER_CONFIG"
-        else rm -f "$QUENCH_DOCKER_CONFIG"; fi
+        RESTORED=true
+        if [ "$HAD_CONFIG" = true ]; then
+            atomic_restore_file "$BACKUP" "$QUENCH_DOCKER_CONFIG" || RESTORED=false
+        else
+            rm -f "$QUENCH_DOCKER_CONFIG" || RESTORED=false
+        fi
         svc_restart docker || true
-        rm -f "$STAGE" "$BACKUP"
-        error "Docker 未能使用新配置启动，已恢复原 daemon.json"
+        rm -f "$STAGE"
+        if [ "$RESTORED" = true ]; then
+            rm -f "$BACKUP"
+            error "Docker 未能使用新配置启动，已恢复原 daemon.json"
+        else
+            error "Docker 未能使用新配置启动，且原 daemon.json 恢复失败"
+            error "备份已保留：$BACKUP"
+        fi
         audit_action "应用 Docker 生产基线" FAILED
         return 1
     fi
@@ -407,7 +417,8 @@ docker_compose_fetch_and_deploy() {
     fi
     if [ "$FAILED" = true ]; then
         if [ "$HAD_OLD" = true ]; then
-            cp -p "$BACKUP" "$DEST_DIR/compose.yaml"
+            atomic_restore_file "$BACKUP" "$DEST_DIR/compose.yaml" \
+                || error "compose.yaml 恢复失败，备份已保留：$BACKUP"
             docker compose --project-directory "$DEST_DIR" -p "$PROJECT" -f "$DEST_DIR/compose.yaml" up -d --remove-orphans || true
         else
             docker compose --project-directory "$DEST_DIR" -p "$PROJECT" -f "$DEST_DIR/compose.yaml" down --remove-orphans || true

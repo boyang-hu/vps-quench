@@ -199,39 +199,84 @@ SAFETY_UNIT=""
 # 同一进程重复进入直接复用（Quench 同时只维护一笔事务，不存在真正的嵌套）。
 QUENCH_TXN_LOCK_FILE="${QUENCH_TXN_LOCK_FILE:-/run/lock/quench-config.lock}"
 QUENCH_TXN_LOCK_HELD=0
+QUENCH_TXN_LOCK_MODE=""
 
 txn_lock_acquire() {
-    # 系统没有 flock 时退化为不加锁：宁可失去互斥，也不能让高危变更无法进行。
-    command -v flock >/dev/null 2>&1 || return 0
     [ "$QUENCH_TXN_LOCK_HELD" = 1 ] && return 0
     mkdir -p "$(dirname "$QUENCH_TXN_LOCK_FILE")" 2>/dev/null || true
-    exec 9>"$QUENCH_TXN_LOCK_FILE" 2>/dev/null || return 0
-    if ! flock -w "${QUENCH_TXN_LOCK_WAIT:-10}" 9 2>/dev/null; then
+    if command -v flock >/dev/null 2>&1 && exec 9>"$QUENCH_TXN_LOCK_FILE" 2>/dev/null; then
+        if flock -w "${QUENCH_TXN_LOCK_WAIT:-10}" 9 2>/dev/null; then
+            QUENCH_TXN_LOCK_HELD=1
+            QUENCH_TXN_LOCK_MODE="flock"
+            return 0
+        fi
         exec 9>&-
         error "另一个 Quench 会话正在修改配置，请等它结束后重试"
         return 1
     fi
-    QUENCH_TXN_LOCK_HELD=1
+    # 缺少 flock、或锁文件打不开时，退回原子 mkdir 锁，而不是直接放行。
+    # 高危变更不能因为少一个工具就失去互斥——那正是两个会话互相覆盖的入口。
+    txn_lock_mkdir_acquire
+}
+
+txn_lock_mkdir_acquire() {
+    local DIR="${QUENCH_TXN_LOCK_FILE}.d" OWNER I
+    for I in 1 2; do
+        if mkdir "$DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$DIR/pid" 2>/dev/null || true
+            QUENCH_TXN_LOCK_HELD=1
+            QUENCH_TXN_LOCK_MODE="mkdir"
+            return 0
+        fi
+        OWNER=$(cat "$DIR/pid" 2>/dev/null || true)
+        # 持有者进程还在 -> 真的有人在改；已经消失 -> 是陈旧锁，清掉重试一次
+        if printf '%s\n' "$OWNER" | grep -qE '^[0-9]+$' && kill -0 "$OWNER" 2>/dev/null; then
+            break
+        fi
+        rm -f "$DIR/pid" 2>/dev/null || true
+        rmdir "$DIR" 2>/dev/null || break
+    done
+    if [ ! -d "$DIR" ]; then
+        error "无法创建事务锁目录：$DIR"
+        error "拒绝在没有互斥保护的情况下修改配置"
+        return 1
+    fi
+    error "另一个 Quench 会话正在修改配置，请等它结束后重试"
+    return 1
 }
 
 txn_lock_release() {
     [ "$QUENCH_TXN_LOCK_HELD" = 1 ] || return 0
-    flock -u 9 2>/dev/null || true
-    exec 9>&-
+    case "$QUENCH_TXN_LOCK_MODE" in
+        flock)
+            flock -u 9 2>/dev/null || true
+            exec 9>&-
+            ;;
+        mkdir)
+            rm -f "${QUENCH_TXN_LOCK_FILE}.d/pid" 2>/dev/null || true
+            rmdir "${QUENCH_TXN_LOCK_FILE}.d" 2>/dev/null || true
+            ;;
+    esac
     QUENCH_TXN_LOCK_HELD=0
+    QUENCH_TXN_LOCK_MODE=""
 }
 
 # ── 事务记录（只写盘，不打扰）──────────────────────────────
 # 崩溃或断线的会话不会留下任何进程内线索，新进程也就看不见它布下的回滚计时器。
 # 这里把事务落到磁盘，供“回滚中心 → 检查未完成的变更”事后查看。
 # 启动时不扫描、不提示、不自动删除任何回滚脚本：那些脚本可能仍会正常触发。
-# 记录失败一律不影响事务本身——它是诊断信息，不是安全前提。
+# 记录一旦成为遗留事务检查的依据，就不再只是诊断信息：写不进去，下一个会话
+# 就看不到这笔未确认的变更，也就挡不住它的回滚覆盖新配置。因此写入失败必须
+# 让整笔事务失败。
 QUENCH_TXN_DIR="${QUENCH_TXN_DIR:-$QUENCH_DATA_DIR/transactions}"
 QUENCH_TXN_FILE=""
 
 txn_record_begin() {
     local LABEL="$1" SCRIPT="$2"
-    mkdir -p "$QUENCH_TXN_DIR" 2>/dev/null || return 0
+    mkdir -p "$QUENCH_TXN_DIR" 2>/dev/null || {
+        error "无法创建事务记录目录：$QUENCH_TXN_DIR"
+        return 1
+    }
     chmod 700 "$QUENCH_TXN_DIR" 2>/dev/null || true
     QUENCH_TXN_FILE="$QUENCH_TXN_DIR/$$-$(date +%s)-${RANDOM}.txn"
     {
@@ -241,7 +286,12 @@ txn_record_begin() {
         printf 'TIMER_PID=%s\n' "${SAFETY_PID:-}"
         printf 'QUENCH_PID=%s\n' "$$"
         printf 'STARTED=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
-    } > "$QUENCH_TXN_FILE" 2>/dev/null || { QUENCH_TXN_FILE=""; return 0; }
+    } > "$QUENCH_TXN_FILE" 2>/dev/null || {
+        rm -f "$QUENCH_TXN_FILE" 2>/dev/null || true
+        QUENCH_TXN_FILE=""
+        error "无法写入事务记录，拒绝在无法追踪的状态下开始变更"
+        return 1
+    }
     chmod 600 "$QUENCH_TXN_FILE" 2>/dev/null || true
 }
 
@@ -899,7 +949,9 @@ restore_backup_or_remove() {
         rm -f "$TARGET" "$BACKUP"
         return 0
     fi
-    if cp "$BACKUP" "$TARGET"; then
+    # 原子替换而不是 cp：cp 覆盖活配置时写到一半失败会留下截断文件，
+    # 而这里正是“出错之后”的恢复路径，再截断一次就没有退路了。
+    if atomic_replace_file "$BACKUP" "$TARGET"; then
         rm -f "$BACKUP"
         return 0
     fi
@@ -940,6 +992,19 @@ atomic_replace_file() {
         restorecon "$TARGET" >/dev/null 2>&1 || true
     fi
     return 0
+}
+
+# 用备份原子恢复目标。与 atomic_replace_file 的属性来源相反：
+# 备份是 cp -p 从原文件复制的，带着原权限；而此刻目标往往已被删除或改坏，
+# 拿它当属性来源会把权限改成默认值。
+atomic_restore_file() {
+    local SOURCE="$1" TARGET="$2" MODE OWNER
+    [ -f "$SOURCE" ] || return 1
+    MODE=$(stat -c '%a' "$SOURCE" 2>/dev/null || stat -f '%Lp' "$SOURCE" 2>/dev/null || true)
+    OWNER=$(stat -c '%u:%g' "$SOURCE" 2>/dev/null || stat -f '%u:%g' "$SOURCE" 2>/dev/null || true)
+    atomic_replace_file "$SOURCE" "$TARGET" "${MODE:-0644}" || return 1
+    if [ -n "$MODE" ]; then chmod "$MODE" "$TARGET" 2>/dev/null || true; fi
+    if [ -n "$OWNER" ]; then chown "$OWNER" "$TARGET" 2>/dev/null || true; fi
 }
 
 backup_config() {

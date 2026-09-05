@@ -1464,10 +1464,15 @@ caddy_delete_site() {
         caddy_reload_active || APPLY_FAILED=true
     fi
     if [ "$APPLY_FAILED" = true ]; then
-        cp -p "$BACKUP" "$FILE"
-        [ "$WAS_ACTIVE" = false ] || caddy_reload_active >/dev/null 2>&1 || true
-        rm -f "$BACKUP"; caddy_lock_release
-        error "站点删除失败，已恢复配置"; caddy_show_last_error; return 1
+        if atomic_restore_file "$BACKUP" "$FILE"; then
+            [ "$WAS_ACTIVE" = false ] || caddy_reload_active >/dev/null 2>&1 || true
+            rm -f "$BACKUP"
+            error "站点删除失败，已恢复配置"
+        else
+            error "站点删除失败，且配置恢复也失败，备份已保留：$BACKUP"
+        fi
+        caddy_lock_release
+        caddy_show_last_error; return 1
     fi
     rm -f "$BACKUP"; caddy_lock_release
     audit_action "删除 Caddy $TYPE 站点 $ADDRESS -> $TARGET" SUCCESS

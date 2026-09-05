@@ -9,6 +9,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 export QUENCH_TEST_MODE=1
+QUENCH_TXN_DIR="$TMP/transactions"
+# 事务锁默认落在 /run/lock，测试环境未必可写；缺少 flock 时会退回 mkdir 锁，
+# 建不出锁目录就会（正确地）拒绝变更，所以这里必须指到可写路径。
+QUENCH_TXN_LOCK_FILE="$TMP/quench-config.lock"
 # shellcheck source=/dev/null
 source "$ROOT/vps-quench.sh"
 # shellcheck source=lib/harness.sh

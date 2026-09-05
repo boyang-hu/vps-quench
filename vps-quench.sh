@@ -199,39 +199,84 @@ SAFETY_UNIT=""
 # 同一进程重复进入直接复用（Quench 同时只维护一笔事务，不存在真正的嵌套）。
 QUENCH_TXN_LOCK_FILE="${QUENCH_TXN_LOCK_FILE:-/run/lock/quench-config.lock}"
 QUENCH_TXN_LOCK_HELD=0
+QUENCH_TXN_LOCK_MODE=""
 
 txn_lock_acquire() {
-    # 系统没有 flock 时退化为不加锁：宁可失去互斥，也不能让高危变更无法进行。
-    command -v flock >/dev/null 2>&1 || return 0
     [ "$QUENCH_TXN_LOCK_HELD" = 1 ] && return 0
     mkdir -p "$(dirname "$QUENCH_TXN_LOCK_FILE")" 2>/dev/null || true
-    exec 9>"$QUENCH_TXN_LOCK_FILE" 2>/dev/null || return 0
-    if ! flock -w "${QUENCH_TXN_LOCK_WAIT:-10}" 9 2>/dev/null; then
+    if command -v flock >/dev/null 2>&1 && exec 9>"$QUENCH_TXN_LOCK_FILE" 2>/dev/null; then
+        if flock -w "${QUENCH_TXN_LOCK_WAIT:-10}" 9 2>/dev/null; then
+            QUENCH_TXN_LOCK_HELD=1
+            QUENCH_TXN_LOCK_MODE="flock"
+            return 0
+        fi
         exec 9>&-
         error "另一个 Quench 会话正在修改配置，请等它结束后重试"
         return 1
     fi
-    QUENCH_TXN_LOCK_HELD=1
+    # 缺少 flock、或锁文件打不开时，退回原子 mkdir 锁，而不是直接放行。
+    # 高危变更不能因为少一个工具就失去互斥——那正是两个会话互相覆盖的入口。
+    txn_lock_mkdir_acquire
+}
+
+txn_lock_mkdir_acquire() {
+    local DIR="${QUENCH_TXN_LOCK_FILE}.d" OWNER I
+    for I in 1 2; do
+        if mkdir "$DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$DIR/pid" 2>/dev/null || true
+            QUENCH_TXN_LOCK_HELD=1
+            QUENCH_TXN_LOCK_MODE="mkdir"
+            return 0
+        fi
+        OWNER=$(cat "$DIR/pid" 2>/dev/null || true)
+        # 持有者进程还在 -> 真的有人在改；已经消失 -> 是陈旧锁，清掉重试一次
+        if printf '%s\n' "$OWNER" | grep -qE '^[0-9]+$' && kill -0 "$OWNER" 2>/dev/null; then
+            break
+        fi
+        rm -f "$DIR/pid" 2>/dev/null || true
+        rmdir "$DIR" 2>/dev/null || break
+    done
+    if [ ! -d "$DIR" ]; then
+        error "无法创建事务锁目录：$DIR"
+        error "拒绝在没有互斥保护的情况下修改配置"
+        return 1
+    fi
+    error "另一个 Quench 会话正在修改配置，请等它结束后重试"
+    return 1
 }
 
 txn_lock_release() {
     [ "$QUENCH_TXN_LOCK_HELD" = 1 ] || return 0
-    flock -u 9 2>/dev/null || true
-    exec 9>&-
+    case "$QUENCH_TXN_LOCK_MODE" in
+        flock)
+            flock -u 9 2>/dev/null || true
+            exec 9>&-
+            ;;
+        mkdir)
+            rm -f "${QUENCH_TXN_LOCK_FILE}.d/pid" 2>/dev/null || true
+            rmdir "${QUENCH_TXN_LOCK_FILE}.d" 2>/dev/null || true
+            ;;
+    esac
     QUENCH_TXN_LOCK_HELD=0
+    QUENCH_TXN_LOCK_MODE=""
 }
 
 # ── 事务记录（只写盘，不打扰）──────────────────────────────
 # 崩溃或断线的会话不会留下任何进程内线索，新进程也就看不见它布下的回滚计时器。
 # 这里把事务落到磁盘，供“回滚中心 → 检查未完成的变更”事后查看。
 # 启动时不扫描、不提示、不自动删除任何回滚脚本：那些脚本可能仍会正常触发。
-# 记录失败一律不影响事务本身——它是诊断信息，不是安全前提。
+# 记录一旦成为遗留事务检查的依据，就不再只是诊断信息：写不进去，下一个会话
+# 就看不到这笔未确认的变更，也就挡不住它的回滚覆盖新配置。因此写入失败必须
+# 让整笔事务失败。
 QUENCH_TXN_DIR="${QUENCH_TXN_DIR:-$QUENCH_DATA_DIR/transactions}"
 QUENCH_TXN_FILE=""
 
 txn_record_begin() {
     local LABEL="$1" SCRIPT="$2"
-    mkdir -p "$QUENCH_TXN_DIR" 2>/dev/null || return 0
+    mkdir -p "$QUENCH_TXN_DIR" 2>/dev/null || {
+        error "无法创建事务记录目录：$QUENCH_TXN_DIR"
+        return 1
+    }
     chmod 700 "$QUENCH_TXN_DIR" 2>/dev/null || true
     QUENCH_TXN_FILE="$QUENCH_TXN_DIR/$$-$(date +%s)-${RANDOM}.txn"
     {
@@ -241,7 +286,12 @@ txn_record_begin() {
         printf 'TIMER_PID=%s\n' "${SAFETY_PID:-}"
         printf 'QUENCH_PID=%s\n' "$$"
         printf 'STARTED=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
-    } > "$QUENCH_TXN_FILE" 2>/dev/null || { QUENCH_TXN_FILE=""; return 0; }
+    } > "$QUENCH_TXN_FILE" 2>/dev/null || {
+        rm -f "$QUENCH_TXN_FILE" 2>/dev/null || true
+        QUENCH_TXN_FILE=""
+        error "无法写入事务记录，拒绝在无法追踪的状态下开始变更"
+        return 1
+    }
     chmod 600 "$QUENCH_TXN_FILE" 2>/dev/null || true
 }
 
@@ -899,7 +949,9 @@ restore_backup_or_remove() {
         rm -f "$TARGET" "$BACKUP"
         return 0
     fi
-    if cp "$BACKUP" "$TARGET"; then
+    # 原子替换而不是 cp：cp 覆盖活配置时写到一半失败会留下截断文件，
+    # 而这里正是“出错之后”的恢复路径，再截断一次就没有退路了。
+    if atomic_replace_file "$BACKUP" "$TARGET"; then
         rm -f "$BACKUP"
         return 0
     fi
@@ -940,6 +992,19 @@ atomic_replace_file() {
         restorecon "$TARGET" >/dev/null 2>&1 || true
     fi
     return 0
+}
+
+# 用备份原子恢复目标。与 atomic_replace_file 的属性来源相反：
+# 备份是 cp -p 从原文件复制的，带着原权限；而此刻目标往往已被删除或改坏，
+# 拿它当属性来源会把权限改成默认值。
+atomic_restore_file() {
+    local SOURCE="$1" TARGET="$2" MODE OWNER
+    [ -f "$SOURCE" ] || return 1
+    MODE=$(stat -c '%a' "$SOURCE" 2>/dev/null || stat -f '%Lp' "$SOURCE" 2>/dev/null || true)
+    OWNER=$(stat -c '%u:%g' "$SOURCE" 2>/dev/null || stat -f '%u:%g' "$SOURCE" 2>/dev/null || true)
+    atomic_replace_file "$SOURCE" "$TARGET" "${MODE:-0644}" || return 1
+    if [ -n "$MODE" ]; then chmod "$MODE" "$TARGET" 2>/dev/null || true; fi
+    if [ -n "$OWNER" ]; then chown "$OWNER" "$TARGET" 2>/dev/null || true; fi
 }
 
 backup_config() {
@@ -2852,9 +2917,13 @@ f2b_config_params() {
         && { [ -z "$APPLY_PORT" ] || f2b_set_param_jail port "$APPLY_PORT"; }; then
         :
     else
-        cp "$BACKUP" "$JAIL_FILE"
-        rm -f "$BACKUP"
-        error "参数写入失败，已恢复修改前配置"
+        if atomic_replace_file "$BACKUP" "$JAIL_FILE"; then
+            rm -f "$BACKUP"
+            error "参数写入失败，已恢复修改前配置"
+        else
+            error "参数写入失败，且恢复修改前配置也失败，备份已保留：$BACKUP"
+            error "请立即手动执行：cp $BACKUP $JAIL_FILE"
+        fi
         return 1
     fi
 
@@ -8795,13 +8864,20 @@ ip_v6_safety_arm_locked() {
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
         safety_rollback_now || return 1
+        # 回滚成功会释放上一笔的锁，本笔必须重新持有
+        txn_lock_acquire || return 1
     fi
     ip_v6_snapshot_create || return 1
     SCRIPT="$QUENCH_DATA_DIR/rollback_ipv6_$$_$(date +%s)_${RANDOM}.sh"
     ip_v6_rollback_script_create "$IP_V6_SNAPSHOT" "$SCRIPT" "$DELAY" || { rm -f "$SCRIPT"; return 1; }
     safety_launch_timer "$SCRIPT" \
         || { rm -f "$SCRIPT"; error "无法启动防断联回滚计时器"; return 1; }
-    txn_record_begin "$LABEL" "$SCRIPT"
+    txn_record_begin "$LABEL" "$SCRIPT" || {
+        safety_stop_timer_process || true
+        rm -f "$SCRIPT"
+        SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+        return 1
+    }
     audit_action "启动防断联保护 $LABEL" SUCCESS
     warn "IPv6 精确回滚保护已启动：${DELAY} 秒内未确认将恢复原运行时与配置状态。"
 }
@@ -9034,6 +9110,8 @@ ip_source_safety_arm_locked() {
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
         safety_rollback_now || return 1
+        # 回滚成功会释放上一笔的锁，本笔必须重新持有
+        txn_lock_acquire || return 1
     fi
     read -r -a TOKENS <<< "$ROUTE_LINE"
     [ "${#TOKENS[@]}" -gt 0 ] || return 1
@@ -9061,7 +9139,12 @@ ip_source_safety_arm_locked() {
     chmod 700 "$SCRIPT" || { rm -f "$SCRIPT"; return 1; }
     safety_launch_timer "$SCRIPT" \
         || { rm -f "$SCRIPT"; error "无法启动防断联回滚计时器"; return 1; }
-    txn_record_begin "IPv${FAMILY} 源地址切换" "$SCRIPT"
+    txn_record_begin "IPv${FAMILY} 源地址切换" "$SCRIPT" || {
+        safety_stop_timer_process || true
+        rm -f "$SCRIPT"
+        SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+        return 1
+    }
     audit_action "启动防断联保护 IPv${FAMILY} 源地址切换" SUCCESS
     warn "防断联保护已启动：${DELAY} 秒内未确认将自动恢复原默认路由。"
 }
@@ -10732,10 +10815,15 @@ caddy_delete_site() {
         caddy_reload_active || APPLY_FAILED=true
     fi
     if [ "$APPLY_FAILED" = true ]; then
-        cp -p "$BACKUP" "$FILE"
-        [ "$WAS_ACTIVE" = false ] || caddy_reload_active >/dev/null 2>&1 || true
-        rm -f "$BACKUP"; caddy_lock_release
-        error "站点删除失败，已恢复配置"; caddy_show_last_error; return 1
+        if atomic_restore_file "$BACKUP" "$FILE"; then
+            [ "$WAS_ACTIVE" = false ] || caddy_reload_active >/dev/null 2>&1 || true
+            rm -f "$BACKUP"
+            error "站点删除失败，已恢复配置"
+        else
+            error "站点删除失败，且配置恢复也失败，备份已保留：$BACKUP"
+        fi
+        caddy_lock_release
+        caddy_show_last_error; return 1
     fi
     rm -f "$BACKUP"; caddy_lock_release
     audit_action "删除 Caddy $TYPE 站点 $ADDRESS -> $TARGET" SUCCESS
@@ -12639,7 +12727,7 @@ config_archive_validate() {
 }
 
 config_archive_extract() {
-    local FILE="$1" STAGE LINK REL TARGET ROOT SRC DEST RESTORE_ROOT
+    local FILE="$1" STAGE LINK REL TARGET ROOT SRC DEST RESTORE_ROOT SAVED
     RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     STAGE=$(quench_mktemp_d) || return 1
     if ! tar -xzf "$FILE" -C "$STAGE" --no-same-owner 2>/dev/null; then
@@ -12673,7 +12761,27 @@ config_archive_extract() {
         DEST="${RESTORE_ROOT%/}/$ROOT"
         [ -e "$SRC" ] || [ -L "$SRC" ] || continue
         mkdir -p "$(dirname "$DEST")" || { rm -rf "$STAGE"; return 1; }
-        cp -a "$SRC" "$(dirname "$DEST")/" || { rm -rf "$STAGE"; error "恢复路径失败：$ROOT"; return 1; }
+        if [ -d "$SRC" ] && [ ! -L "$SRC" ]; then
+            # 目录必须精确恢复。cp -a 进父目录是“合并”：快照之后新增的文件会
+            # 原样留下，恢复结果并不等于快照状态。先把现有目录挪开，拷贝成功
+            # 才删除它；失败则挪回，避免中途出错把目录整个弄丢。
+            SAVED=""
+            if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+                SAVED="${DEST}.quench-restore-$$"
+                rm -rf "$SAVED"
+                mv "$DEST" "$SAVED" || { rm -rf "$STAGE"; error "无法暂存原目录：$ROOT"; return 1; }
+            fi
+            if cp -a "$SRC" "$DEST"; then
+                [ -z "$SAVED" ] || rm -rf "$SAVED"
+            else
+                [ -z "$SAVED" ] || mv "$SAVED" "$DEST"
+                rm -rf "$STAGE"
+                error "恢复路径失败：$ROOT"
+                return 1
+            fi
+        else
+            cp -a "$SRC" "$(dirname "$DEST")/" || { rm -rf "$STAGE"; error "恢复路径失败：$ROOT"; return 1; }
+        fi
     done < <(config_backup_allowed_roots)
     rm -rf "$STAGE"
 }
@@ -12697,14 +12805,25 @@ config_backup_prune() {
 # 删除脚本与句柄，于是界面显示“已取消”，后台却仍会在倒计时结束后回滚。
 # 参数可选，便于回滚中心停止别的会话留下的计时器。
 safety_stop_timer_process() {
-    local UNIT="${1-${SAFETY_UNIT:-}}" PID="${2-${SAFETY_PID:-}}" I
+    local UNIT="${1-${SAFETY_UNIT:-}}" PID="${2-${SAFETY_PID:-}}" I STATE
     if [ -n "$UNIT" ]; then
         command -v systemctl >/dev/null 2>&1 || return 1
         systemctl stop "$UNIT" >/dev/null 2>&1 || true
         systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
         for I in 1 2 3 4 5; do
-            systemctl is-active --quiet "$UNIT" 2>/dev/null || return 0
-            sleep 1
+            if systemctl is-active --quiet "$UNIT" 2>/dev/null; then
+                sleep 1
+                continue
+            fi
+            # is-active 返回非零既可能是“确实停了”，也可能是根本查不到状态
+            # （systemd 总线不可用等）。用 ActiveState 复核：读不到属性说明是
+            # 查询本身失败，绝不能当成已停止——那会让调用方删掉回滚材料。
+            STATE=$(systemctl show -p ActiveState "$UNIT" 2>/dev/null | sed -n 's/^ActiveState=//p')
+            case "$STATE" in
+                inactive|failed|deactivating) return 0 ;;
+                '') return 1 ;;
+                *) sleep 1 ;;
+            esac
         done
         return 1
     fi
@@ -12747,23 +12866,34 @@ cancel_safety_timer() {
     txn_lock_release
 }
 
+# 立即执行回滚。顺序很重要，之前是反的：先删记录、放锁，再跑脚本，
+# 而且不管跑没跑成都把脚本删掉——一旦回滚失败，恢复材料全没了，
+# 上层还照着 safety_rollback_after_failure 的话术说“事务记录已保留”。
+# 现在：确认计时器停住 -> 执行回滚 -> 只有成功才清理记录、放锁、删脚本。
 safety_rollback_now() {
     local SCRIPT="${SAFETY_SCRIPT:-}" RC=0
     [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ] || {
         SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
         return 0
     }
-    safety_stop_timer_process
+    if ! safety_stop_timer_process; then
+        error "无法停止自动回滚计时器（${SAFETY_UNIT:-PID ${SAFETY_PID:-未知}}）"
+        error "拒绝立即回滚以免执行两次；回滚脚本与事务记录已保留：$SCRIPT"
+        audit_action "立即回滚前停止计时器失败" FAILED
+        return 1
+    fi
+    if ! bash "$SCRIPT" --now >/dev/null 2>&1; then
+        RC=$?
+        [ "$RC" -ne 0 ] || RC=1
+        audit_action "立即执行防断联回滚失败" FAILED
+        error "自动回滚执行失败，回滚脚本与事务记录已保留：$SCRIPT"
+        error "锁也保持持有，请立即检查当前 SSH 与网络配置"
+        return "$RC"
+    fi
+    rm -f "$SCRIPT"
     SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
     txn_record_end
     txn_lock_release
-    bash "$SCRIPT" --now >/dev/null 2>&1 || RC=$?
-    rm -f "$SCRIPT"
-    [ "$RC" -eq 0 ] || {
-        audit_action "立即执行防断联回滚失败" FAILED
-        error "自动回滚执行失败，请立即检查当前 SSH 与网络配置"
-        return "$RC"
-    }
     audit_action "立即执行防断联回滚" SUCCESS
 }
 
@@ -13146,6 +13276,9 @@ safety_arm_locked() {
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
         safety_rollback_now || return 1
+        # 上一笔回滚成功即代表那笔事务结束，safety_rollback_now 会释放锁。
+        # 本笔必须重新持有，否则接下来整段变更是在无锁状态下进行的。
+        txn_lock_acquire || return 1
     fi
     for PATH_VALUE in "$@"; do
         config_path_allowed "$PATH_VALUE" || {
@@ -13194,26 +13327,61 @@ tar -tzf $SNAP_Q 2>/dev/null | grep -qx 'etc/sysctl.d/98-vps-quench-network-secu
 tar -tzf $SNAP_Q 2>/dev/null | grep -qx 'etc/sysctl.d/99-quench-ipv6.conf' || rm -f ${RESTORE_ROOT%/}/etc/sysctl.d/99-quench-ipv6.conf
 if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
 if [ $ROOT_Q != / ]; then rm -f $SCRIPT_Q; exit 0; fi
-sysctl --system >/dev/null 2>&1 || true
-sshd -t >/dev/null 2>&1 && (systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null)
+# RC 汇总必要步骤的结果。原来这些全是 || true，任何一步失败都被吞掉，
+# 脚本照样记录成功并删掉自己，调用方据此认为回滚已完成。
+# 只统计该组件确实存在时的失败；组件本来就没装不算失败。
+RC=0
+if command -v sysctl >/dev/null 2>&1; then
+    sysctl --system >/dev/null 2>&1 || RC=1
+fi
+if command -v sshd >/dev/null 2>&1; then
+    if sshd -t >/dev/null 2>&1; then
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null \
+            || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || RC=1
+    else
+        RC=1
+    fi
+fi
 systemctl restart systemd-resolved >/dev/null 2>&1 || true
 systemctl restart NetworkManager >/dev/null 2>&1 || true
 if command -v ufw >/dev/null 2>&1; then
-    if [ '$UFW_STATE' = active ]; then ufw --force enable >/dev/null 2>&1; else ufw --force disable >/dev/null 2>&1; fi
+    if [ '$UFW_STATE' = active ]; then
+        ufw --force enable >/dev/null 2>&1 || RC=1
+    else
+        ufw --force disable >/dev/null 2>&1 || RC=1
+    fi
 fi
 if command -v firewall-cmd >/dev/null 2>&1; then
-    if [ '$FIREWALLD_STATE' = active ]; then systemctl start firewalld >/dev/null 2>&1; else systemctl stop firewalld >/dev/null 2>&1; fi
+    if [ '$FIREWALLD_STATE' = active ]; then
+        systemctl start firewalld >/dev/null 2>&1 || RC=1
+    else
+        systemctl stop firewalld >/dev/null 2>&1 || RC=1
+    fi
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
-nft -f /etc/nftables.conf >/dev/null 2>&1 || true
-[ -x /usr/local/libexec/quench-nft-forward-apply ] && /usr/local/libexec/quench-nft-forward-apply >/dev/null 2>&1 || true
-logger -t quench "未确认连接，已自动恢复 $LABEL_Q 配置"
-rm -f $SCRIPT_Q
+if command -v nft >/dev/null 2>&1 && [ -f /etc/nftables.conf ]; then
+    nft -f /etc/nftables.conf >/dev/null 2>&1 || RC=1
+fi
+if [ -x /usr/local/libexec/quench-nft-forward-apply ]; then
+    /usr/local/libexec/quench-nft-forward-apply >/dev/null 2>&1 || RC=1
+fi
+if [ "\$RC" -eq 0 ]; then
+    logger -t quench "未确认连接，已自动恢复 $LABEL_Q 配置"
+    rm -f $SCRIPT_Q
+else
+    logger -t quench "自动恢复过程中有步骤失败，回滚脚本已保留：$SCRIPT_Q"
+fi
+exit "\$RC"
 ROLLBACK_EOF
     chmod 700 "$SCRIPT"
     safety_launch_timer "$SCRIPT" \
         || { rm -f "$SCRIPT"; error "无法启动防断联回滚计时器"; return 1; }
-    txn_record_begin "$LABEL" "$SCRIPT"
+    txn_record_begin "$LABEL" "$SCRIPT" || {
+        safety_stop_timer_process || true
+        rm -f "$SCRIPT"
+        SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+        return 1
+    }
     audit_action "启动防断联保护 $LABEL" SUCCESS
     warn "防断联保护已启动：${DELAY} 秒内未确认将自动恢复。"
 }
@@ -14644,7 +14812,7 @@ docker_config_validate() {
 docker_apply_production_baseline() {
     docker_require_ready || return 1
     command -v python3 >/dev/null 2>&1 || pkg_install python3 || { error "无法安装 python3"; return 1; }
-    local DIR STAGE BACKUP="" HAD_CONFIG=false RUNNING_COUNT FAILED=false
+    local DIR STAGE BACKUP="" HAD_CONFIG=false RUNNING_COUNT FAILED=false RESTORED
     DIR=$(dirname "$QUENCH_DOCKER_CONFIG")
     mkdir -p "$DIR" "$QUENCH_DOCKER_STATE_DIR" || return 1
     chmod 700 "$QUENCH_DOCKER_STATE_DIR" 2>/dev/null || true
@@ -14670,11 +14838,21 @@ docker_apply_production_baseline() {
         fi
     fi
     if [ "$FAILED" = true ]; then
-        if [ "$HAD_CONFIG" = true ]; then cp -p "$BACKUP" "$QUENCH_DOCKER_CONFIG"
-        else rm -f "$QUENCH_DOCKER_CONFIG"; fi
+        RESTORED=true
+        if [ "$HAD_CONFIG" = true ]; then
+            atomic_restore_file "$BACKUP" "$QUENCH_DOCKER_CONFIG" || RESTORED=false
+        else
+            rm -f "$QUENCH_DOCKER_CONFIG" || RESTORED=false
+        fi
         svc_restart docker || true
-        rm -f "$STAGE" "$BACKUP"
-        error "Docker 未能使用新配置启动，已恢复原 daemon.json"
+        rm -f "$STAGE"
+        if [ "$RESTORED" = true ]; then
+            rm -f "$BACKUP"
+            error "Docker 未能使用新配置启动，已恢复原 daemon.json"
+        else
+            error "Docker 未能使用新配置启动，且原 daemon.json 恢复失败"
+            error "备份已保留：$BACKUP"
+        fi
         audit_action "应用 Docker 生产基线" FAILED
         return 1
     fi
@@ -14856,7 +15034,8 @@ docker_compose_fetch_and_deploy() {
     fi
     if [ "$FAILED" = true ]; then
         if [ "$HAD_OLD" = true ]; then
-            cp -p "$BACKUP" "$DEST_DIR/compose.yaml"
+            atomic_restore_file "$BACKUP" "$DEST_DIR/compose.yaml" \
+                || error "compose.yaml 恢复失败，备份已保留：$BACKUP"
             docker compose --project-directory "$DEST_DIR" -p "$PROJECT" -f "$DEST_DIR/compose.yaml" up -d --remove-orphans || true
         else
             docker compose --project-directory "$DEST_DIR" -p "$PROJECT" -f "$DEST_DIR/compose.yaml" down --remove-orphans || true

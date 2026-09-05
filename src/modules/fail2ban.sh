@@ -400,9 +400,13 @@ f2b_config_params() {
         && { [ -z "$APPLY_PORT" ] || f2b_set_param_jail port "$APPLY_PORT"; }; then
         :
     else
-        cp "$BACKUP" "$JAIL_FILE"
-        rm -f "$BACKUP"
-        error "参数写入失败，已恢复修改前配置"
+        if atomic_replace_file "$BACKUP" "$JAIL_FILE"; then
+            rm -f "$BACKUP"
+            error "参数写入失败，已恢复修改前配置"
+        else
+            error "参数写入失败，且恢复修改前配置也失败，备份已保留：$BACKUP"
+            error "请立即手动执行：cp $BACKUP $JAIL_FILE"
+        fi
         return 1
     fi
 

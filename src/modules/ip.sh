@@ -349,13 +349,20 @@ ip_v6_safety_arm_locked() {
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
         safety_rollback_now || return 1
+        # 回滚成功会释放上一笔的锁，本笔必须重新持有
+        txn_lock_acquire || return 1
     fi
     ip_v6_snapshot_create || return 1
     SCRIPT="$QUENCH_DATA_DIR/rollback_ipv6_$$_$(date +%s)_${RANDOM}.sh"
     ip_v6_rollback_script_create "$IP_V6_SNAPSHOT" "$SCRIPT" "$DELAY" || { rm -f "$SCRIPT"; return 1; }
     safety_launch_timer "$SCRIPT" \
         || { rm -f "$SCRIPT"; error "无法启动防断联回滚计时器"; return 1; }
-    txn_record_begin "$LABEL" "$SCRIPT"
+    txn_record_begin "$LABEL" "$SCRIPT" || {
+        safety_stop_timer_process || true
+        rm -f "$SCRIPT"
+        SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+        return 1
+    }
     audit_action "启动防断联保护 $LABEL" SUCCESS
     warn "IPv6 精确回滚保护已启动：${DELAY} 秒内未确认将恢复原运行时与配置状态。"
 }
@@ -588,6 +595,8 @@ ip_source_safety_arm_locked() {
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
         safety_rollback_now || return 1
+        # 回滚成功会释放上一笔的锁，本笔必须重新持有
+        txn_lock_acquire || return 1
     fi
     read -r -a TOKENS <<< "$ROUTE_LINE"
     [ "${#TOKENS[@]}" -gt 0 ] || return 1
@@ -615,7 +624,12 @@ ip_source_safety_arm_locked() {
     chmod 700 "$SCRIPT" || { rm -f "$SCRIPT"; return 1; }
     safety_launch_timer "$SCRIPT" \
         || { rm -f "$SCRIPT"; error "无法启动防断联回滚计时器"; return 1; }
-    txn_record_begin "IPv${FAMILY} 源地址切换" "$SCRIPT"
+    txn_record_begin "IPv${FAMILY} 源地址切换" "$SCRIPT" || {
+        safety_stop_timer_process || true
+        rm -f "$SCRIPT"
+        SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""
+        return 1
+    }
     audit_action "启动防断联保护 IPv${FAMILY} 源地址切换" SUCCESS
     warn "防断联保护已启动：${DELAY} 秒内未确认将自动恢复原默认路由。"
 }

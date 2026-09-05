@@ -9,6 +9,12 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 export QUENCH_TEST_MODE=1
+# 事务记录现在是遗留事务检查的依据，写不进去事务就会失败。
+# 真实运行时是 /var/lib/quench/transactions；测试里指到可写的临时目录。
+QUENCH_TXN_DIR="$TMP/transactions"
+# 事务锁默认落在 /run/lock，测试环境未必可写；缺少 flock 时会退回 mkdir 锁，
+# 建不出锁目录就会（正确地）拒绝变更，所以这里必须指到可写路径。
+QUENCH_TXN_LOCK_FILE="$TMP/quench-config.lock"
 # shellcheck source=/dev/null
 source "$ROOT/vps-quench.sh"
 # shellcheck source=lib/harness.sh
@@ -1422,6 +1428,12 @@ t_fi_051() {
         case "${1:-}" in
             stop) UNIT_ACTIVE=0; return 0 ;;
             is-active) [ "$UNIT_ACTIVE" = 1 ] && return 0 || return 1 ;;
+            show)
+                # 停止确认会用 ActiveState 复核 is-active 的非零结果
+                [ "$UNIT_ACTIVE" = 1 ] && printf 'ActiveState=active\n' \
+                    || printf 'ActiveState=inactive\n'
+                return 0
+                ;;
         esac
         return 0
     }
@@ -1724,7 +1736,13 @@ t_cancel_001() {
     QUENCH_TXN_REGISTRY=""
     # A unit that refuses to stop: stop reports success, is-active stays true.
     # shellcheck disable=SC2329 # test stub stands in for the systemctl binary
-    systemctl() { case "${1:-}" in is-active) return 0 ;; esac; return 0; }
+    systemctl() {
+        case "${1:-}" in
+            is-active) return 0 ;;
+            show) printf 'ActiveState=active\n'; return 0 ;;
+        esac
+        return 0
+    }
 
     cancel_safety_timer >/dev/null 2>&1 \
         && { echo "cancel reported success while the timer was still active" >&2; exit 1; }
@@ -1900,5 +1918,231 @@ t_svc_001() {
     :
 }
 run_test "svc_enable reports a failed boot-time enable" t_svc_001
+
+# safety_rollback_now used to delete the record, release the lock and remove the
+# script before running it, and removed the script even when the rollback failed —
+# while safety_rollback_after_failure told the operator the record had been kept.
+t_rbnow_001() {
+    RB_DIR="$TMP/rollback-now"
+    mkdir -p "$RB_DIR"
+    QUENCH_TXN_DIR="$RB_DIR/txn"
+    QUENCH_TXN_LOCK_FILE="$RB_DIR/lock"
+    QUENCH_TXN_LOCK_HELD=0
+    QUENCH_TXN_LOCK_MODE=""
+    SAFETY_SCRIPT="$RB_DIR/rollback.sh"
+    printf '#!/bin/bash\nexit 3\n' > "$SAFETY_SCRIPT"
+    chmod 700 "$SAFETY_SCRIPT"
+    SAFETY_UNIT=""; SAFETY_PID=""
+    # shellcheck disable=SC2329 # test stub: the timer stops cleanly, the rollback does not
+    safety_stop_timer_process() { return 0; }
+    txn_lock_acquire || { echo "could not take the lock for the fixture" >&2; exit 1; }
+    txn_record_begin rollback_probe "$SAFETY_SCRIPT" \
+        || { echo "could not write the fixture transaction record" >&2; exit 1; }
+    REC="$QUENCH_TXN_FILE"
+
+    safety_rollback_now >/dev/null 2>&1 \
+        && { echo "rollback reported success while the script exited non-zero" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT" ] \
+        || { echo "a failed rollback deleted the rollback script" >&2; exit 1; }
+    [ -f "$REC" ] \
+        || { echo "a failed rollback deleted the transaction record" >&2; exit 1; }
+    [ "$QUENCH_TXN_LOCK_HELD" = 1 ] \
+        || { echo "a failed rollback released the lock" >&2; exit 1; }
+    [ -n "$SAFETY_SCRIPT" ] \
+        || { echo "a failed rollback cleared the rollback handle" >&2; exit 1; }
+
+    # 停不掉计时器时必须拒绝执行：否则手动这次和它自己的倒计时会各回滚一次
+    RAN_MARKER="$RB_DIR/ran"
+    printf '#!/bin/bash\ntouch %s\nexit 0\n' "$RAN_MARKER" > "$SAFETY_SCRIPT"
+    chmod 700 "$SAFETY_SCRIPT"
+    # shellcheck disable=SC2329 # test stub: the timer refuses to stop
+    safety_stop_timer_process() { return 1; }
+    safety_rollback_now >/dev/null 2>&1 \
+        && { echo "rollback reported success while the timer could not be stopped" >&2; exit 1; }
+    [ ! -e "$RAN_MARKER" ] \
+        || { echo "the rollback ran even though its timer could not be stopped" >&2; exit 1; }
+    [ -f "$SAFETY_SCRIPT" ] \
+        || { echo "refusing to roll back still deleted the script" >&2; exit 1; }
+    :
+}
+run_test "A failed immediate rollback keeps the script, the record and the lock" t_rbnow_001
+
+# Stopping must not read "state unavailable" as "stopped".
+t_stop_001() {
+    SAFETY_UNIT=quench-rollback-unknown
+    SAFETY_PID=""
+    # 总线不可用：is-active 非零，ActiveState 也查不到
+    # shellcheck disable=SC2329 # test stub stands in for the systemctl binary
+    systemctl() { return 1; }
+    safety_stop_timer_process >/dev/null 2>&1 \
+        && { echo "an unreadable unit state was treated as stopped" >&2; exit 1; }
+
+    # 明确 inactive 才算停住
+    # shellcheck disable=SC2329 # test stub stands in for the systemctl binary
+    systemctl() {
+        case "${1:-}" in
+            is-active) return 1 ;;
+            show) printf 'ActiveState=inactive\n'; return 0 ;;
+        esac
+        return 0
+    }
+    safety_stop_timer_process >/dev/null 2>&1 \
+        || { echo "a confirmed inactive unit was not accepted as stopped" >&2; exit 1; }
+    :
+}
+run_test "Stopping tells a confirmed inactive unit from an unreadable one" t_stop_001
+
+# Without flock the lock must fall back to an atomic mkdir, not wave the change through.
+t_lock_001() {
+    LK_DIR="$TMP/mkdir-lock"
+    mkdir -p "$LK_DIR"
+    QUENCH_TXN_LOCK_FILE="$LK_DIR/lock"
+    QUENCH_TXN_LOCK_HELD=0
+    QUENCH_TXN_LOCK_MODE=""
+    txn_lock_mkdir_acquire || { echo "mkdir lock could not be taken" >&2; exit 1; }
+    [ "$QUENCH_TXN_LOCK_MODE" = mkdir ] \
+        || { echo "mkdir lock did not record its mode" >&2; exit 1; }
+    [ -d "$LK_DIR/lock.d" ] || { echo "mkdir lock left no lock directory" >&2; exit 1; }
+
+    # 另一个活着的进程持有 -> 必须拒绝
+    QUENCH_TXN_LOCK_HELD=0
+    printf '%s\n' "$$" > "$LK_DIR/lock.d/pid"
+    txn_lock_mkdir_acquire >/dev/null 2>&1 \
+        && { echo "mkdir lock was handed out twice" >&2; exit 1; }
+
+    # 持有者已消失 -> 陈旧锁应被清理并重新取得
+    ( : ) & GONE=$!
+    wait "$GONE" 2>/dev/null || true
+    printf '%s\n' "$GONE" > "$LK_DIR/lock.d/pid"
+    QUENCH_TXN_LOCK_HELD=0
+    txn_lock_mkdir_acquire >/dev/null 2>&1 \
+        || { echo "a stale mkdir lock was not reclaimed" >&2; exit 1; }
+    txn_lock_release
+    [ ! -d "$LK_DIR/lock.d" ] || { echo "release left the lock directory behind" >&2; exit 1; }
+    :
+}
+run_test "Without flock the transaction lock falls back to an atomic mkdir" t_lock_001
+
+# A transaction that cannot be recorded cannot be reconciled later, so it must fail.
+t_rec_001() {
+    REC_DIR="$TMP/record-fail"
+    mkdir -p "$REC_DIR"
+    chmod 500 "$REC_DIR"
+    QUENCH_TXN_DIR="$REC_DIR/nested/transactions"
+    QUENCH_TXN_FILE=""
+    RC=0
+    txn_record_begin probe /nonexistent >/dev/null 2>&1 || RC=$?
+    chmod 700 "$REC_DIR"
+    [ "$RC" -ne 0 ] \
+        || { echo "an unwritable transaction directory was reported as recorded" >&2; exit 1; }
+
+    # 目录建得出、但记录文件写不进去，是另一条分支。txn_record_begin 会
+    # chmod 700 把目录权限改回来，所以要挡住 chmod 才能停在不可写状态。
+    WR_DIR="$TMP/record-write-fail"
+    mkdir -p "$WR_DIR"
+    QUENCH_TXN_DIR="$WR_DIR"
+    QUENCH_TXN_FILE=""
+    chmod 500 "$WR_DIR"
+    # shellcheck disable=SC2329 # test stub keeps the fixture directory read-only
+    chmod() { return 0; }
+    RC=0
+    txn_record_begin probe /nonexistent >/dev/null 2>&1 || RC=$?
+    unset -f chmod
+    command chmod 700 "$WR_DIR"
+    [ "$RC" -ne 0 ] \
+        || { echo "an unwritable record file was reported as recorded" >&2; exit 1; }
+    [ -z "$QUENCH_TXN_FILE" ] \
+        || { echo "a failed record left a dangling record handle" >&2; exit 1; }
+    :
+}
+run_test "A transaction that cannot be recorded is refused" t_rec_001
+
+# And the caller must act on that: arming has to fail and take the timer down with it.
+t_rec_002() {
+    RC2_DIR="$TMP/record-arm"
+    mkdir -p "$RC2_DIR/root/etc" "$RC2_DIR/data"
+    QUENCH_DATA_DIR="$RC2_DIR/data"
+    QUENCH_BACKUP_DIR="$RC2_DIR/data/backups"
+    QUENCH_TXN_LOCK_FILE="$RC2_DIR/lock"
+    QUENCH_TXN_LOCK_HELD=0
+    CONFIG_RESTORE_ROOT="$RC2_DIR/root"
+    printf 'x\n' > "$RC2_DIR/root/etc/hostname"
+    tar -czf "$RC2_DIR/snap.tar.gz" -C "$RC2_DIR/root" etc/hostname
+    # shellcheck disable=SC2329 # test stub avoids touching real system state
+    config_backup_create() { printf '%s\n' "$RC2_DIR/snap.tar.gz"; }
+    # shellcheck disable=SC2329 # test stub overrides the sourced function
+    svc_is_active() { return 1; }
+    # shellcheck disable=SC2329 # test stub records the script instead of launching it
+    safety_launch_timer() { SAFETY_UNIT=""; SAFETY_PID=""; SAFETY_SCRIPT="$1"; return 0; }
+    # shellcheck disable=SC2329 # test stub forces the record-failure path
+    txn_record_begin() { return 1; }
+    STOPPED=0
+    # shellcheck disable=SC2329 # test stub observes the cleanup
+    safety_stop_timer_process() { STOPPED=1; return 0; }
+
+    safety_arm recprobe >/dev/null 2>&1 \
+        && { echo "arming succeeded even though the transaction could not be recorded" >&2; exit 1; }
+    [ "$STOPPED" = 1 ] \
+        || { echo "a failed record left the rollback timer running" >&2; exit 1; }
+    [ -z "$SAFETY_SCRIPT" ] \
+        || { echo "a failed record left a rollback handle behind" >&2; exit 1; }
+    [ "$QUENCH_TXN_LOCK_HELD" = 0 ] \
+        || { echo "a failed record leaked the transaction lock" >&2; exit 1; }
+    :
+}
+run_test "Arming fails and stands down when the transaction cannot be recorded" t_rec_002
+
+# The generated rollback script must aggregate its steps instead of always exiting 0.
+t_genrb_001() {
+    GEN_DIR="$TMP/gen-rollback"
+    mkdir -p "$GEN_DIR/root/etc" "$GEN_DIR/data"
+    QUENCH_DATA_DIR="$GEN_DIR/data"
+    QUENCH_BACKUP_DIR="$GEN_DIR/data/backups"
+    QUENCH_TXN_DIR="$GEN_DIR/txn"
+    QUENCH_TXN_LOCK_FILE="$GEN_DIR/lock"
+    QUENCH_TXN_LOCK_HELD=0
+    CONFIG_RESTORE_ROOT="$GEN_DIR/root"
+    printf 'x\n' > "$GEN_DIR/root/etc/hostname"
+    tar -czf "$GEN_DIR/snap.tar.gz" -C "$GEN_DIR/root" etc/hostname
+    # shellcheck disable=SC2329 # test stub avoids touching real system state
+    config_backup_create() { printf '%s\n' "$GEN_DIR/snap.tar.gz"; }
+    # shellcheck disable=SC2329 # test stub overrides the sourced function
+    svc_is_active() { return 1; }
+    # shellcheck disable=SC2329 # test stub records the script instead of launching it
+    safety_launch_timer() { SAFETY_UNIT=""; SAFETY_PID=""; SAFETY_SCRIPT="$1"; return 0; }
+    safety_arm genprobe >/dev/null 2>&1 \
+        || { echo "could not arm the fixture transaction" >&2; exit 1; }
+    bash -n "$SAFETY_SCRIPT" \
+        || { echo "the generated rollback script does not parse" >&2; exit 1; }
+    grep -q '^RC=0$' "$SAFETY_SCRIPT" \
+        || { echo "the generated script does not track a result code" >&2; exit 1; }
+    grep -q 'exit "\$RC"' "$SAFETY_SCRIPT" \
+        || { echo "the generated script does not exit with its result code" >&2; exit 1; }
+    grep -q 'sysctl --system >/dev/null 2>&1 || RC=1' "$SAFETY_SCRIPT" \
+        || { echo "the generated script still swallows a failed sysctl reload" >&2; exit 1; }
+    :
+}
+run_test "The generated rollback script reports a failed step instead of exiting 0" t_genrb_001
+
+# Restoring a snapshot must reproduce it exactly, not merge into what is there now.
+t_exact_001() {
+    EX_DIR="$TMP/exact-restore"
+    mkdir -p "$EX_DIR/src/etc/fail2ban" "$EX_DIR/dest"
+    printf 'original\n' > "$EX_DIR/src/etc/fail2ban/jail.local"
+    ( cd "$EX_DIR/src" && tar -czf "$EX_DIR/snap.tar.gz" etc/fail2ban )
+    mkdir -p "$EX_DIR/dest/etc/fail2ban"
+    printf 'original\n' > "$EX_DIR/dest/etc/fail2ban/jail.local"
+    printf 'added-after-the-snapshot\n' > "$EX_DIR/dest/etc/fail2ban/extra.local"
+
+    CONFIG_RESTORE_ROOT="$EX_DIR/dest"
+    config_archive_extract "$EX_DIR/snap.tar.gz" >/dev/null 2>&1 \
+        || { echo "restoring a valid snapshot failed" >&2; exit 1; }
+    [ -f "$EX_DIR/dest/etc/fail2ban/jail.local" ] \
+        || { echo "the snapshot's own file was not restored" >&2; exit 1; }
+    [ ! -e "$EX_DIR/dest/etc/fail2ban/extra.local" ] \
+        || { echo "a file created after the snapshot survived the restore" >&2; exit 1; }
+    :
+}
+run_test "Snapshot restore reproduces the directory exactly" t_exact_001
 
 test_summary "Fault injection"
