@@ -201,6 +201,19 @@ QUENCH_TXN_LOCK_FILE="${QUENCH_TXN_LOCK_FILE:-/run/lock/quench-config.lock}"
 QUENCH_TXN_LOCK_HELD=0
 QUENCH_TXN_LOCK_MODE=""
 
+# 带超时地拿 flock。不能用 `flock -w N`：busybox 的 flock 只认 -sxnu，没有 -w，
+# 在 Alpine / OpenWrt 上会直接报参数错误，于是所有加锁的写入全部被拒绝。
+# 用 -n 轮询实现等待，util-linux 与 busybox 都支持。
+flock_wait() {
+    local FD="$1" WAIT="${2:-10}" I=0
+    while :; do
+        flock -n "$FD" 2>/dev/null && return 0
+        I=$((I + 1))
+        [ "$I" -lt "$WAIT" ] || return 1
+        sleep 1
+    done
+}
+
 txn_lock_acquire() {
     [ "$QUENCH_TXN_LOCK_HELD" = 1 ] && return 0
     mkdir -p "$(dirname "$QUENCH_TXN_LOCK_FILE")" 2>/dev/null || true
@@ -208,7 +221,7 @@ txn_lock_acquire() {
     # shell，那一句会把整个进程的 stderr 永久指向 /dev/null，之后所有报错全部消失。
     # 用花括号把 2>/dev/null 限定在打开锁文件这一步。
     if command -v flock >/dev/null 2>&1 && { exec 9>"$QUENCH_TXN_LOCK_FILE"; } 2>/dev/null; then
-        if flock -w "${QUENCH_TXN_LOCK_WAIT:-10}" 9 2>/dev/null; then
+        if flock_wait 9 "${QUENCH_TXN_LOCK_WAIT:-10}"; then
             QUENCH_TXN_LOCK_HELD=1
             QUENCH_TXN_LOCK_MODE="flock"
             return 0
@@ -15776,7 +15789,7 @@ nft_lock_acquire() {
     command -v flock >/dev/null 2>&1 || return 0
     [ "$NFT_LOCK_HELD" = 1 ] && return 0
     exec 8>"$NFT_LOCK_FILE" || return 1
-    if ! flock -w 30 8; then
+    if ! flock_wait 8 30; then
         # 原实现在这里直接 return，把已打开的 fd 留着不关。
         exec 8>&-
         error "另一个 Quench 转发任务正在运行"

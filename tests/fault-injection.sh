@@ -2252,4 +2252,44 @@ t_dash_001() {
 }
 run_test "The dashboard reports a tc mismatch instead of silently applying the saved rate" t_dash_001
 
+# busybox flock has no -w. Locking must work with a flock that only knows -sxnu, or
+# every guarded write is refused on Alpine and OpenWrt — the exact platforms the
+# README promises.
+t_lock_003() {
+    BB="$TMP/busybox-flock"
+    mkdir -p "$BB"
+    QUENCH_TXN_LOCK_FILE="$BB/lock"
+    QUENCH_TXN_LOCK_HELD=0
+    QUENCH_TXN_LOCK_MODE=""
+    FLOCK_CALLS="$BB/calls"
+    : > "$FLOCK_CALLS"
+    # 模拟 busybox：遇到 -w 就像未知选项一样失败；-n 正常
+    # shellcheck disable=SC2329 # test stub behaves like busybox flock
+    flock() {
+        printf '%s\n' "$*" >> "$FLOCK_CALLS"
+        case " $* " in *" -w "*) return 1 ;; esac
+        return 0
+    }
+    txn_lock_acquire >/dev/null 2>&1 \
+        || { echo "locking failed against a flock without -w (busybox)" >&2; exit 1; }
+    [ "$QUENCH_TXN_LOCK_MODE" = flock ] \
+        || { echo "lock did not use flock: mode=$QUENCH_TXN_LOCK_MODE" >&2; exit 1; }
+    grep -q -- ' -w ' "$FLOCK_CALLS" \
+        && { echo "lock still passes -w, which busybox rejects" >&2; exit 1; }
+    txn_lock_release
+
+    # 等待语义仍在：一直拿不到就超时失败，而不是立即失败
+    # shellcheck disable=SC2329 # test stub: the lock is never free
+    flock() { return 1; }
+    QUENCH_TXN_LOCK_WAIT=2
+    START=$(date +%s)
+    txn_lock_acquire >/dev/null 2>&1 \
+        && { echo "acquire succeeded while the lock was permanently busy" >&2; exit 1; }
+    ELAPSED=$(( $(date +%s) - START ))
+    [ "$ELAPSED" -ge 1 ] \
+        || { echo "acquire gave up without waiting for the configured timeout" >&2; exit 1; }
+    :
+}
+run_test "The transaction lock works with busybox flock, which lacks -w" t_lock_003
+
 test_summary "Fault injection"

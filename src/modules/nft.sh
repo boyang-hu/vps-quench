@@ -42,7 +42,7 @@ nft_lock_acquire() {
     command -v flock >/dev/null 2>&1 || return 0
     [ "$NFT_LOCK_HELD" = 1 ] && return 0
     exec 8>"$NFT_LOCK_FILE" || return 1
-    if ! flock -w 30 8; then
+    if ! flock_wait 8 30; then
         # 原实现在这里直接 return，把已打开的 fd 留着不关。
         exec 8>&-
         error "另一个 Quench 转发任务正在运行"
