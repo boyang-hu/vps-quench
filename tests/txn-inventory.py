@@ -33,6 +33,8 @@ def covered(path):
 cov={v:p for v,p in pathvars.items() if covered(p)}
 WRITE=re.compile(r'(?:(?<![<0-9])>>?\s*"?\$\{?(%s)\b|\b(?:cp|mv|install|tee|ln|truncate)\b[^\n|]*"?\$\{?(%s)\b|\brm\s+-[rf]+\s+[^\n]*"?\$\{?(%s)\b|\bsed\s+-i[^\n]*"?\$\{?(%s)\b|\b(?:atomic_replace_file|atomic_restore_file|set_config_file|restore_backup_or_remove)\b[^\n]*"?\$\{?(%s)\b|\bmkdir\b[^\n]*"?\$\{?(%s)\b)'%((('|'.join(map(re.escape,cov)) or 'NOPE'),)*6))
 LIT=re.compile(r'(?:>>?\s*"?(/etc/[^\s"]+)|\b(?:cp|mv|tee|install|rm\s+-[rf]+|sed\s+-i)\b[^\n|]*\s"?(/etc/[^\s"]+))')
+# 运行时写入：默认路由被出口源地址回滚整条替换，disable_ipv6 被 IPv6 回滚整体恢复
+RUNTIME=re.compile(r'\bip\s+(?:"?-\$\{?FAMILY\}?"?|-4|-6)?\s*route\s+(?:replace|change|add|del|delete|flush)\b|disable_ipv6"?\s*$|>\s*"?\$\{?[A-Z_]*PROC[A-Z_]*\b')
 writers={}
 for n,b in funcs.items():
     hits=set()
@@ -47,6 +49,8 @@ for n,b in funcs.items():
         for mm in LIT.finditer(line):
             p=next(g for g in mm.groups() if g)
             if covered(p): hits.add(p)
+        if RUNTIME.search(line) and not ls.startswith('#') and 'route show' not in line and 'route get' not in line:
+            hits.add('runtime:'+('default-route' if 'route' in line else 'ipv6'))
     if hits: writers[n]=hits
 GUARD=('txn_write_begin','safety_arm ','safety_arm_locked','ip_v6_safety_arm','ip_source_safety_arm','config_restore_transaction')
 guarded={n for n,b in funcs.items() if any(g in b for g in GUARD)}

@@ -2463,7 +2463,8 @@ t_review_006() {
     for FN in bbr_apply_sysctl bbr_restore_initial_baseline bbr_restore_sysctl \
               nft_add_rule nft_delete_rule nft_edit_rule nft_edit_access nft_clear_all_rules nft_toggle_rule nft_reapply \
               nft_uninstall nft_refresh_timer_enable nft_refresh_timer_disable nft_refresh_domain_targets \
-              system_hostname_apply system_enable_auto_security_updates f2b_edit_config caddy_install; do
+              system_hostname_apply system_enable_auto_security_updates f2b_edit_config caddy_install \
+              bbr_menu_initcwnd bbr_remove_initcwnd; do
         eval "${FN}_locked() { : > \"$PROBE/witness-$FN\"; }"
         RC=0
         "$FN" dummy-arg >/dev/null 2>&1 || RC=$?
@@ -2759,6 +2760,125 @@ t_review_017() {
     :
 }
 run_test "Cancel treats a stale restoring marker with no live process as a failure" t_review_017
+
+review_menu_stubs() {
+    # shellcheck disable=SC2329 # review fixture stubs
+    print_header() { :; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    menu_item() { :; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    menu_div() { :; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    ui_pause() { :; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    ui_hint() { :; }
+}
+
+# 18. 回滚中心接管遗留记录必须在事务锁内，且只接管已结束会话：原会话持锁或仍在运行都拒绝。
+t_review_018() {
+    review_setup center_takeover
+    review_menu_stubs
+    QUENCH_TXN_LOCK_WAIT=1
+    safety_arm dns >/dev/null 2>&1 || { echo "could not arm the DNS transaction" >&2; exit 1; }
+    REC="$QUENCH_TXN_FILE"
+    printf 'Port 2222\n' > "$SSHD_CONFIG"
+    txn_lock_release; QUENCH_TXN_FILE=""; SAFETY_SCRIPT=""
+    # 1) 记录所属会话已经没了，但另一个会话正持有配置锁（它在写别的东西）：不能在锁外恢复
+    sed "s/^QUENCH_PID=.*/QUENCH_PID=999999/" "$REC" > "$REC.new" && mv "$REC.new" "$REC"
+    [ "$(txn_record_state "$REC")" = armed ] || { echo "fixture: record is not 'armed'" >&2; exit 1; }
+    # 持锁者不能占着用例的输出管道，且要限时：否则断言失败退出后它会把整个用例卡到超时
+    ( txn_lock_acquire >/dev/null 2>&1 || exit 1; : > "$PROBE/holder-ready"; I=0
+      while [ ! -e "$PROBE/holder-release" ] && [ "$I" -lt 100 ]; do sleep 0.1; I=$((I + 1)); done
+      txn_lock_release ) >/dev/null 2>&1 &
+    HOLDER=$!
+    I=0; while [ ! -e "$PROBE/holder-ready" ] && [ "$I" -lt 50 ]; do sleep 0.1; I=$((I + 1)); done
+    [ -e "$PROBE/holder-ready" ] || { echo "fixture: the lock holder never came up" >&2; exit 1; }
+    txn_review_menu <<< $'1\n1\ny\n0' >/dev/null 2>&1 || true
+    [ "$(cat "$SSHD_CONFIG")" = 'Port 2222' ] || { echo "restored a snapshot while another session holds the lock" >&2; exit 1; }
+    [ -f "$REC" ] || { echo "deleted the record while another session holds the lock" >&2; exit 1; }
+    : > "$PROBE/holder-release"; wait "$HOLDER" 2>/dev/null || true
+    # 2) 锁空闲，但记录所属进程还活着
+    ( sleep 30 ) & OTHER=$!
+    sed "s/^QUENCH_PID=.*/QUENCH_PID=$OTHER/" "$REC" > "$REC.new" && mv "$REC.new" "$REC"
+    [ "$(txn_record_state "$REC")" = running ] || { echo "fixture: record is not 'running'" >&2; exit 1; }
+    txn_review_menu <<< $'1\n1\ny\n0' >/dev/null 2>&1 || true
+    [ "$(cat "$SSHD_CONFIG")" = 'Port 2222' ] || { echo "rolled back a running session's transaction" >&2; exit 1; }
+    [ -f "$REC" ] || { echo "deleted a running session's record" >&2; exit 1; }
+    [ "$QUENCH_TXN_LOCK_HELD" = 0 ] || { echo "the lock was left held after refusing" >&2; exit 1; }
+    # 3) 原会话已结束、锁空闲：可以接管
+    kill "$OTHER" 2>/dev/null || true; wait "$OTHER" 2>/dev/null || true
+    txn_review_menu <<< $'1\n1\ny\n0' >/dev/null 2>&1 || true
+    grep -qx 'Port 22' "$SSHD_CONFIG" && ! grep -q 'Port 2222' "$SSHD_CONFIG" \
+        || { echo "could not take over a dead session's rollback" >&2; exit 1; }
+    [ ! -f "$REC" ] || { echo "the record survived a successful takeover" >&2; exit 1; }
+    [ "$QUENCH_TXN_LOCK_HELD" = 0 ] || { echo "the lock was left held after the takeover" >&2; exit 1; }
+    :
+}
+run_test "The rollback center only takes over records of sessions that are gone, under the lock" t_review_018
+
+# 19. 备份轮换不能删掉未完成事务依赖的快照。
+t_review_019() {
+    review_setup prune_active
+    safety_arm dns >/dev/null 2>&1 || { echo "could not arm the DNS transaction" >&2; exit 1; }
+    SNAP=$(txn_record_field "$QUENCH_TXN_FILE" SNAPSHOT)
+    [ -n "$SNAP" ] && [ -f "$SNAP" ] || { echo "the transaction record does not name its snapshot" >&2; exit 1; }
+    cp "$SNAP" "$QUENCH_BACKUP_DIR/zzz-newer.tar.gz"; cp "$SNAP" "$QUENCH_BACKUP_DIR/aaa-older.tar.gz"
+    QUENCH_BACKUP_KEEP=1
+    config_backup_prune >/dev/null 2>&1 || { echo "prune failed" >&2; exit 1; }
+    [ -f "$SNAP" ] || { echo "pruned the snapshot of an armed transaction" >&2; exit 1; }
+    [ -f "$QUENCH_BACKUP_DIR/zzz-newer.tar.gz" ] || { echo "the newest backup was pruned" >&2; exit 1; }
+    [ ! -f "$QUENCH_BACKUP_DIR/aaa-older.tar.gz" ] || { echo "an unreferenced old backup survived the rotation" >&2; exit 1; }
+    printf 'nameserver 1.1.1.1\n' > "$CONFIG_RESTORE_ROOT/etc/resolv.conf"
+    safety_rollback_now >/dev/null 2>&1 || { echo "rollback failed after the rotation" >&2; exit 1; }
+    [ "$(cat "$CONFIG_RESTORE_ROOT/etc/resolv.conf")" = 'nameserver 192.0.2.53' ] || { echo "rollback did not restore" >&2; exit 1; }
+    :
+}
+run_test "Backup rotation keeps snapshots that pending transactions depend on" t_review_019
+
+# 20. initcwnd 改的是默认路由，出口源地址回滚会整条换掉它：IP 事务未确认时必须拒绝。
+t_review_020() {
+    review_setup initcwnd_vs_ip
+    ip_source_safety_arm 4 'default via 192.0.2.1 dev eth0 src 192.0.2.10' >/dev/null 2>&1 \
+        || { echo "could not arm the IP-source transaction" >&2; exit 1; }
+    # shellcheck disable=SC2329 # review fixture: reaching the body means the guard is missing
+    bbr_menu_initcwnd_locked() { : > "$PROBE/witness"; }
+    RC=0
+    bbr_menu_initcwnd <<< $'2\nn' >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "initcwnd was applied while an IP-source rollback was pending" >&2; exit 1; }
+    [ ! -e "$PROBE/witness" ] || { echo "initcwnd reached its body while an IP-source rollback was pending" >&2; exit 1; }
+    :
+}
+run_test "initcwnd changes are refused while an IP-source rollback is pending" t_review_020
+
+# 21. 导入不能把文件换成目录（或反过来）；即使换了，回滚也要把类型恢复回来。
+t_review_021() {
+    review_setup type_change
+    mkdir -p "$PROBE/i1/etc/ssh/sshd_config"; printf 'x\n' > "$PROBE/i1/etc/ssh/sshd_config/extra"
+    tar -czf "$PROBE/i1.tar.gz" -C "$PROBE/i1" etc/ssh/sshd_config
+    RC=0; config_archive_validate "$PROBE/i1.tar.gz" >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "an archive turning sshd_config into a directory passed validation" >&2; exit 1; }
+    mkdir -p "$PROBE/i2/etc/ssh"; printf 'x\n' > "$PROBE/i2/etc/ssh/sshd_config.d"
+    tar -czf "$PROBE/i2.tar.gz" -C "$PROBE/i2" etc/ssh/sshd_config.d
+    RC=0; config_archive_validate "$PROBE/i2.tar.gz" >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "an archive turning sshd_config.d into a file passed validation" >&2; exit 1; }
+    mkdir -p "$PROBE/i3/etc/ssh"; printf 'Port 2222\n' > "$PROBE/i3/etc/ssh/sshd_config"
+    tar -czf "$PROBE/i3.tar.gz" -C "$PROBE/i3" etc/ssh/sshd_config
+    config_archive_validate "$PROBE/i3.tar.gz" >/dev/null 2>&1 || { echo "a same-type archive was rejected" >&2; exit 1; }
+    # 解包本身也必须拒绝，不能只靠调用方先校验
+    RC=0; config_archive_extract "$PROBE/i1.tar.gz" >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "extract accepted an archive turning sshd_config into a directory" >&2; exit 1; }
+    [ -f "$SSHD_CONFIG" ] || { echo "extract replaced sshd_config with a directory" >&2; exit 1; }
+    # 类型冲突绕过校验时，恢复也必须把目录换回文件
+    safety_arm config_restore >/dev/null 2>&1 || { echo "could not arm the restore transaction" >&2; exit 1; }
+    rm -f "$SSHD_CONFIG"; mkdir "$SSHD_CONFIG"; printf 'x\n' > "$SSHD_CONFIG/extra"
+    RC=0; bash "$SAFETY_SCRIPT" --now >/dev/null 2>&1 || RC=$?
+    [ "$RC" -eq 0 ] || { echo "rollback failed on a type change (exit $RC)" >&2; exit 1; }
+    [ -f "$SSHD_CONFIG" ] && grep -qx 'Port 22' "$SSHD_CONFIG" || { echo "sshd_config was not restored as a file" >&2; exit 1; }
+    [ ! -e "$SSHD_CONFIG.quench-old" ] && [ ! -e "$SSHD_CONFIG.quench-new" ] || { echo "restore leftovers remain" >&2; exit 1; }
+    [ ! -f "$SAFETY_SCRIPT" ] || { echo "the script stayed after a successful rollback" >&2; exit 1; }
+    :
+}
+run_test "Imports cannot change a path between file and directory, and rollback restores the type" t_review_021
 
 # 9. SSH 策略的基准哈希必须取自尚未改动的候选副本：在“复制”和“算哈希”之间落地的
 #    另一笔写入，旧做法会把它算进基准，核对形同虚设，然后被旧候选原样覆盖掉。

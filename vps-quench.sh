@@ -2,7 +2,7 @@
 # 由 build.sh 从 src/ 生成；请修改模块源码后重新构建发行脚本。
 
 # ============================================================
-#  Quench V0.1.4 — VPS 初始化与管理工具
+#  Quench V0.1.5 — VPS 初始化与管理工具
 #  作者：Boyang
 #
 #  项目说明：
@@ -12,6 +12,7 @@
 #  - 支持配置备份、操作审计、离线安装、完整性校验和脚本自更新
 #
 #  发布版本：
+#  V0.1.5: 回滚中心接管遗留记录改为在事务锁内进行，并在锁内重新核对记录状态，原会话仍在运行或持锁时拒绝接管；事务记录新增 SNAPSHOT 字段，备份轮换跳过未完成事务依赖的快照；initcwnd 设置/移除接入事务锁（默认路由会被出口源地址回滚整条替换），盘点脚本识别 ip route 等运行时写入；配置导入拒绝目录与非目录之间的类型变化（校验与解包各查一次），回滚在目标已变成目录时也能把文件换回来。
 #  V0.1.4: 三个回滚脚本生成器（通用配置、IPv6、出口源地址）共用一套状态协议：.restoring/.failed 标记、恢复阶段忽略 TERM/INT、EXIT 兜底让快照损坏等提前退出也记为失败而不是永远“正在恢复”；取消时恢复进程已死而标记仍在直接判失败，不再等满超时；NFT 启停/重新应用、BBR 基线恢复/快照还原接入事务锁；新增 tests/txn-inventory.py 调用图盘点并纳入 smoke，菜单可达的快照范围写入必须受事务保护。
 #  V0.1.3: 回滚事务状态明确化：回滚脚本进入恢复阶段后留下 .restoring 标记并忽略 TERM/INT，取消与停止在恢复阶段只等待不打断，systemd 计时器单元设 SendSIGKILL=no；恢复执行失败留下 .failed 标记，确认时不再当作“已取消”删掉材料；普通文件回滚改为单次 rename 覆盖，快照外的根删除失败计入回滚结果；BBR 内核参数、端口转发规则与服务、hostname、自动安全更新、Fail2ban 编辑、Caddy 安装接入事务锁；SSH 策略与首次开荒基线的基准哈希改为取自未改动的候选副本，算不出即拒绝。
 #  V0.1.2: 安全回滚收口：自动回滚改为与配置导入一致的精确恢复（事务新增的文件回滚时删除）；Caddy 写入接入事务锁；SSH 策略与首次开荒基线在取锁后核对原文件未被改动；确认输入前计时器已到期时如实报告已回滚而非“已取消”；BBR 子菜单入口不再自动应用保存的限速。
@@ -341,8 +342,10 @@ txn_write_end() {
 QUENCH_TXN_DIR="${QUENCH_TXN_DIR:-$QUENCH_DATA_DIR/transactions}"
 QUENCH_TXN_FILE=""
 
+# $3 可选：该事务依赖的配置快照。备份轮换据此跳过它——待确认、恢复中、恢复失败的
+# 事务都还要靠这份快照回滚，按数量清理会把它删掉，回滚就直接失败。
 txn_record_begin() {
-    local LABEL="$1" SCRIPT="$2"
+    local LABEL="$1" SCRIPT="$2" SNAPSHOT="${3:-}"
     mkdir -p "$QUENCH_TXN_DIR" 2>/dev/null || {
         error "无法创建事务记录目录：$QUENCH_TXN_DIR"
         return 1
@@ -356,6 +359,7 @@ txn_record_begin() {
         printf 'TIMER_PID=%s\n' "${SAFETY_PID:-}"
         printf 'QUENCH_PID=%s\n' "$$"
         printf 'STARTED=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'SNAPSHOT=%s\n' "$SNAPSHOT"
     } > "$QUENCH_TXN_FILE" 2>/dev/null || {
         rm -f "$QUENCH_TXN_FILE" 2>/dev/null || true
         QUENCH_TXN_FILE=""
@@ -561,7 +565,7 @@ vis_len() {
 BOX_W=64
 UI_COMPACT=0
 APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
-APP_VERSION="V0.1.4"
+APP_VERSION="V0.1.5"
 APP_AUTHOR="Boyang"
 
 # 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、
@@ -6274,7 +6278,17 @@ EOF
     fi
 }
 
+# 统一写入入口：默认路由是出口源地址回滚要整条替换的对象，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 bbr_remove_initcwnd() {
+    local RC
+    txn_write_begin "恢复 initcwnd 内核默认" || return 1
+    bbr_remove_initcwnd_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_remove_initcwnd_locked() {
     local FAMILY ROUTE FAILED=0
     while IFS='|' read -r FAMILY ROUTE; do
         [ -n "$FAMILY" ] || continue
@@ -6300,7 +6314,17 @@ bbr_remove_initcwnd() {
     info "initcwnd/initrwnd 已恢复为内核默认，持久化配置已移除 ✓"
 }
 
+# 统一写入入口：默认路由是出口源地址回滚要整条替换的对象，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 bbr_menu_initcwnd() {
+    local RC
+    txn_write_begin "设置 initcwnd" || return 1
+    bbr_menu_initcwnd_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_menu_initcwnd_locked() {
     print_header "initcwnd 设置"
 
     # ── LXC 检测 ───────────────────────────────────────────
@@ -13099,11 +13123,29 @@ config_archive_validate() {
         done < <(config_backup_allowed_roots)
         [ "$OK" = true ] || { error "归档包含非 Quench 配置路径：$MEMBER"; return 1; }
     done < <(tar -tzf "$FILE")
+    # 归档成员与系统上同一路径不能在“目录”与“非目录”之间变类型：rename 覆盖不了目录，
+    # 导入把文件换成目录后，回滚会把恢复出来的文件挪进那个目录里而不是换掉它。
+    # 符号链接与普通文件之间的变化是正常的（resolv.conf 很常见），不拦。
+    local TYPE LIVE RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
+    while read -r TYPE MEMBER; do
+        MEMBER=${MEMBER#./}
+        MEMBER=${MEMBER%/}
+        [ -n "$MEMBER" ] || continue
+        LIVE="${RESTORE_ROOT%/}/$MEMBER"
+        [ -e "$LIVE" ] || continue
+        if [ "$TYPE" = d ]; then
+            [ -d "$LIVE" ] || { error "归档中 $MEMBER 是目录，当前系统上不是；类型不一致的导入无法回滚，已拒绝"; return 1; }
+        elif [ -d "$LIVE" ] && [ ! -L "$LIVE" ]; then
+            error "归档中 $MEMBER 不是目录，当前系统上是目录；类型不一致的导入无法回滚，已拒绝"; return 1
+        fi
+    done < <(tar -tvzf "$FILE" 2>/dev/null | awk '{ t = substr($1, 1, 1); n = $NF; if (t == "l") n = $(NF-2); print t, n }')
 }
 
 config_archive_extract() {
     local FILE="$1" STAGE LINK REL TARGET ROOT SRC DEST RESTORE_ROOT SAVED NEW
     RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
+    # 解包自己也做校验：调用方漏了校验、或校验与解包之间系统上的路径类型变了，都不能放过
+    config_archive_validate "$FILE" || return 1
     STAGE=$(quench_mktemp_d) || return 1
     if ! tar -xzf "$FILE" -C "$STAGE" --no-same-owner 2>/dev/null; then
         rm -rf "$STAGE"
@@ -13167,17 +13209,33 @@ config_archive_extract() {
     rm -rf "$STAGE"
 }
 
+# 仍被事务记录引用的快照（文件名列表）。记录只在回滚成功后删除，所以待确认、
+# 恢复中、恢复失败的事务都在这里。
+txn_referenced_snapshots() {
+    local REC SNAP
+    for REC in "$QUENCH_TXN_DIR"/*.txn; do
+        [ -f "$REC" ] || continue
+        SNAP=$(txn_record_field "$REC" SNAPSHOT)
+        [ -n "$SNAP" ] && basename "$SNAP"
+    done 2>/dev/null
+    return 0
+}
+
 config_backup_prune() {
-    local FILES=() f REMOVE_COUNT i
+    local FILES=() f REMOVE_COUNT=0 KEPT=0 REFERENCED
+    REFERENCED=$(txn_referenced_snapshots)
     while IFS= read -r f; do FILES+=("$f"); done < <(
         find "$QUENCH_BACKUP_DIR" -maxdepth 1 -type f -name '*.tar.gz' 2>/dev/null | sort -r
     )
-    [ "${#FILES[@]}" -le "$QUENCH_BACKUP_KEEP" ] && return 0
-    REMOVE_COUNT=$((${#FILES[@]} - QUENCH_BACKUP_KEEP))
-    for ((i=${#FILES[@]}-1; i>=QUENCH_BACKUP_KEEP; i--)); do
-        rm -f "${FILES[$i]}"
+    for f in "${FILES[@]}"; do
+        # 被未完成事务依赖的快照不参与轮换：删了它，那笔事务就再也回滚不了
+        if printf '%s\n' "$REFERENCED" | grep -qxF "$(basename "$f")"; then continue; fi
+        KEPT=$((KEPT + 1))
+        [ "$KEPT" -le "$QUENCH_BACKUP_KEEP" ] && continue
+        rm -f "$f" && REMOVE_COUNT=$((REMOVE_COUNT + 1))
     done
-    audit_action "自动清理 $REMOVE_COUNT 个旧配置备份" SUCCESS
+    [ "$REMOVE_COUNT" -eq 0 ] || audit_action "自动清理 $REMOVE_COUNT 个旧配置备份" SUCCESS
+    return 0
 }
 
 # 停止回滚计时器，并且必须确认真的停住了。
@@ -13589,7 +13647,7 @@ txn_reconcile_stale() {
 }
 
 txn_review_menu() {
-    local FILES=() FILE LABEL SCRIPT STARTED STATE INDEX CH SELECTED REMOVED
+    local FILES=() FILE LABEL SCRIPT STARTED STATE INDEX CH SELECTED REMOVED HAD_LOCK
     while true; do
         print_header "未完成的配置变更"
         FILES=()
@@ -13636,10 +13694,34 @@ txn_review_menu() {
                 confirm_change_preview "立即执行遗留回滚" \
                     "记录：$(txn_record_field "$FILE" LABEL)" \
                     "将恢复该事务开始前保存的配置快照" || continue
+                # 接管必须在事务锁内进行，并在锁内重新核对记录状态：原会话若还活着，
+                # 它随时可能继续写入，这边恢复快照就是两个写入者互相覆盖。
+                # 只允许接管已经结束的会话（进程不在了）留下的记录。
+                HAD_LOCK="$QUENCH_TXN_LOCK_HELD"
+                if ! txn_lock_acquire; then
+                    error "无法取得配置锁，拒绝接管：原会话可能仍在修改配置"
+                    ui_pause
+                    continue
+                fi
+                case "$(txn_record_state "$FILE")" in
+                    mine)
+                        [ "$HAD_LOCK" = 1 ] || txn_lock_release
+                        error "这是本会话自己的未确认变更，请在原流程中确认或回滚"
+                        ui_pause
+                        continue
+                        ;;
+                    running)
+                        [ "$HAD_LOCK" = 1 ] || txn_lock_release
+                        error "该记录所属的 Quench 会话（PID $(txn_record_field "$FILE" QUENCH_PID)）仍在运行，只能接管已结束会话的记录"
+                        ui_pause
+                        continue
+                        ;;
+                esac
                 # 必须先停掉这笔事务自己的计时器：否则脚本会被执行两次——
                 # 一次是现在手动跑，一次是原 unit 倒计时到期后自己跑。
                 if ! safety_stop_timer_process \
                     "$(txn_record_field "$FILE" UNIT)" "$(txn_record_field "$FILE" TIMER_PID)" "$SCRIPT"; then
+                    [ "$HAD_LOCK" = 1 ] || txn_lock_release
                     error "无法停止该记录的回滚计时器，拒绝手动执行以免回滚两次"
                     ui_pause
                     continue
@@ -13652,6 +13734,7 @@ txn_review_menu() {
                     audit_action "手动执行遗留回滚 $(basename "$FILE")" FAILED
                     error "回滚执行失败，请立即人工检查当前配置"
                 fi
+                [ "$HAD_LOCK" = 1 ] || txn_lock_release
                 ui_pause
                 ;;
             2)
@@ -13791,9 +13874,18 @@ for ROOT in $ROOTS_Q; do
             else [ ! -e "\$DEST.quench-old" ] || mv "\$DEST.quench-old" "\$DEST"; rm -rf "\$DEST.quench-new"; RC=1
             fi
         else
-            # 普通文件：同目录一次 rename 直接覆盖，主路径任何时刻都存在
+            # 普通文件：同目录一次 rename 直接覆盖，主路径任何时刻都存在。
+            # 目标当前是目录（导入把文件换成了目录）时 rename 会把文件挪进目录里，
+            # 只能像目录那样两步切换。
             cp -a "\$SRC" "\$DEST.quench-new" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
-            mv -f "\$DEST.quench-new" "\$DEST" || { rm -f "\$DEST.quench-new"; RC=1; }
+            if [ -d "\$DEST" ] && [ ! -L "\$DEST" ]; then
+                mv "\$DEST" "\$DEST.quench-old" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
+                if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old"
+                else mv "\$DEST.quench-old" "\$DEST"; rm -f "\$DEST.quench-new"; RC=1
+                fi
+            else
+                mv -f "\$DEST.quench-new" "\$DEST" || { rm -f "\$DEST.quench-new"; RC=1; }
+            fi
         fi
     else
         # 快照里没有 = 快照时不存在；删不掉就没有恢复到快照状态，必须计入
@@ -13851,7 +13943,7 @@ ROLLBACK_EOF
     chmod 700 "$SCRIPT"
     safety_launch_timer "$SCRIPT" \
         || { rm -f "$SCRIPT"; error "无法启动防断联回滚计时器"; return 1; }
-    txn_record_begin "$LABEL" "$SCRIPT" || {
+    txn_record_begin "$LABEL" "$SCRIPT" "$SNAP" || {
         safety_stop_timer_process || true
         rm -f "$SCRIPT"
         SAFETY_PID="" SAFETY_SCRIPT="" SAFETY_UNIT=""

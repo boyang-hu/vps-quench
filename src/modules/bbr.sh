@@ -2883,7 +2883,17 @@ EOF
     fi
 }
 
+# 统一写入入口：默认路由是出口源地址回滚要整条替换的对象，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 bbr_remove_initcwnd() {
+    local RC
+    txn_write_begin "恢复 initcwnd 内核默认" || return 1
+    bbr_remove_initcwnd_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_remove_initcwnd_locked() {
     local FAMILY ROUTE FAILED=0
     while IFS='|' read -r FAMILY ROUTE; do
         [ -n "$FAMILY" ] || continue
@@ -2909,7 +2919,17 @@ bbr_remove_initcwnd() {
     info "initcwnd/initrwnd 已恢复为内核默认，持久化配置已移除 ✓"
 }
 
+# 统一写入入口：默认路由是出口源地址回滚要整条替换的对象，未确认的回滚到期会把它覆盖回去。见 txn_write_begin。
 bbr_menu_initcwnd() {
+    local RC
+    txn_write_begin "设置 initcwnd" || return 1
+    bbr_menu_initcwnd_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_menu_initcwnd_locked() {
     print_header "initcwnd 设置"
 
     # ── LXC 检测 ───────────────────────────────────────────
