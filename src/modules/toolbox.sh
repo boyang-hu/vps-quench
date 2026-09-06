@@ -742,6 +742,7 @@ safety_arm_locked() {
     local DELAY="${SAFETY_DELAY_SECONDS:-180}" RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     local RESOLV_IMMUTABLE="inactive" PATH_VALUE TARGET ROOTS_Q="" ROOT_ITEM ROOT_ITEM_Q
     local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q PROLOGUE
+    local SYSCTL_RUNTIME="" DNS_BACKEND="static" DNS_IFACE="" DNS_EXPECTED="" DNS_FN="" DNS_IFACE_Q RESOLV_FILE_Q
     shift
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
     if safety_timer_pending; then
@@ -752,11 +753,28 @@ safety_arm_locked() {
         txn_lock_acquire || return 1
     fi
     for PATH_VALUE in "$@"; do
+        case "$PATH_VALUE" in
+            --sysctl-runtime=*)
+                # 事务开始前采集的 sysctl 运行值（key|value 每行一条），嵌进回滚脚本逐项恢复。
+                # sysctl --system 只加载现存配置，被删掉的配置声明过的参数不会自动回到旧值。
+                SYSCTL_RUNTIME=$(grep -E '^[A-Za-z0-9_./-]+\|[A-Za-z0-9_. -]*$' "${PATH_VALUE#*=}" 2>/dev/null || true)
+                continue
+                ;;
+        esac
         config_path_allowed "$PATH_VALUE" || {
             error "拒绝将非 Quench 配置路径加入回滚：$PATH_VALUE"
             return 1
         }
     done
+    # DNS 运行态：记下快照时的后端和实际生效的上游。回滚只恢复文件是不够的，
+    # 后端不重新读取（resolvconf -u / 重启 resolved）实际 DNS 还是新值；恢复后按同一套逻辑核对。
+    if [ "$RESTORE_ROOT" = / ]; then
+        DNS_BACKEND=$(dns_backend_detect 2>/dev/null || true)
+        case "$DNS_BACKEND" in ''|*[!A-Za-z-]*) DNS_BACKEND=static ;; esac
+        DNS_IFACE=$(dns_nm_default_iface 2>/dev/null || true)
+        DNS_EXPECTED=$(dns_effective_servers "$DNS_BACKEND" "$DNS_IFACE" 2>/dev/null | grep -E '^[0-9A-Fa-f:.]+$' | tr '\n' ' ')
+        DNS_FN=$(dns_effective_servers_function)
+    fi
     # 允许根列表嵌进回滚脚本：快照里没有的根在回滚时删除（快照时它不存在），
     # 这一步取代了原来按调用方传入路径逐条生成的 rm 行和两处 sysctl.d 特判。
     while IFS= read -r ROOT_ITEM; do
@@ -779,9 +797,12 @@ safety_arm_locked() {
     printf -v ROOT_Q '%q' "$RESTORE_ROOT"
     printf -v LABEL_Q '%q' "$LABEL"
     printf -v RESOLV_Q '%q' "$TARGET"
+    printf -v DNS_IFACE_Q '%q' "$DNS_IFACE"
+    printf -v RESOLV_FILE_Q '%q' "$(dns_resolv_file)"
     PROLOGUE=$(safety_script_prologue "$SCRIPT" "$DELAY") || return 1
     cat > "$SCRIPT" <<ROLLBACK_EOF
 $PROLOGUE
+$DNS_FN
 chattr -i $RESOLV_Q >/dev/null 2>&1 || true
 # 精确恢复，与配置导入同一语义。原来是 tar -xzf 直接解压合并：快照之后新增的文件
 # （例如导入带来的 sshd_config.d/99-deny.conf）会留下，回滚后的状态并不等于快照。
@@ -831,6 +852,14 @@ if [ $ROOT_Q != / ]; then rollback_finish "\$RC"; fi
 # 只统计该组件确实存在时的失败；组件本来就没装不算失败。
 if command -v sysctl >/dev/null 2>&1; then
     sysctl --system >/dev/null 2>&1 || RC=1
+    # 逐项恢复事务开始前采集的运行值并回读核对（列表为空时什么都不做）
+    while IFS='|' read -r KEY VALUE; do
+        [ -n "\$KEY" ] || continue
+        sysctl -w "\$KEY=\$VALUE" >/dev/null 2>&1 || RC=1
+        [ "\$(sysctl -n "\$KEY" 2>/dev/null)" = "\$VALUE" ] || RC=1
+    done <<'SYSCTL_RUNTIME_EOF'
+$SYSCTL_RUNTIME
+SYSCTL_RUNTIME_EOF
 fi
 if command -v sshd >/dev/null 2>&1; then
     if sshd -t >/dev/null 2>&1; then
@@ -840,8 +869,22 @@ if command -v sshd >/dev/null 2>&1; then
         RC=1
     fi
 fi
-systemctl restart systemd-resolved >/dev/null 2>&1 || true
-systemctl restart NetworkManager >/dev/null 2>&1 || true
+# DNS：按快照时的后端刷新运行态（失败计入 RC），再核对实际生效的上游——
+# 与 DNS 模块同一条判定：快照时的上游至少有一个仍在生效列表里。
+case "$DNS_BACKEND" in
+    resolvconf) resolvconf -u >/dev/null 2>&1 || RC=1 ;;
+    systemd-resolved)
+        systemctl restart systemd-resolved >/dev/null 2>&1 || RC=1
+        resolvectl flush-caches >/dev/null 2>&1 || true
+        ;;
+    NetworkManager) systemctl restart NetworkManager >/dev/null 2>&1 || RC=1 ;;
+esac
+if [ -n "$DNS_EXPECTED" ]; then
+    DNS_EFFECTIVE=\$(quench_dns_effective "$DNS_BACKEND" $DNS_IFACE_Q $RESOLV_FILE_Q)
+    DNS_OK=0
+    for S in $DNS_EXPECTED; do printf '%s\n' "\$DNS_EFFECTIVE" | grep -Fxq "\$S" && DNS_OK=1; done
+    [ "\$DNS_OK" -eq 1 ] || RC=1
+fi
 if command -v ufw >/dev/null 2>&1; then
     if [ '$UFW_STATE' = active ]; then
         ufw --force enable >/dev/null 2>&1 || RC=1

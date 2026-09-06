@@ -52,21 +52,31 @@ dns_backend_label() {
     esac
 }
 
-dns_effective_servers() {
-    local BACKEND="$1" IFACE="${2:-}" RESOLV
-    RESOLV=$(dns_resolv_file)
-    case "$BACKEND" in
+# 按后端读取实际生效的上游 DNS。函数体以文本形式提供，既在这里 eval 使用，
+# 也原样嵌进回滚脚本：回滚后核对 DNS 是否真的恢复，用的必须是同一套读取逻辑。
+# 参数：$1 后端，$2 NetworkManager 接口，$3 resolv.conf 路径。
+dns_effective_servers_function() {
+    cat <<'EOF'
+quench_dns_effective() {
+    case "$1" in
         NetworkManager)
-            nmcli -g IP4.DNS,IP6.DNS device show "$IFACE" 2>/dev/null | awk 'NF && !seen[$0]++'
+            nmcli -g IP4.DNS,IP6.DNS device show "$2" 2>/dev/null | awk 'NF && !seen[$0]++'
             ;;
         systemd-resolved)
             resolvectl dns 2>/dev/null \
                 | awk '{sub(/^.*: /, ""); for (i=1; i<=NF; i++) if ($i ~ /^[0-9A-Fa-f:.]+$/ && !seen[$i]++) print $i}'
             ;;
         *)
-            awk '$1 == "nameserver" && NF >= 2 && !seen[$2]++ {print $2}' "$RESOLV" 2>/dev/null
+            awk '$1 == "nameserver" && NF >= 2 && !seen[$2]++ {print $2}' "$3" 2>/dev/null
             ;;
     esac
+}
+EOF
+}
+
+dns_effective_servers() {
+    eval "$(dns_effective_servers_function)"
+    quench_dns_effective "$1" "${2:-}" "$(dns_resolv_file)"
 }
 
 dns_show_current() {

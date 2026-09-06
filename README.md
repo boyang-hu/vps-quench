@@ -1,4 +1,4 @@
-# Quench — VPS 初始化与管理工具 V0.1.5
+# Quench — VPS 初始化与管理工具 V0.1.6
 
 > 首次开荒 · 用户与 SSH · Fail2ban · Firewall · BBR/FQ · DNS · Caddy 网站入口 · 系统与服务管理
 
@@ -28,24 +28,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 适合不能访问 GitHub 的中国内地 VPS。先在一台可以访问 GitHub 的电脑或跳板机下载：
 
 ```bash
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.5/quench-offline-V0.1.5.tar.gz
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.5/quench-offline-V0.1.5.tar.gz.sha256
-sha256sum -c quench-offline-V0.1.5.tar.gz.sha256
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.6/quench-offline-V0.1.6.tar.gz
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.6/quench-offline-V0.1.6.tar.gz.sha256
+sha256sum -c quench-offline-V0.1.6.tar.gz.sha256
 ```
 
 再通过 `scp`、SFTP 或 WinSCP 将两个文件传到 VPS。Linux/macOS 示例：
 
 ```bash
-scp quench-offline-V0.1.5.tar.gz* root@你的VPS地址:/root/
+scp quench-offline-V0.1.6.tar.gz* root@你的VPS地址:/root/
 ```
 
 登录 VPS 后离线安装：
 
 ```bash
 cd /root
-sha256sum -c quench-offline-V0.1.5.tar.gz.sha256
-tar -xzf quench-offline-V0.1.5.tar.gz
-cd quench-offline-V0.1.5
+sha256sum -c quench-offline-V0.1.6.tar.gz.sha256
+tar -xzf quench-offline-V0.1.6.tar.gz
+cd quench-offline-V0.1.6
 bash install.sh
 v
 ```
@@ -112,7 +112,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
  ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.5  ·  Boyang
+  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.6  ·  Boyang
 ────────────────────────────────────────────────────────────────
   SSH · BBR · DNS · Caddy · Firewall · NFT · Docker
 
@@ -608,6 +608,7 @@ BBR、FQ、tc 与 initcwnd 统一由 `src/modules/bbr.sh` 管理。修改网络�
 
 | 版本 | Quench 主要变更 |
 |------|----------------|
+| **V0.1.6** | 回滚脚本按快照时的 DNS 后端刷新运行态（resolvconf -u / 重启 systemd-resolved / 重启 NetworkManager，失败计入回滚结果），并用与 DNS 模块相同的读取逻辑核对实际生效的上游；safety_arm 新增 --sysctl-runtime=FILE，首次开荒内核安全基线把旧运行值随事务保存，延迟回滚逐项 sysctl -w 恢复并回读核对。 |
 | **V0.1.5** | 回滚中心接管遗留记录改为在事务锁内进行，并在锁内重新核对记录状态，原会话仍在运行或持锁时拒绝接管；事务记录新增 SNAPSHOT 字段，备份轮换跳过未完成事务依赖的快照；initcwnd 设置/移除接入事务锁（默认路由会被出口源地址回滚整条替换），盘点脚本识别 ip route 等运行时写入；配置导入拒绝目录与非目录之间的类型变化（校验与解包各查一次），回滚在目标已变成目录时也能把文件换回来。 |
 | **V0.1.4** | 三个回滚脚本生成器（通用配置、IPv6、出口源地址）共用一套状态协议：.restoring/.failed 标记、恢复阶段忽略 TERM/INT、EXIT 兜底让快照损坏等提前退出也记为失败而不是永远“正在恢复”；取消时恢复进程已死而标记仍在直接判失败，不再等满超时；NFT 启停/重新应用、BBR 基线恢复/快照还原接入事务锁；新增 tests/txn-inventory.py 调用图盘点并纳入 smoke，菜单可达的快照范围写入必须受事务保护。 |
 | **V0.1.3** | 回滚事务状态明确化：回滚脚本进入恢复阶段后留下 .restoring 标记并忽略 TERM/INT，取消与停止在恢复阶段只等待不打断，systemd 计时器单元设 SendSIGKILL=no；恢复执行失败留下 .failed 标记，确认时不再当作“已取消”删掉材料；普通文件回滚改为单次 rename 覆盖，快照外的根删除失败计入回滚结果；BBR 内核参数、端口转发规则与服务、hostname、自动安全更新、Fail2ban 编辑、Caddy 安装接入事务锁；SSH 策略与首次开荒基线的基准哈希改为取自未改动的候选副本，算不出即拒绝。 |

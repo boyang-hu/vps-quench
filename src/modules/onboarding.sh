@@ -301,7 +301,8 @@ first_run_network_security_apply() {
         cp "$FIRST_RUN_NETWORK_SECURITY_FILE" "$BACKUP" || { rm -f "$CANDIDATE" "$RUNTIME" "$BACKUP"; return 1; }
         EXISTED=yes
     fi
-    safety_arm first_run_network_security || { rm -f "$CANDIDATE" "$RUNTIME" "$BACKUP"; return 1; }
+    # 旧运行值随事务保存：延迟回滚要逐项恢复它们，只恢复配置文件再 sysctl --system 恢复不了
+    safety_arm first_run_network_security "--sysctl-runtime=$RUNTIME" || { rm -f "$CANDIDATE" "$RUNTIME" "$BACKUP"; return 1; }
     if ! { mkdir -p "$(dirname "$FIRST_RUN_NETWORK_SECURITY_FILE")" \
         && cp "$CANDIDATE" "$FIRST_RUN_NETWORK_SECURITY_FILE" \
         && chmod 0644 "$FIRST_RUN_NETWORK_SECURITY_FILE"; } \

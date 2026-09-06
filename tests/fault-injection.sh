@@ -2880,6 +2880,204 @@ t_review_021() {
 }
 run_test "Imports cannot change a path between file and directory, and rollback restores the type" t_review_021
 
+# 下面三条跑的是完整的回滚脚本，包括服务/运行态尾段：快照根重定位到临时树，
+# 系统命令换成记录调用并模拟状态的垫片（sysctl 状态表、resolvconf/resolved 生成的 resolv.conf）。
+review_runtime_setup() {
+    review_setup "$1"
+    export QUENCH_TEST_PROBE="$PROBE"
+    mkdir -p "$PROBE/root/etc/ssh" "$PROBE/root/etc/resolvconf/resolv.conf.d" "$PROBE/root/etc/systemd/resolved.conf.d" \
+        "$PROBE/root/etc/sysctl.d" "$PROBE/run/systemd/resolve" "$PROBE/shim"
+    rm -f "$PROBE/root/etc/resolv.conf"
+    CONFIG_RESTORE_ROOT=/
+    SSHD_CONFIG="$PROBE/root/etc/ssh/sshd_config"; printf 'Port 22\n' > "$SSHD_CONFIG"
+    DNS_RESOLV_FILE="$PROBE/root/etc/resolv.conf"
+    DNS_RESOLVCONF_HEAD="$PROBE/root/etc/resolvconf/resolv.conf.d/head"
+    DNS_RESOLVED_DROPIN="$PROBE/root/etc/systemd/resolved.conf.d/99-quench.conf"
+    FIRST_RUN_NETWORK_SECURITY_FILE="$PROBE/root/etc/sysctl.d/98-vps-quench-network-security.conf"
+    printf 'net.ipv4.conf.all.accept_redirects|1\n' > "$PROBE/sysctl-state"
+    : > "$PROBE/commands"
+    # shellcheck disable=SC2329 # review fixture: snapshot roots relocated into the temporary tree
+    config_backup_allowed_roots() {
+        local P
+        for P in etc/ssh/sshd_config etc/resolv.conf etc/resolvconf/resolv.conf.d etc/systemd/resolved.conf.d \
+                 etc/sysctl.d/98-vps-quench-network-security.conf; do
+            printf '%s/root/%s\n' "${PROBE#/}" "$P"
+        done
+    }
+    # shellcheck disable=SC2329 # review fixture: a real tar of the relocated roots
+    config_backup_create() {
+        local ARCHIVE="$QUENCH_BACKUP_DIR/snapshot-$RANDOM.tar.gz" R
+        config_backup_allowed_roots | while IFS= read -r R; do
+            if [ -e "/$R" ] || [ -L "/$R" ]; then printf '%s\n' "$R"; fi
+        done > "$PROBE/backup-list"
+        tar -czf "$ARCHIVE" -C / -T "$PROBE/backup-list" || return 1
+        printf '%s\n' "$ARCHIVE"
+    }
+    # shellcheck disable=SC2329 # review fixture stubs
+    systemd_available() { return 0; }
+    cat > "$PROBE/shim/tool" <<'SHIM'
+#!/bin/bash
+P="$QUENCH_TEST_PROBE"; NAME="${0##*/}"
+printf '%s %s\n' "$NAME" "$*" >> "$P/commands"
+set_sysctl() {
+    local KEY="${1%%=*}" VALUE="${1#*=}"
+    awk -F'|' -v key="$KEY" -v value="$VALUE" '$1==key {print key "|" value; next} {print}' "$P/sysctl-state" > "$P/sysctl-state.new"
+    mv "$P/sysctl-state.new" "$P/sysctl-state"
+}
+load_sysctl() {
+    [ -f "$1" ] || return 0
+    local PAIR
+    while IFS= read -r PAIR; do set_sysctl "$PAIR"; done < <(
+        awk -F= '!/^#/ && NF==2 {gsub(/[[:space:]]/,"",$1); gsub(/[[:space:]]/,"",$2); print $1 "=" $2}' "$1")
+}
+case "$NAME" in
+    sysctl)
+        case "${1:-}" in
+            -n) awk -F'|' -v key="$2" '$1==key {print $2; found=1} END {exit !found}' "$P/sysctl-state" ;;
+            -w) [ -e "$P/sysctl-w-noop" ] || set_sysctl "$2" ;;
+            -p) load_sysctl "$2" ;;
+            --system) for F in "$P/root/etc/sysctl.d/"*.conf; do load_sysctl "$F"; done ;;
+            *) exit 1 ;;
+        esac ;;
+    resolvconf)
+        [ "${1:-}" = -u ] || exit 1
+        [ ! -e "$P/resolvconf-noop" ] || exit 0
+        [ ! -f "$P/root/etc/resolvconf/resolv.conf.d/head" ] || cp "$P/root/etc/resolvconf/resolv.conf.d/head" "$P/runtime-resolv.conf" ;;
+    systemctl)
+        case "$*" in
+            'restart ssh'|'restart sshd'|'stop firewalld'|'start firewalld') exit 0 ;;
+            'restart systemd-resolved')
+                [ ! -f "$P/fail-resolved-restart" ] || exit 1
+                [ ! -f "$P/resolved-restart-noop" ] || exit 0
+                F="$P/root/etc/systemd/resolved.conf.d/99-quench.conf"
+                if [ -f "$F" ]; then awk -F= '$1=="DNS" {print "nameserver " $2}' "$F" > "$P/run/systemd/resolve/stub-resolv.conf"
+                else printf 'nameserver 192.0.2.53\n' > "$P/run/systemd/resolve/stub-resolv.conf"; fi ;;
+            *) exit 1 ;;
+        esac ;;
+    resolvectl)
+        case "${1:-}" in
+            dns) [ -f "$P/resolvectl-silent" ] || printf 'Global: %s\n' "$(awk '$1=="nameserver" {print $2}' "$P/run/systemd/resolve/stub-resolv.conf" 2>/dev/null | tr '\n' ' ')" ;;
+            *) exit 0 ;;
+        esac ;;
+    sshd|logger|chattr|lsattr|nft) exit 0 ;;
+    ufw) [ "${1:-}" != status ] || printf 'Status: inactive\n'; exit 0 ;;
+    *) exit 1 ;;
+esac
+SHIM
+    chmod +x "$PROBE/shim/tool"
+    local N
+    for N in sysctl resolvconf systemctl resolvectl sshd logger chattr lsattr nft ufw; do ln -s "$PROBE/shim/tool" "$PROBE/shim/$N"; done
+    export PATH="$PROBE/shim:$PATH"
+}
+
+# 22. resolvconf 后端：回滚恢复了 head 之后必须 resolvconf -u，并核对实际生效的 DNS。
+t_review_022() {
+    review_runtime_setup dns_resolvconf
+    printf 'nameserver 192.0.2.53\n' > "$PROBE/runtime-resolv.conf"
+    ln -s "$PROBE/runtime-resolv.conf" "$DNS_RESOLV_FILE"
+    printf 'nameserver 192.0.2.53\n' > "$DNS_RESOLVCONF_HEAD"
+    [ "$(dns_backend_detect)" = resolvconf ] || { echo "fixture: backend is $(dns_backend_detect), expected resolvconf" >&2; exit 1; }
+    safety_arm dns >/dev/null 2>&1 || { echo "could not arm the DNS transaction" >&2; exit 1; }
+    SCRIPT="$SAFETY_SCRIPT"
+    dns_apply_resolvconf '192.0.2.99' || { echo "fixture: apply failed" >&2; exit 1; }
+    [ "$(cat "$DNS_RESOLV_FILE")" = 'nameserver 192.0.2.99' ] || { echo "fixture: the new DNS did not take effect" >&2; exit 1; }
+    RC=0; safety_rollback_now >/dev/null 2>&1 || RC=$?
+    [ "$RC" -eq 0 ] || { echo "rollback failed (exit $RC): $(tail -3 "$PROBE/commands" | tr '\n' ';')" >&2; exit 1; }
+    [ "$(cat "$DNS_RESOLVCONF_HEAD")" = 'nameserver 192.0.2.53' ] || { echo "head was not restored" >&2; exit 1; }
+    [ "$(cat "$DNS_RESOLV_FILE")" = 'nameserver 192.0.2.53' ] || { echo "rollback reported success but the effective DNS is still $(cat "$DNS_RESOLV_FILE")" >&2; exit 1; }
+    [ ! -f "$SCRIPT" ] || { echo "script kept after a successful rollback" >&2; exit 1; }
+    # 刷新命令返回成功但实际 DNS 没有变：只有核对生效值才能发现
+    safety_arm dns >/dev/null 2>&1 || { echo "could not re-arm the DNS transaction" >&2; exit 1; }
+    SCRIPT="$SAFETY_SCRIPT"
+    dns_apply_resolvconf '192.0.2.99' || { echo "fixture: second apply failed" >&2; exit 1; }
+    : > "$PROBE/resolvconf-noop"
+    RC=0; safety_rollback_now >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "rollback reported success although the effective DNS is still $(cat "$DNS_RESOLV_FILE")" >&2; exit 1; }
+    [ -f "$SCRIPT" ] && [ -f "$SCRIPT.failed" ] || { echo "rollback material was not kept after the verification failure" >&2; exit 1; }
+    :
+}
+run_test "A resolvconf DNS rollback refreshes the runtime state and verifies the effective DNS" t_review_022
+
+# 23. systemd-resolved 后端：重启失败不能报告成功；重启成功后实际 DNS 必须回到快照值。
+t_review_023() {
+    review_runtime_setup dns_resolved
+    printf 'nameserver 192.0.2.53\n' > "$PROBE/run/systemd/resolve/stub-resolv.conf"
+    ln -s "$PROBE/run/systemd/resolve/stub-resolv.conf" "$DNS_RESOLV_FILE"
+    [ "$(dns_backend_detect)" = systemd-resolved ] || { echo "fixture: backend is $(dns_backend_detect), expected systemd-resolved" >&2; exit 1; }
+    # 1) resolvectl 报不出上游（核对无从做起）：重启失败本身就必须让回滚失败
+    : > "$PROBE/resolvectl-silent"
+    safety_arm dns >/dev/null 2>&1 || { echo "could not arm the DNS transaction" >&2; exit 1; }
+    SCRIPT="$SAFETY_SCRIPT"
+    dns_apply_resolved '192.0.2.99' || { echo "fixture: apply failed" >&2; exit 1; }
+    [ "$(cat "$DNS_RESOLV_FILE")" = 'nameserver 192.0.2.99' ] || { echo "fixture: the new DNS did not take effect" >&2; exit 1; }
+    : > "$PROBE/fail-resolved-restart"
+    RC=0; safety_rollback_now >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "rollback reported success although resolved could not be restarted" >&2; exit 1; }
+    [ -f "$SCRIPT" ] && [ -f "$SCRIPT.failed" ] || { echo "rollback material was not kept after the failed restart" >&2; exit 1; }
+    [ ! -f "$DNS_RESOLVED_DROPIN" ] || { echo "the new drop-in survived the rollback" >&2; exit 1; }
+    rm -f "$PROBE/fail-resolved-restart"
+    RC=0; bash "$SCRIPT" --now >/dev/null 2>&1 || RC=$?
+    [ "$RC" -eq 0 ] || { echo "rerun failed (exit $RC)" >&2; exit 1; }
+    [ "$(cat "$DNS_RESOLV_FILE")" = 'nameserver 192.0.2.53' ] || { echo "effective DNS after the rerun is $(cat "$DNS_RESOLV_FILE")" >&2; exit 1; }
+    [ ! -f "$SCRIPT" ] || { echo "script kept after a successful rerun" >&2; exit 1; }
+    rm -f "$PROBE/resolvectl-silent"
+    # 2) 重启“成功”但 resolved 没有重新读取配置：只有核对生效值才能发现
+    safety_arm dns >/dev/null 2>&1 || { echo "could not re-arm the DNS transaction" >&2; exit 1; }
+    SCRIPT="$SAFETY_SCRIPT"
+    dns_apply_resolved '192.0.2.99' || { echo "fixture: second apply failed" >&2; exit 1; }
+    : > "$PROBE/resolved-restart-noop"
+    RC=0; safety_rollback_now >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "rollback reported success although the effective DNS is still $(cat "$DNS_RESOLV_FILE")" >&2; exit 1; }
+    [ -f "$SCRIPT" ] && [ -f "$SCRIPT.failed" ] || { echo "rollback material was not kept after the verification failure" >&2; exit 1; }
+    :
+}
+run_test "A systemd-resolved DNS rollback fails when the restart fails and verifies on success" t_review_023
+
+# 24. 首次开荒基线的延迟回滚要把旧运行值逐项恢复：sysctl --system 恢复不了被删掉配置里声明过的参数。
+t_review_024() {
+    review_runtime_setup baseline_runtime
+    printf 'nameserver 192.0.2.53\n' > "$DNS_RESOLV_FILE"
+    # shellcheck disable=SC2329 # review fixture stubs
+    ensure_sysctl() { return 0; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    has_sysctl_write() { return 0; }
+    # shellcheck disable=SC2329 # review fixture stubs
+    confirm_change_preview() { return 0; }
+    first_run_network_security_apply <<< n >/dev/null 2>&1 || { echo "fixture: applying the baseline failed" >&2; exit 1; }
+    [ "$(sysctl -n net.ipv4.conf.all.accept_redirects)" = 0 ] || { echo "fixture: the baseline did not apply" >&2; exit 1; }
+    SCRIPT="$SAFETY_SCRIPT"
+    [ -f "$SCRIPT" ] || { echo "fixture: no rollback script armed" >&2; exit 1; }
+    RC=0; safety_rollback_now >/dev/null 2>&1 || RC=$?
+    [ "$RC" -eq 0 ] || { echo "rollback failed (exit $RC)" >&2; exit 1; }
+    [ ! -f "$FIRST_RUN_NETWORK_SECURITY_FILE" ] || { echo "the new sysctl file survived the rollback" >&2; exit 1; }
+    [ "$(sysctl -n net.ipv4.conf.all.accept_redirects)" = 1 ] \
+        || { echo "rollback reported success but the runtime value is still $(sysctl -n net.ipv4.conf.all.accept_redirects)" >&2; exit 1; }
+    :
+}
+run_test "The onboarding baseline rollback restores the captured runtime sysctl values" t_review_024
+
+# 25. --sysctl-runtime 的通用语义：逐项 sysctl -w 并回读；写入“成功”但值没生效也算失败。
+t_review_025() {
+    review_runtime_setup sysctl_runtime
+    printf 'nameserver 192.0.2.53\n' > "$DNS_RESOLV_FILE"
+    printf 'net.ipv4.conf.all.accept_redirects|1\nbad key|1\n' > "$PROBE/runtime"
+    safety_arm dns "--sysctl-runtime=$PROBE/runtime" >/dev/null 2>&1 || { echo "could not arm with a runtime file" >&2; exit 1; }
+    SCRIPT="$SAFETY_SCRIPT"
+    grep -q 'net.ipv4.conf.all.accept_redirects|1' "$SCRIPT" || { echo "the runtime values were not embedded" >&2; exit 1; }
+    ! grep -q 'bad key' "$SCRIPT" || { echo "an invalid runtime line was embedded" >&2; exit 1; }
+    sysctl -w net.ipv4.conf.all.accept_redirects=0 >/dev/null
+    : > "$PROBE/sysctl-w-noop"
+    RC=0; bash "$SCRIPT" --now >/dev/null 2>&1 || RC=$?
+    [ "$RC" -ne 0 ] || { echo "rollback reported success although the sysctl value did not take" >&2; exit 1; }
+    [ -f "$SCRIPT" ] || { echo "the script deleted itself after a failed runtime restore" >&2; exit 1; }
+    rm -f "$PROBE/sysctl-w-noop"
+    RC=0; bash "$SCRIPT" --now >/dev/null 2>&1 || RC=$?
+    [ "$RC" -eq 0 ] || { echo "rollback failed (exit $RC)" >&2; exit 1; }
+    [ "$(sysctl -n net.ipv4.conf.all.accept_redirects)" = 1 ] || { echo "the runtime value was not restored" >&2; exit 1; }
+    :
+}
+run_test "Embedded runtime sysctl values are restored one by one and read back" t_review_025
+
 # 9. SSH 策略的基准哈希必须取自尚未改动的候选副本：在“复制”和“算哈希”之间落地的
 #    另一笔写入，旧做法会把它算进基准，核对形同虚设，然后被旧候选原样覆盖掉。
 t_review_009() {

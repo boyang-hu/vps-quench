@@ -2,7 +2,7 @@
 # 由 build.sh 从 src/ 生成；请修改模块源码后重新构建发行脚本。
 
 # ============================================================
-#  Quench V0.1.5 — VPS 初始化与管理工具
+#  Quench V0.1.6 — VPS 初始化与管理工具
 #  作者：Boyang
 #
 #  项目说明：
@@ -12,6 +12,7 @@
 #  - 支持配置备份、操作审计、离线安装、完整性校验和脚本自更新
 #
 #  发布版本：
+#  V0.1.6: 回滚脚本按快照时的 DNS 后端刷新运行态（resolvconf -u / 重启 systemd-resolved / 重启 NetworkManager，失败计入回滚结果），并用与 DNS 模块相同的读取逻辑核对实际生效的上游；safety_arm 新增 --sysctl-runtime=FILE，首次开荒内核安全基线把旧运行值随事务保存，延迟回滚逐项 sysctl -w 恢复并回读核对。
 #  V0.1.5: 回滚中心接管遗留记录改为在事务锁内进行，并在锁内重新核对记录状态，原会话仍在运行或持锁时拒绝接管；事务记录新增 SNAPSHOT 字段，备份轮换跳过未完成事务依赖的快照；initcwnd 设置/移除接入事务锁（默认路由会被出口源地址回滚整条替换），盘点脚本识别 ip route 等运行时写入；配置导入拒绝目录与非目录之间的类型变化（校验与解包各查一次），回滚在目标已变成目录时也能把文件换回来。
 #  V0.1.4: 三个回滚脚本生成器（通用配置、IPv6、出口源地址）共用一套状态协议：.restoring/.failed 标记、恢复阶段忽略 TERM/INT、EXIT 兜底让快照损坏等提前退出也记为失败而不是永远“正在恢复”；取消时恢复进程已死而标记仍在直接判失败，不再等满超时；NFT 启停/重新应用、BBR 基线恢复/快照还原接入事务锁；新增 tests/txn-inventory.py 调用图盘点并纳入 smoke，菜单可达的快照范围写入必须受事务保护。
 #  V0.1.3: 回滚事务状态明确化：回滚脚本进入恢复阶段后留下 .restoring 标记并忽略 TERM/INT，取消与停止在恢复阶段只等待不打断，systemd 计时器单元设 SendSIGKILL=no；恢复执行失败留下 .failed 标记，确认时不再当作“已取消”删掉材料；普通文件回滚改为单次 rename 覆盖，快照外的根删除失败计入回滚结果；BBR 内核参数、端口转发规则与服务、hostname、自动安全更新、Fail2ban 编辑、Caddy 安装接入事务锁；SSH 策略与首次开荒基线的基准哈希改为取自未改动的候选副本，算不出即拒绝。
@@ -565,7 +566,7 @@ vis_len() {
 BOX_W=64
 UI_COMPACT=0
 APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
-APP_VERSION="V0.1.5"
+APP_VERSION="V0.1.6"
 APP_AUTHOR="Boyang"
 
 # 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、
@@ -7453,21 +7454,31 @@ dns_backend_label() {
     esac
 }
 
-dns_effective_servers() {
-    local BACKEND="$1" IFACE="${2:-}" RESOLV
-    RESOLV=$(dns_resolv_file)
-    case "$BACKEND" in
+# 按后端读取实际生效的上游 DNS。函数体以文本形式提供，既在这里 eval 使用，
+# 也原样嵌进回滚脚本：回滚后核对 DNS 是否真的恢复，用的必须是同一套读取逻辑。
+# 参数：$1 后端，$2 NetworkManager 接口，$3 resolv.conf 路径。
+dns_effective_servers_function() {
+    cat <<'EOF'
+quench_dns_effective() {
+    case "$1" in
         NetworkManager)
-            nmcli -g IP4.DNS,IP6.DNS device show "$IFACE" 2>/dev/null | awk 'NF && !seen[$0]++'
+            nmcli -g IP4.DNS,IP6.DNS device show "$2" 2>/dev/null | awk 'NF && !seen[$0]++'
             ;;
         systemd-resolved)
             resolvectl dns 2>/dev/null \
                 | awk '{sub(/^.*: /, ""); for (i=1; i<=NF; i++) if ($i ~ /^[0-9A-Fa-f:.]+$/ && !seen[$i]++) print $i}'
             ;;
         *)
-            awk '$1 == "nameserver" && NF >= 2 && !seen[$2]++ {print $2}' "$RESOLV" 2>/dev/null
+            awk '$1 == "nameserver" && NF >= 2 && !seen[$2]++ {print $2}' "$3" 2>/dev/null
             ;;
     esac
+}
+EOF
+}
+
+dns_effective_servers() {
+    eval "$(dns_effective_servers_function)"
+    quench_dns_effective "$1" "${2:-}" "$(dns_resolv_file)"
 }
 
 dns_show_current() {
@@ -13812,6 +13823,7 @@ safety_arm_locked() {
     local DELAY="${SAFETY_DELAY_SECONDS:-180}" RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     local RESOLV_IMMUTABLE="inactive" PATH_VALUE TARGET ROOTS_Q="" ROOT_ITEM ROOT_ITEM_Q
     local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q PROLOGUE
+    local SYSCTL_RUNTIME="" DNS_BACKEND="static" DNS_IFACE="" DNS_EXPECTED="" DNS_FN="" DNS_IFACE_Q RESOLV_FILE_Q
     shift
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
     if safety_timer_pending; then
@@ -13822,11 +13834,28 @@ safety_arm_locked() {
         txn_lock_acquire || return 1
     fi
     for PATH_VALUE in "$@"; do
+        case "$PATH_VALUE" in
+            --sysctl-runtime=*)
+                # 事务开始前采集的 sysctl 运行值（key|value 每行一条），嵌进回滚脚本逐项恢复。
+                # sysctl --system 只加载现存配置，被删掉的配置声明过的参数不会自动回到旧值。
+                SYSCTL_RUNTIME=$(grep -E '^[A-Za-z0-9_./-]+\|[A-Za-z0-9_. -]*$' "${PATH_VALUE#*=}" 2>/dev/null || true)
+                continue
+                ;;
+        esac
         config_path_allowed "$PATH_VALUE" || {
             error "拒绝将非 Quench 配置路径加入回滚：$PATH_VALUE"
             return 1
         }
     done
+    # DNS 运行态：记下快照时的后端和实际生效的上游。回滚只恢复文件是不够的，
+    # 后端不重新读取（resolvconf -u / 重启 resolved）实际 DNS 还是新值；恢复后按同一套逻辑核对。
+    if [ "$RESTORE_ROOT" = / ]; then
+        DNS_BACKEND=$(dns_backend_detect 2>/dev/null || true)
+        case "$DNS_BACKEND" in ''|*[!A-Za-z-]*) DNS_BACKEND=static ;; esac
+        DNS_IFACE=$(dns_nm_default_iface 2>/dev/null || true)
+        DNS_EXPECTED=$(dns_effective_servers "$DNS_BACKEND" "$DNS_IFACE" 2>/dev/null | grep -E '^[0-9A-Fa-f:.]+$' | tr '\n' ' ')
+        DNS_FN=$(dns_effective_servers_function)
+    fi
     # 允许根列表嵌进回滚脚本：快照里没有的根在回滚时删除（快照时它不存在），
     # 这一步取代了原来按调用方传入路径逐条生成的 rm 行和两处 sysctl.d 特判。
     while IFS= read -r ROOT_ITEM; do
@@ -13849,9 +13878,12 @@ safety_arm_locked() {
     printf -v ROOT_Q '%q' "$RESTORE_ROOT"
     printf -v LABEL_Q '%q' "$LABEL"
     printf -v RESOLV_Q '%q' "$TARGET"
+    printf -v DNS_IFACE_Q '%q' "$DNS_IFACE"
+    printf -v RESOLV_FILE_Q '%q' "$(dns_resolv_file)"
     PROLOGUE=$(safety_script_prologue "$SCRIPT" "$DELAY") || return 1
     cat > "$SCRIPT" <<ROLLBACK_EOF
 $PROLOGUE
+$DNS_FN
 chattr -i $RESOLV_Q >/dev/null 2>&1 || true
 # 精确恢复，与配置导入同一语义。原来是 tar -xzf 直接解压合并：快照之后新增的文件
 # （例如导入带来的 sshd_config.d/99-deny.conf）会留下，回滚后的状态并不等于快照。
@@ -13901,6 +13933,14 @@ if [ $ROOT_Q != / ]; then rollback_finish "\$RC"; fi
 # 只统计该组件确实存在时的失败；组件本来就没装不算失败。
 if command -v sysctl >/dev/null 2>&1; then
     sysctl --system >/dev/null 2>&1 || RC=1
+    # 逐项恢复事务开始前采集的运行值并回读核对（列表为空时什么都不做）
+    while IFS='|' read -r KEY VALUE; do
+        [ -n "\$KEY" ] || continue
+        sysctl -w "\$KEY=\$VALUE" >/dev/null 2>&1 || RC=1
+        [ "\$(sysctl -n "\$KEY" 2>/dev/null)" = "\$VALUE" ] || RC=1
+    done <<'SYSCTL_RUNTIME_EOF'
+$SYSCTL_RUNTIME
+SYSCTL_RUNTIME_EOF
 fi
 if command -v sshd >/dev/null 2>&1; then
     if sshd -t >/dev/null 2>&1; then
@@ -13910,8 +13950,22 @@ if command -v sshd >/dev/null 2>&1; then
         RC=1
     fi
 fi
-systemctl restart systemd-resolved >/dev/null 2>&1 || true
-systemctl restart NetworkManager >/dev/null 2>&1 || true
+# DNS：按快照时的后端刷新运行态（失败计入 RC），再核对实际生效的上游——
+# 与 DNS 模块同一条判定：快照时的上游至少有一个仍在生效列表里。
+case "$DNS_BACKEND" in
+    resolvconf) resolvconf -u >/dev/null 2>&1 || RC=1 ;;
+    systemd-resolved)
+        systemctl restart systemd-resolved >/dev/null 2>&1 || RC=1
+        resolvectl flush-caches >/dev/null 2>&1 || true
+        ;;
+    NetworkManager) systemctl restart NetworkManager >/dev/null 2>&1 || RC=1 ;;
+esac
+if [ -n "$DNS_EXPECTED" ]; then
+    DNS_EFFECTIVE=\$(quench_dns_effective "$DNS_BACKEND" $DNS_IFACE_Q $RESOLV_FILE_Q)
+    DNS_OK=0
+    for S in $DNS_EXPECTED; do printf '%s\n' "\$DNS_EFFECTIVE" | grep -Fxq "\$S" && DNS_OK=1; done
+    [ "\$DNS_OK" -eq 1 ] || RC=1
+fi
 if command -v ufw >/dev/null 2>&1; then
     if [ '$UFW_STATE' = active ]; then
         ufw --force enable >/dev/null 2>&1 || RC=1
@@ -14858,7 +14912,8 @@ first_run_network_security_apply() {
         cp "$FIRST_RUN_NETWORK_SECURITY_FILE" "$BACKUP" || { rm -f "$CANDIDATE" "$RUNTIME" "$BACKUP"; return 1; }
         EXISTED=yes
     fi
-    safety_arm first_run_network_security || { rm -f "$CANDIDATE" "$RUNTIME" "$BACKUP"; return 1; }
+    # 旧运行值随事务保存：延迟回滚要逐项恢复它们，只恢复配置文件再 sysctl --system 恢复不了
+    safety_arm first_run_network_security "--sysctl-runtime=$RUNTIME" || { rm -f "$CANDIDATE" "$RUNTIME" "$BACKUP"; return 1; }
     if ! { mkdir -p "$(dirname "$FIRST_RUN_NETWORK_SECURITY_FILE")" \
         && cp "$CANDIDATE" "$FIRST_RUN_NETWORK_SECURITY_FILE" \
         && chmod 0644 "$FIRST_RUN_NETWORK_SECURITY_FILE"; } \
