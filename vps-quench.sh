@@ -1746,47 +1746,15 @@ ssh_read_port_state() {
 }
 
 ssh_sync_fail2ban_ports() {
-    local PORTS="$1" JAIL_FILE WAS_RUNNING BACKUP EXISTED=no FAILED=false
+    local PORTS="$1"
     declare -F f2b_config_file >/dev/null 2>&1 || return 0
     # 保留配置但已卸载 Fail2ban 时，新装流程会按实时 SSH 端口重建配置；
     # 此处不能让一份休眠配置阻断 SSH 端口迁移。
     command -v fail2ban-client >/dev/null 2>&1 || return 0
-    declare -F f2b_ensure_managed_config >/dev/null 2>&1 || return 1
-    declare -F f2b_set_param_jail >/dev/null 2>&1 || return 1
-    declare -F f2b_runtime_healthy >/dev/null 2>&1 || return 1
+    declare -F f2b_configure_shared >/dev/null 2>&1 || return 1
     f2b_ports_valid "$PORTS" || { warn "Fail2ban 端口列表无效"; return 1; }
-    JAIL_FILE=$(f2b_config_file)
-    BACKUP=$(quench_mktemp) || return 1
-    if [ -f "$JAIL_FILE" ]; then
-        cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
-        EXISTED=yes
-    fi
-    WAS_RUNNING=$(f2b_status)
-    if ! f2b_ensure_managed_config "$PORTS" \
-        || ! f2b_set_param_jail port "$PORTS" \
-        || ! f2b_managed_ports_match "$PORTS"; then
-        FAILED=true
-    elif [ "$WAS_RUNNING" = running ] \
-        && { ! restart_fail2ban >/dev/null 2>&1 || ! f2b_runtime_healthy; }; then
-        FAILED=true
-    elif [ "$WAS_RUNNING" != running ] && ! f2b_validate_config; then
-        FAILED=true
-    fi
-    if [ "$FAILED" = true ]; then
-        restore_backup_or_remove "$BACKUP" "$JAIL_FILE" "$EXISTED" || return 1
-        if [ "$WAS_RUNNING" = running ]; then
-            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
-            restart_fail2ban >/dev/null 2>&1 && f2b_runtime_healthy \
-                || warn "Fail2ban 原配置恢复后仍未正常运行，请立即检查服务"
-        fi
-        warn "Fail2ban 端口同步或 sshd jail 验证失败，已恢复原配置"
-        return 1
-    fi
-    rm -f "$BACKUP"
-    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
-    [ "$WAS_RUNNING" = running ] \
-        && info "Fail2ban sshd jail 已验证：端口 ${PORTS} ✓" \
-        || info "Fail2ban 配置已验证：端口 ${PORTS}（服务保持停止）"
+    # 双端口、完成切换、回滚都走同一份共享配置及三文件恢复事务。
+    f2b_configure_shared "$PORTS" "" preserve
 }
 
 ssh_firewall_close_port() {
@@ -2749,8 +2717,11 @@ user_recommended_wizard() {
 # ══════════════════════════════════════════════════════════
 
 f2b_config_file() {
-    printf '%s\n' "${F2B_JAIL_LOCAL:-/etc/fail2ban/jail.d/zz-vps-quench.local}"
+    printf '%s\n' "${QUENCH_F2B_JAIL_LOCAL:-${F2B_JAIL_LOCAL:-/etc/fail2ban/jail.local}}"
 }
+
+f2b_advanced_file() { printf '%s/jail.d/90-quench-sshd.local\n' "$(dirname "$(f2b_config_file)")"; }
+f2b_legacy_file() { printf '%s/jail.d/zz-vps-quench.local\n' "$(dirname "$(f2b_config_file)")"; }
 
 f2b_validate_config() {
     if command -v fail2ban-client >/dev/null 2>&1; then
@@ -2763,7 +2734,7 @@ f2b_validate_config() {
 f2b_ports_valid() {
     local INPUT="$1" ITEM
     local -a ITEMS=()
-    [ -n "$INPUT" ] || return 1
+    [[ "$INPUT" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
     IFS=',' read -r -a ITEMS <<< "$INPUT"
     for ITEM in "${ITEMS[@]}"; do
         [[ "$ITEM" =~ ^[0-9]+$ ]] && [ "$ITEM" -ge 1 ] && [ "$ITEM" -le 65535 ] || return 1
@@ -2793,33 +2764,6 @@ f2b_get_section_param() {
     ' "$FILE" 2>/dev/null
 }
 
-f2b_render_managed_config() {
-    local DEST="$1" BACKEND="$2" PORTS="$3" ALLOW_IPV6_LINE="$4"
-    {
-        echo "# Managed by Quench. Keep unrelated jails in jail.local or separate jail.d files."
-        if [ -n "$ALLOW_IPV6_LINE" ]; then
-            echo "[DEFAULT]"
-            echo "$ALLOW_IPV6_LINE"
-            echo ""
-        fi
-        echo "[sshd]"
-        echo "enabled  = true"
-        echo "port     = ${PORTS}"
-        echo "mode     = aggressive"
-        echo "backend  = ${BACKEND}"
-        echo "bantime  = 1h"
-        echo "findtime = 10m"
-        echo "maxretry = 5"
-        echo "bantime.increment = true"
-        echo "bantime.maxtime = 1w"
-        if [ "$BACKEND" = systemd ]; then
-            echo "journalmatch = _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=sshd.service + _COMM=sshd"
-        else
-            echo "logpath  = %(sshd_log)s"
-        fi
-    } > "$DEST"
-}
-
 f2b_backend_detect() {
     if python3 -c 'import systemd.journal' >/dev/null 2>&1; then
         echo systemd
@@ -2828,30 +2772,301 @@ f2b_backend_detect() {
     fi
 }
 
-f2b_allow_ipv6_line() {
-    local MAJOR
-    MAJOR=$(fail2ban-client version 2>/dev/null | grep -oE '[0-9]+' | head -1)
-    [ "${MAJOR:-0}" -ge 1 ] && echo 'allowipv6 = auto'
+f2b_ensure_managed_config() {
+    f2b_configure_shared "$1" "" preserve
 }
 
-f2b_ensure_managed_config() {
-    local PORTS="$1" TARGET STAGED BACKEND ALLOW_IPV6_LINE=""
+# 只对候选副本做合并。保留 jail.local 中其他段落的原文；旧 Quench 文件只在
+# 确认来源和结构后迁移。高级 bantime.* 独立存放，避免 1Panel v2.2.5 的
+# HasPrefix("bantime") 把它们当作 bantime 编辑。第三方高优先级覆盖不擅自删除。
+f2b_merge_shared_candidate() {
+    local WORK="$1" PORTS="$2" BACKEND="$3"
+    python3 - "$WORK" "$(dirname "$(f2b_config_file)")" "$PORTS" "$BACKEND" <<'PY'
+import configparser, pathlib, re, sys
+work, root = map(pathlib.Path, sys.argv[1:3])
+ports, backend = sys.argv[3:]
+basic = {'enabled', 'port', 'bantime', 'findtime', 'maxretry', 'banaction', 'logpath', 'ignoreip'}
+marker = '# Managed by Quench: SSH advanced settings; base settings live in jail.local.'
+def read(path):
+    return path.read_text() if path.exists() else ''
+def parse(text):
+    cfg = configparser.ConfigParser(interpolation=None, strict=True, inline_comment_prefixes=(';', '#'))
+    cfg.read_string(text)
+    return cfg
+def own(cfg, section):
+    return dict(cfg.defaults() if section == 'DEFAULT' else cfg._sections.get(section, {}))
+def advanced(key):
+    return key.startswith('bantime.') or key.startswith('banaction_')
+def section_parts(text):
+    # Preserve all non-sshd blocks verbatim, including comments and INCLUDES.
+    chunks = re.split(r'(?m)(?=^[ \t]*\[)', text)
+    other, ssh = [], []
+    for chunk in chunks:
+        m = re.match(r'^[ \t]*\[([^]]+)\]', chunk)
+        (ssh if m and m[1] == 'sshd' else other).append(chunk)
+    return ''.join(other), ''.join(ssh)
+try:
+    base_text, old_text, adv_text = (read(work / x) for x in ('base', 'legacy', 'advanced'))
+    base, old, adv = map(parse, (base_text, old_text, adv_text))
+    if old_text:
+        if '# Managed by Quench.' not in old_text.splitlines()[:1][0]:
+            raise ValueError('旧 drop-in 没有 Quench 标记，拒绝接管')
+        if set(old.sections()) - {'sshd'} or set(old.defaults()) - {'allowipv6'}:
+            raise ValueError('旧 drop-in 包含额外 jail/全局配置，请人工迁移，原文件未改动')
+    if adv_text and (not adv_text.startswith(marker + '\n') or set(adv.sections()) - {'sshd'} or adv.defaults()
+                     or any(not advanced(k) for k in own(adv, 'sshd'))):
+        raise ValueError('高级配置文件并非纯 Quench 高级参数，拒绝覆盖')
+    for path in sorted((root / 'jail.d').glob('*.local')):
+        if path.name in ('zz-vps-quench.local', '90-quench-sshd.local'):
+            continue
+        cfg = parse(path.read_text())
+        conflicts = basic & (set(own(cfg, 'sshd')) | set(cfg.defaults()))
+        if conflicts or cfg.has_section('INCLUDES'):
+            raise ValueError('后加载配置可能覆盖面板参数：%s (%s)，请先人工合并' % (path, ','.join(sorted(conflicts))))
+    if base.has_section('INCLUDES') and own(base, 'INCLUDES').get('after', '').strip():
+        raise ValueError('jail.local 使用 INCLUDES after，需先核对后加载覆盖，拒绝自动迁移')
+    values = own(base, 'sshd')
+    values.update(own(adv, 'sshd'))
+    values.update(own(old, 'sshd'))  # legacy was loaded after jail.local
+    # Keep the distribution's existing action when no .local explicitly sets it.
+    # In particular, merely having an inactive UFW installed must not select ufw.
+    prior = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+    prior.read([str(root / 'jail.conf')] + [str(p) for p in sorted((root / 'jail.d').glob('*.conf'))])
+    action = prior.get('sshd', 'banaction', fallback=prior.defaults().get('banaction', 'iptables-multiport'))
+    for key, value in {'bantime': '3600', 'findtime': '600', 'maxretry': '5', 'backend': backend,
+                       'mode': 'aggressive', 'banaction': action,
+                       'bantime.increment': 'true', 'bantime.maxtime': '1w'}.items():
+        values.setdefault(key, base.defaults().get(key, value))
+    values.update(enabled='true', port=ports)
+    if values['backend'] == 'systemd':
+        values.setdefault('journalmatch', '_SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=sshd.service + _COMM=sshd')
+        values['logpath'] = ''  # journal backend: do not display an unused auth.log
+    else:
+        values.setdefault('logpath', base.defaults().get('logpath', '%(sshd_log)s'))
+    for key in ('bantime', 'findtime'):
+        value = values[key]
+        if re.fullmatch(r'-?\d+', value):
+            continue
+        m = re.fullmatch(r'(\d+)([smhdw])', value)
+        if not m:
+            raise ValueError('%s=%s 无法安全转成面板所需秒数，请先改成整数秒' % (key, value))
+        values[key] = str(int(m[1]) * dict(s=1, m=60, h=3600, d=86400, w=604800)[m[2]])
+    if not re.fullmatch(r'[1-9]\d*', values['maxretry']):
+        raise ValueError('maxretry 必须是正整数')
+    for key in basic:
+        if key in values and ('\n' in values[key] or '%(' in values[key] and key != 'logpath'):
+            raise ValueError('%s 使用多行/插值，需先人工转换为面板可编辑值' % key)
+    # Keep unknown sshd settings/comments, normalize only the keys being managed.
+    other, ssh = section_parts(base_text)
+    lines, skipping = [], False
+    for line in ssh.splitlines(keepends=True):
+        if re.match(r'^\s*\[sshd\]', line):
+            continue
+        m = re.match(r'^\s*([^#;\s][^=:\s]*)\s*[=:]', line)
+        if m:
+            skipping = m[1].lower() in values
+        elif skipping and line[:1].isspace() and line.strip() and not line.lstrip().startswith(('#', ';')):
+            continue
+        else:
+            skipping = False
+        if not skipping:
+            lines.append(line)
+    base_out = other.rstrip('\n') + '\n\n[sshd]\n' + ''.join(lines)
+    if not base_out.endswith('\n'):
+        base_out += '\n'
+    for key, value in values.items():
+        if not advanced(key):
+            base_out += '%s = %s\n' % (key, value.replace('\n', '\n    '))
+    adv_out = marker + '\n[sshd]\n'
+    for key, value in values.items():
+        if advanced(key):
+            adv_out += '%s = %s\n' % (key, value.replace('\n', '\n    '))
+    (work / 'base.new').write_text(base_out.lstrip('\n'))
+    (work / 'advanced.new').write_text(adv_out)
+except (OSError, ValueError, configparser.Error) as exc:
+    print('Fail2ban 配置合并失败：%s' % exc, file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+# 不只检查配置文件里的一行：通过 Fail2ban 的合并配置确认高优先级文件没有
+# 改写参数，再从运行中的 sshd jail/action 回读。此过程不执行封禁测试。
+f2b_shared_effective_check() {
+    local RUNNING="${1:-no}" TARGET DUMP PLAN KEY VALUE ACTUAL ACTION PORTS RC=0
     TARGET=$(f2b_config_file)
-    [ -f "$TARGET" ] && return 0
-    mkdir -p "$(dirname "$TARGET")" || return 1
-    STAGED=$(mktemp "${TARGET}.tmp.XXXXXX") || return 1
-    BACKEND=$(f2b_backend_detect)
-    ALLOW_IPV6_LINE=$(f2b_allow_ipv6_line || true)
-    f2b_render_managed_config "$STAGED" "$BACKEND" "$PORTS" "$ALLOW_IPV6_LINE" \
-        || { rm -f "$STAGED"; return 1; }
-    info "正在创建 Quench 托管的 sshd drop-in"
-    chmod 0644 "$STAGED"
-    mv "$STAGED" "$TARGET" || { rm -f "$STAGED"; return 1; }
-    if ! f2b_validate_config; then
-        rm -f "$TARGET"
-        error "Fail2ban 配置创建失败，已撤销新 drop-in"
-        return 1
+    DUMP=$(quench_mktemp) || return 1
+    PLAN=$(quench_mktemp) || { rm -f "$DUMP"; return 1; }
+    fail2ban-client -d > "$DUMP" 2>/dev/null || { rm -f "$DUMP" "$PLAN"; return 1; }
+    if ! python3 - "$TARGET" "$DUMP" > "$PLAN" <<'PY'
+import ast, configparser, sys
+try:
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read(sys.argv[1])
+    wanted = cfg['sshd']
+    commands = [ast.literal_eval(x) for x in open(sys.argv[2]) if x.startswith('[')]
+    settings, actions = {}, {}
+    for c in commands:
+        if len(c) >= 4 and c[:2] == ['set', 'sshd']:
+            settings[c[2]] = c[3]
+            if c[2] == 'addaction':
+                actions.setdefault(c[3], {})
+        if len(c) >= 5 and c[:3] == ['multi-set', 'sshd', 'action']:
+            actions.setdefault(c[3], {}).update(dict(c[4]))
+        if len(c) >= 6 and c[:3] == ['set', 'sshd', 'action']:
+            actions.setdefault(c[3], {})[c[4]] = c[5]
+    for key in ('bantime', 'findtime', 'maxretry'):
+        if str(settings.get(key)) != wanted[key]:
+            raise ValueError('合并后的 %s 与 jail.local 不一致' % key)
+        print(key + '|' + wanted[key])
+    ports = lambda p: set(str(p).replace(' ', '').split(','))
+    if not actions:
+        raise ValueError('sshd 没有封禁 action')
+    for name, props in actions.items():
+        # Standard command actions carry the jail port even for ufw/allports.
+        # Custom Python/notification actions without port are not proof of SSH protection.
+        if 'port' not in props:
+            continue
+        if ports(props['port']) != ports(wanted['port']):
+            raise ValueError('action %s 的端口与 jail.local 不一致' % name)
+        print('action|' + name)
+    if not any('port' in props for props in actions.values()):
+        raise ValueError('没有可核验端口的 action，需人工检查自定义封禁配置')
+except (OSError, ValueError, KeyError, configparser.Error, SyntaxError) as exc:
+    print('Fail2ban 生效检查失败：%s' % exc, file=sys.stderr)
+    sys.exit(1)
+PY
+    then
+        rm -f "$DUMP" "$PLAN"; return 1
     fi
+    if [ "$RUNNING" = yes ]; then
+        f2b_runtime_healthy || { rm -f "$DUMP" "$PLAN"; return 1; }
+        PORTS=$(f2b_get_section_param sshd port "$TARGET" | tr -d '[:space:]')
+        while IFS='|' read -r KEY VALUE; do
+            if [ "$KEY" = action ]; then
+                ACTION="$VALUE"
+                ACTUAL=$(fail2ban-client get sshd action "$ACTION" port 2>/dev/null) \
+                    || { RC=1; break; }
+                [ "$(printf '%s' "$ACTUAL" | tr -d '[:space:]')" = "$PORTS" ] \
+                    || { error "运行中 action $ACTION 的端口不一致"; RC=1; break; }
+            else
+                ACTUAL=$(fail2ban-client get sshd "$KEY" 2>/dev/null) \
+                    || { RC=1; break; }
+                [ "$ACTUAL" = "$VALUE" ] \
+                    || { error "运行中 sshd jail 的 $KEY 不一致"; RC=1; break; }
+            fi
+        done < "$PLAN"
+    fi
+    rm -f "$DUMP" "$PLAN"
+    return "$RC"
+}
+
+f2b_shared_restore() {
+    local WORK="$1" TARGET="$2" ADVANCED="$3" LEGACY="$4" WAS_RUNNING="$5" NAME FILE RC=0
+    for NAME in base advanced legacy; do
+        case "$NAME" in base) FILE="$TARGET" ;; advanced) FILE="$ADVANCED" ;; legacy) FILE="$LEGACY" ;; esac
+        if [ -f "$WORK/$NAME" ]; then
+            atomic_restore_file "$WORK/$NAME" "$FILE" || RC=1
+        else
+            rm -f "$FILE" || RC=1
+        fi
+    done
+    if [ "$RC" = 0 ] && [ -f "$WORK/service-attempted" ]; then
+        if [ "$WAS_RUNNING" = running ]; then
+            restart_fail2ban >/dev/null 2>&1 && f2b_runtime_healthy || RC=1
+        else
+            stop_fail2ban >/dev/null 2>&1 || RC=1
+        fi
+    fi
+    [ "$RC" = 0 ] || error "恢复未确认，请保留并人工检查备份：$WORK"
+    return "$RC"
+}
+
+f2b_configure_shared() {
+    local RC
+    txn_write_begin "同步 Fail2ban 共享 SSH 配置" || return 1
+    f2b_configure_shared_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+f2b_configure_shared_locked() {
+    local PORTS="$1" BACKEND="${2:-}" MODE="${3:-preserve}" TARGET ADVANCED LEGACY STATE WORK
+    local NAME FILE WAS_RUNNING RESTORE_CMD
+    f2b_ports_valid "$PORTS" || { error "无效 SSH 端口列表"; return 1; }
+    command -v python3 >/dev/null 2>&1 || { error "Fail2ban 配置迁移/合并需要 python3，请先安装"; return 1; }
+    TARGET=$(f2b_config_file); ADVANCED=$(f2b_advanced_file); LEGACY=$(f2b_legacy_file)
+    STATE="${QUENCH_F2B_STATE_DIR:-$QUENCH_DATA_DIR/fail2ban}"
+    f2b_require_no_pending || return 1
+    for FILE in "$TARGET" "$ADVANCED" "$LEGACY"; do
+        if [ -L "$FILE" ] || { [ -e "$FILE" ] && [ ! -f "$FILE" ]; }; then
+            error "拒绝覆盖非普通配置文件：$FILE"; return 1
+        fi
+    done
+    mkdir -p "$STATE" "$(dirname "$ADVANCED")" || return 1
+    chmod 700 "$STATE" || return 1
+    WORK=$(mktemp -d "$STATE/quench-config.XXXXXX") || return 1
+    for NAME in base advanced legacy; do
+        case "$NAME" in base) FILE="$TARGET" ;; advanced) FILE="$ADVANCED" ;; legacy) FILE="$LEGACY" ;; esac
+        [ ! -f "$FILE" ] || cp -p "$FILE" "$WORK/$NAME" || return 1
+    done
+    [ -n "$BACKEND" ] || BACKEND=$(f2b_backend_detect)
+    f2b_merge_shared_candidate "$WORK" "$PORTS" "$BACKEND" || return 1
+    # 1Panel 不遵守 Quench 的锁；至少在落盘前发现确认/合并期间的外部修改。
+    for NAME in base advanced legacy; do
+        case "$NAME" in base) FILE="$TARGET" ;; advanced) FILE="$ADVANCED" ;; legacy) FILE="$LEGACY" ;; esac
+        if [ -f "$WORK/$NAME" ]; then
+            cmp -s "$WORK/$NAME" "$FILE" || { error "配置被外部修改，请重试：$FILE"; return 1; }
+        else
+            [ ! -e "$FILE" ] || { error "出现新的外部配置，请重试：$FILE"; return 1; }
+        fi
+    done
+    WAS_RUNNING=$(f2b_status)
+    printf '%s\n' "$WORK" > "$STATE/pending" || return 1
+    printf -v RESTORE_CMD 'if f2b_shared_restore %q %q %q %q %q; then rm -f %q; fi' \
+        "$WORK" "$TARGET" "$ADVANCED" "$LEGACY" "$WAS_RUNNING" "$STATE/pending"
+    # 不登记为临时文件：失败、断电或被 kill -9 后，恢复材料必须跨会话保留。
+    (
+        # shellcheck disable=SC2064 # %q 已安全引用路径；立即固化参数，不能在函数局部变量失效后再展开。
+        trap "$RESTORE_CMD" EXIT
+        trap 'exit 1' INT TERM HUP
+        atomic_replace_file "$WORK/base.new" "$TARGET" 0640 || exit 1
+        atomic_replace_file "$WORK/advanced.new" "$ADVANCED" 0640 || exit 1
+        rm -f "$LEGACY" || exit 1
+        f2b_validate_config && f2b_shared_effective_check no || exit 1
+        if [ "$WAS_RUNNING" = running ]; then
+            : > "$WORK/service-attempted" || exit 1
+            restart_fail2ban >/dev/null 2>&1 || exit 1
+            f2b_shared_effective_check yes || exit 1
+        elif [ "$MODE" = start ]; then
+            : > "$WORK/service-attempted" || exit 1
+            start_fail2ban >/dev/null 2>&1 || exit 1
+            f2b_shared_effective_check yes || exit 1
+        fi
+        rm -f "$STATE/pending" || exit 1
+        trap - EXIT INT TERM HUP
+    ) || { error "Fail2ban 同步未完成；原配置备份：$WORK"; return 1; }
+    info "Fail2ban 共享配置已验证：端口 ${PORTS}；备份：$WORK"
+    [[ "$PORTS" != *,* ]] || warn "双端口保护已保留；1Panel 单整数端口框无法完整显示，请完成 SSH 迁移后刷新"
+    return 0
+}
+
+f2b_panel_migrate() {
+    local PORTS
+    PORTS=$(ssh_effective_ports_csv)
+    confirm_change_preview "同步 Fail2ban / 1Panel 配置" \
+        "基础参数合并到 jail.local [sshd]，保留其他 jail/白名单" \
+        "SSH 端口：${PORTS}；旧 Quench drop-in 将备份迁移" \
+        "正在运行的 Fail2ban 会重启；请勿同时在 1Panel 编辑配置" || return 0
+    f2b_configure_shared "$PORTS" "" preserve
+}
+
+f2b_require_no_pending() {
+    local STATE="${QUENCH_F2B_STATE_DIR:-$QUENCH_DATA_DIR/fail2ban}"
+    [ ! -e "$STATE/pending" ] || {
+        error "存在未完成的 Fail2ban 配置事务，请先检查：$STATE/pending"
+        return 1
+    }
 }
 
 f2b_managed_ports_match() {
@@ -2921,6 +3136,7 @@ f2b_install() {
 }
 
 f2b_install_locked() {
+    f2b_require_no_pending || return 1
     print_header "安装 Fail2ban"
     info "正在安装 fail2ban..."
     if ! pkg_install fail2ban; then
@@ -2946,65 +3162,17 @@ f2b_install_locked() {
         fi
     fi
 
-    local F2B_MAJOR ALLOW_IPV6_LINE="" PORTS TARGET STAGED BACKUP EXISTED=no WAS_RUNNING i
-    F2B_MAJOR=$(fail2ban-client version 2>/dev/null | grep -oE '[0-9]+' | head -1)
-    [ "${F2B_MAJOR:-0}" -ge 1 ] && ALLOW_IPV6_LINE="allowipv6 = auto"
+    local PORTS
     PORTS=$(ssh_effective_ports_csv)
     f2b_ports_valid "$PORTS" || { error "无法确定有效的 SSH 端口"; return 1; }
-
-    TARGET=$(f2b_config_file)
-    mkdir -p "$(dirname "$TARGET")" || return 1
-    STAGED=$(mktemp "${TARGET}.tmp.XXXXXX") || return 1
-    BACKUP=$(quench_mktemp) || { rm -f "$STAGED"; return 1; }
-    if [ -f "$TARGET" ]; then
-        cp "$TARGET" "$BACKUP" || { rm -f "$STAGED" "$BACKUP"; return 1; }
-        EXISTED=yes
-    fi
-    WAS_RUNNING=$(f2b_status)
-    f2b_render_managed_config "$STAGED" "$BACKEND" "$PORTS" "$ALLOW_IPV6_LINE" \
-        || { rm -f "$STAGED" "$BACKUP"; return 1; }
-    chmod 0644 "$STAGED"
-    mv "$STAGED" "$TARGET" || { rm -f "$STAGED" "$BACKUP"; return 1; }
-    info "已生成 $(basename "$TARGET")（端口=${PORTS}, backend=${BACKEND}, mode=aggressive）✓"
-
-    info "验证 Fail2ban 配置..."
-    if ! f2b_validate_config; then
-        restore_backup_or_remove "$BACKUP" "$TARGET" "$EXISTED" || return 1
-        error "Fail2ban 配置验证失败，已恢复原配置"
-        fail2ban-client -t 2>&1 | sed 's/^/  /' || true
-        return 1
-    fi
-
+    f2b_configure_shared "$PORTS" "$BACKEND" start || return 1
     svc_enable fail2ban >/dev/null 2>&1 || true
-    if [ "$WAS_RUNNING" = running ]; then
-        restart_fail2ban >/dev/null 2>&1 || true
-    else
-        rm -f /run/fail2ban/fail2ban.sock /var/run/fail2ban/fail2ban.sock 2>/dev/null || true
-        start_fail2ban >/dev/null 2>&1 || true
-    fi
-    i=0
-    while [ "$i" -lt 10 ]; do
-        f2b_ping && break
-        sleep 1
-        i=$((i + 1))
-    done
-    if ! f2b_ping || ! fail2ban-client status sshd >/dev/null 2>&1; then
-        restore_backup_or_remove "$BACKUP" "$TARGET" "$EXISTED" || return 1
-        if [ "$WAS_RUNNING" = running ]; then
-            restart_fail2ban >/dev/null 2>&1 || true
-        else
-            stop_fail2ban >/dev/null 2>&1 || true
-        fi
-        error "Fail2ban 未能使用新配置启动，已恢复原配置"
-        command -v journalctl >/dev/null 2>&1 && journalctl -u fail2ban -n 20 --no-pager 2>/dev/null || true
-        return 1
-    fi
-    rm -f "$BACKUP"
     info "Fail2ban 安装并启动成功 ✓"
 }
 
 f2b_write_section_param() {
-    local SECTION="$1" KEY="$2" VAL="$3" JAIL_FILE="${F2B_JAIL_LOCAL:-$(f2b_config_file)}" TMP
+    local SECTION="$1" KEY="$2" VAL="$3" JAIL_FILE TMP
+    JAIL_FILE=$(f2b_config_file)
     mkdir -p "$(dirname "$JAIL_FILE")" || return 1
     TMP=$(mktemp "${JAIL_FILE}.tmp.XXXXXX") || return 1
     [ -f "$JAIL_FILE" ] || : > "$JAIL_FILE"
@@ -3039,10 +3207,13 @@ f2b_write_section_param() {
 }
 
 f2b_set_section_param() {
-    local SECTION="$1" KEY="$2" VAL="$3" JAIL_FILE="${F2B_JAIL_LOCAL:-$(f2b_config_file)}" BACKUP EXISTED=no
-    BACKUP=$(quench_mktemp) || return 1
+    local SECTION="$1" KEY="$2" VAL="$3" JAIL_FILE BACKUP EXISTED=no
+    JAIL_FILE=$(f2b_config_file)
+    mkdir -p "$(dirname "$JAIL_FILE")" || return 1
+    # 恢复失败时不能被全局临时文件清理删掉；成功时由本函数显式删除。
+    BACKUP=$(mktemp "$(dirname "$JAIL_FILE")/.quench-fail2ban-backup.XXXXXX") || return 1
     if [ -f "$JAIL_FILE" ]; then
-        cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
+        cp -p "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
         EXISTED=yes
     fi
     if ! f2b_write_section_param "$SECTION" "$KEY" "$VAL" || ! f2b_validate_config; then
@@ -3063,9 +3234,10 @@ f2b_set_param() {
 f2b_set_param_jail() {
     local KEY="$1" VAL="$2" JAIL_FILE BACKUP EXISTED=no
     JAIL_FILE=$(f2b_config_file)
-    BACKUP=$(quench_mktemp) || return 1
+    mkdir -p "$(dirname "$JAIL_FILE")" || return 1
+    BACKUP=$(mktemp "$(dirname "$JAIL_FILE")/.quench-fail2ban-backup.XXXXXX") || return 1
     if [ -f "$JAIL_FILE" ]; then
-        cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
+        cp -p "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
         EXISTED=yes
     fi
     if ! f2b_write_section_param sshd enabled true \
@@ -3090,7 +3262,11 @@ f2b_config_params() {
 }
 
 f2b_config_params_locked() {
+    f2b_require_no_pending || return 1
     print_header "Fail2ban SSH 防护参数"
+    if [ -f "$(f2b_legacy_file)" ]; then
+        f2b_ensure_managed_config "$(ssh_effective_ports_csv)" || return 1
+    fi
     local JAIL_FILE CUR_BAN CUR_FIND CUR_MAX CUR_PORT BAN_SEC FIND_SEC CH VAL PRESET
     local APPLY_BAN="" APPLY_FIND="" APPLY_MAX="" APPLY_PORT="" BACKUP WAS_RUNNING
     JAIL_FILE=$(f2b_config_file)
@@ -3157,13 +3333,14 @@ f2b_config_params_locked() {
     esac
 
     [ -f "$JAIL_FILE" ] || { error "Quench Fail2ban 配置不存在，请先安装/修复"; return 1; }
-    BACKUP=$(quench_mktemp) || return 1
-    cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
+    BACKUP=$(mktemp "$(dirname "$JAIL_FILE")/.quench-fail2ban-backup.XXXXXX") || return 1
+    cp -p "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
     WAS_RUNNING=$(f2b_status)
     if { [ -z "$APPLY_BAN" ] || f2b_set_param bantime "$APPLY_BAN"; } \
         && { [ -z "$APPLY_FIND" ] || f2b_set_param findtime "$APPLY_FIND"; } \
         && { [ -z "$APPLY_MAX" ] || f2b_set_param maxretry "$APPLY_MAX"; } \
-        && { [ -z "$APPLY_PORT" ] || f2b_set_param_jail port "$APPLY_PORT"; }; then
+        && { [ -z "$APPLY_PORT" ] || f2b_set_param_jail port "$APPLY_PORT"; } \
+        && f2b_shared_effective_check no; then
         :
     else
         if atomic_replace_file "$BACKUP" "$JAIL_FILE"; then
@@ -3179,14 +3356,20 @@ f2b_config_params_locked() {
     if [ "$WAS_RUNNING" != running ]; then
         rm -f "$BACKUP"
         info "配置已保存；Fail2ban 当前未运行，因此未自动启动"
-    elif restart_fail2ban && f2b_ping; then
+    elif restart_fail2ban && f2b_shared_effective_check yes; then
         rm -f "$BACKUP"
         info "Fail2ban 已重启 ✓"
     else
-        cp "$BACKUP" "$JAIL_FILE"
-        restart_fail2ban >/dev/null 2>&1 || true
-        rm -f "$BACKUP"
-        error "Fail2ban 无法使用新参数运行，已恢复修改前配置"
+        if atomic_restore_file "$BACKUP" "$JAIL_FILE"; then
+            if ! restart_fail2ban >/dev/null 2>&1 || ! f2b_runtime_healthy; then
+                error "原配置已恢复，但服务恢复未确认；备份：$BACKUP"
+                return 1
+            fi
+            rm -f "$BACKUP"
+            error "Fail2ban 无法使用新参数运行，已恢复修改前配置"
+        else
+            error "恢复失败，请保留并人工检查备份：$BACKUP"
+        fi
         return 1
     fi
 }
@@ -3202,30 +3385,43 @@ f2b_edit_config() {
 }
 
 f2b_edit_config_locked() {
-    print_header "编辑 Quench Fail2ban 配置"
+    f2b_require_no_pending || return 1
+    print_header "编辑共享 Fail2ban 配置"
+    if [ -f "$(f2b_legacy_file)" ]; then
+        f2b_ensure_managed_config "$(ssh_effective_ports_csv)" || return 1
+    fi
     local JAIL_FILE BACKUP RESTART
     JAIL_FILE=$(f2b_config_file)
     mkdir -p "$(dirname "$JAIL_FILE")"
     [ -f "$JAIL_FILE" ] || { warn "请先执行 Fail2ban 安装/修复"; return 1; }
-    BACKUP=$(quench_mktemp) || return 1
-    cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
+    BACKUP=$(mktemp "$(dirname "$JAIL_FILE")/.quench-fail2ban-backup.XXXXXX") || return 1
+    cp -p "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
     warn "即将编辑 ${JAIL_FILE}；保存后会先验证，失败自动恢复"
     ui_continue
     open_editor "$JAIL_FILE"
-    if ! f2b_validate_config; then
-        cp "$BACKUP" "$JAIL_FILE"
-        rm -f "$BACKUP"
-        error "配置验证失败，已恢复编辑前版本"
+    if ! f2b_validate_config || ! f2b_shared_effective_check no; then
+        if atomic_restore_file "$BACKUP" "$JAIL_FILE"; then
+            rm -f "$BACKUP"
+            error "配置验证失败，已恢复编辑前版本"
+        else
+            error "恢复失败，请保留并人工检查备份：$BACKUP"
+        fi
         return 1
     fi
     read -rp "  验证通过，是否重启 Fail2ban？(Y/n): " RESTART
     RESTART="${RESTART:-y}"
     if echo "$RESTART" | grep -qiE '^y(es)?$'; then
-        if ! restart_fail2ban || ! f2b_ping; then
-            cp "$BACKUP" "$JAIL_FILE"
-            restart_fail2ban >/dev/null 2>&1 || true
-            rm -f "$BACKUP"
-            error "新配置无法启动服务，已恢复原配置"
+        if ! restart_fail2ban || ! f2b_shared_effective_check yes; then
+            if atomic_restore_file "$BACKUP" "$JAIL_FILE"; then
+                if ! restart_fail2ban >/dev/null 2>&1 || ! f2b_runtime_healthy; then
+                    error "原配置已恢复，但服务恢复未确认；备份：$BACKUP"
+                    return 1
+                fi
+                rm -f "$BACKUP"
+                error "新配置无法启动服务，已恢复原配置"
+            else
+                error "恢复失败，请保留并人工检查备份：$BACKUP"
+            fi
             return 1
         fi
         info "Fail2ban 已重启 ✓"
@@ -3235,8 +3431,7 @@ f2b_edit_config_locked() {
 
 f2b_uninstall() {
     print_header "卸载 Fail2ban"
-    local CONFIRM PURGE TARGET
-    TARGET=$(f2b_config_file)
+    local CONFIRM
     warn "卸载会停止动态封禁；默认保留所有配置，方便恢复"
     read -rp "  确认卸载？(y/N): " CONFIRM
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
@@ -3244,13 +3439,7 @@ f2b_uninstall() {
     svc_disable fail2ban >/dev/null 2>&1 || true
     pkg_remove fail2ban || { error "卸载失败"; return 1; }
     info "Fail2ban 已卸载，配置已保留 ✓"
-    if [ -f "$TARGET" ]; then
-        read -rp "  如需删除 Quench 配置，输入 PURGE（其他 Fail2ban 配置不会删除）: " PURGE
-        if [ "$PURGE" = PURGE ]; then
-            rm -f "$TARGET"
-            info "已删除 Quench 托管的 Fail2ban drop-in"
-        fi
-    fi
+    # jail.local 与面板/用户共享，卸载绝不能按旧的独占 drop-in 语义删除整份文件。
 }
 
 f2b_jail_name() {
@@ -3344,6 +3533,7 @@ fail2ban_menu() {
             BANNED_COUNT="-"; TOTAL_FAIL="-"
         fi
         JAIL_FILE=$(f2b_config_file)
+        [ ! -f "$(f2b_legacy_file)" ] || JAIL_FILE=$(f2b_legacy_file)
         CUR_BAN=$(f2b_get_section_param sshd bantime "$JAIL_FILE"); CUR_BAN="${CUR_BAN:-1h}"
         CUR_FIND=$(f2b_get_section_param sshd findtime "$JAIL_FILE"); CUR_FIND="${CUR_FIND:-10m}"
         CUR_MAX=$(f2b_get_section_param sshd maxretry "$JAIL_FILE"); CUR_MAX="${CUR_MAX:-5}"
@@ -3362,13 +3552,14 @@ fail2ban_menu() {
         box_sep
         menu_pair "1" "查看封禁 IP" "2" "手动解封"
         menu_pair "3" "实时日志" "4" "SSH 防护参数"
-        menu_pair "5" "编辑 Quench 配置" "6" "卸载 Fail2ban" "$GREEN" "$YELLOW"
+        menu_pair "5" "编辑共享配置" "6" "卸载 Fail2ban" "$GREEN" "$YELLOW"
         menu_item "u" "安装 / 修复 / 更新 Fail2ban" "$CYAN"
+        menu_item "p" "同步 / 迁移 1Panel 共享配置" "$CYAN"
         # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$F2B_ST" = running ] && menu_item "7" "停止服务" "$YELLOW" || menu_item "7" "启动服务"
         menu_pair "0" "返回主菜单" "00" "退出脚本" "$RED" "$RED"
         box_bot
-        read -rp "$(ui_prompt '选择操作 [0-7 / u]: ')" CHOICE
+        read -rp "$(ui_prompt '选择操作 [0-7 / u / p]: ')" CHOICE
         case "$CHOICE" in
             1) f2b_banned_list "$JAIL_NAME" ;;
             2) f2b_unban "$JAIL_NAME" ;;
@@ -3377,6 +3568,7 @@ fail2ban_menu() {
             5) f2b_edit_config ;;
             6) f2b_uninstall ;;
             u|U) f2b_install ;;
+            p|P) f2b_panel_migrate ;;
             7)
                 if [ "$F2B_ST" = running ]; then
                     # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底

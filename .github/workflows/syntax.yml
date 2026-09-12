@@ -13,7 +13,11 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Check shell syntax
-        run: bash -n vps-quench.sh build-offline-package.sh tests/offline-package.sh
+        run: |
+          for script in vps-quench.sh build-offline-package.sh tests/offline-package.sh \
+            tests/fail2ban-shared.sh tests/fail2ban-shared-integration.sh; do
+            bash -n "$script"
+          done
 
       - name: Verify generated release
         run: ./build.sh --check
@@ -39,6 +43,15 @@ jobs:
 
       - name: Run fault injection tests
         run: tests/fault-injection.sh
+
+      - name: Test Fail2ban and 1Panel shared configuration
+        run: bash tests/fail2ban-shared.sh
+
+      - name: Install real Fail2ban test dependency
+        run: sudo apt-get update && sudo apt-get install -y fail2ban
+
+      - name: Test isolated real Fail2ban parser and runtime
+        run: sudo bash tests/fail2ban-shared-integration.sh
 
       - name: Test offline package
         run: tests/offline-package.sh

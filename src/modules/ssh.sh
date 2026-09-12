@@ -426,47 +426,15 @@ ssh_read_port_state() {
 }
 
 ssh_sync_fail2ban_ports() {
-    local PORTS="$1" JAIL_FILE WAS_RUNNING BACKUP EXISTED=no FAILED=false
+    local PORTS="$1"
     declare -F f2b_config_file >/dev/null 2>&1 || return 0
     # 保留配置但已卸载 Fail2ban 时，新装流程会按实时 SSH 端口重建配置；
     # 此处不能让一份休眠配置阻断 SSH 端口迁移。
     command -v fail2ban-client >/dev/null 2>&1 || return 0
-    declare -F f2b_ensure_managed_config >/dev/null 2>&1 || return 1
-    declare -F f2b_set_param_jail >/dev/null 2>&1 || return 1
-    declare -F f2b_runtime_healthy >/dev/null 2>&1 || return 1
+    declare -F f2b_configure_shared >/dev/null 2>&1 || return 1
     f2b_ports_valid "$PORTS" || { warn "Fail2ban 端口列表无效"; return 1; }
-    JAIL_FILE=$(f2b_config_file)
-    BACKUP=$(quench_mktemp) || return 1
-    if [ -f "$JAIL_FILE" ]; then
-        cp "$JAIL_FILE" "$BACKUP" || { rm -f "$BACKUP"; return 1; }
-        EXISTED=yes
-    fi
-    WAS_RUNNING=$(f2b_status)
-    if ! f2b_ensure_managed_config "$PORTS" \
-        || ! f2b_set_param_jail port "$PORTS" \
-        || ! f2b_managed_ports_match "$PORTS"; then
-        FAILED=true
-    elif [ "$WAS_RUNNING" = running ] \
-        && { ! restart_fail2ban >/dev/null 2>&1 || ! f2b_runtime_healthy; }; then
-        FAILED=true
-    elif [ "$WAS_RUNNING" != running ] && ! f2b_validate_config; then
-        FAILED=true
-    fi
-    if [ "$FAILED" = true ]; then
-        restore_backup_or_remove "$BACKUP" "$JAIL_FILE" "$EXISTED" || return 1
-        if [ "$WAS_RUNNING" = running ]; then
-            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
-            restart_fail2ban >/dev/null 2>&1 && f2b_runtime_healthy \
-                || warn "Fail2ban 原配置恢复后仍未正常运行，请立即检查服务"
-        fi
-        warn "Fail2ban 端口同步或 sshd jail 验证失败，已恢复原配置"
-        return 1
-    fi
-    rm -f "$BACKUP"
-    # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
-    [ "$WAS_RUNNING" = running ] \
-        && info "Fail2ban sshd jail 已验证：端口 ${PORTS} ✓" \
-        || info "Fail2ban 配置已验证：端口 ${PORTS}（服务保持停止）"
+    # 双端口、完成切换、回滚都走同一份共享配置及三文件恢复事务。
+    f2b_configure_shared "$PORTS" "" preserve
 }
 
 ssh_firewall_close_port() {

@@ -720,19 +720,21 @@ EOF
 }
 run_test "Quench Fail2ban changes are scoped to sshd and must not rewrite global defaults" t_fi_025
 
-# The managed Fail2ban drop-in must use real numeric ports and escalating bans.
+# Shared Fail2ban candidates must use real ports and separate advanced settings.
 t_fi_026() {
-    F2B_RENDER="$TMP/zz-vps-quench.local"
-    f2b_render_managed_config "$F2B_RENDER" systemd 22,2222 'allowipv6 = auto'
-    grep -Eq '^port[[:space:]]*=[[:space:]]*22,2222$' "$F2B_RENDER" \
+    local WORK="$TMP/fail2ban-candidate"
+    local QUENCH_F2B_JAIL_LOCAL="$WORK/config/jail.local"
+    mkdir -p "$WORK/config/jail.d"
+    f2b_merge_shared_candidate "$WORK" 22,2222 systemd
+    grep -Eq '^port[[:space:]]*=[[:space:]]*22,2222$' "$WORK/base.new" \
         || { echo "Fail2ban managed config missed SSH migration ports" >&2; exit 1; }
-    grep -Eq '^mode[[:space:]]*=[[:space:]]*aggressive$' "$F2B_RENDER" \
+    grep -Eq '^mode[[:space:]]*=[[:space:]]*aggressive$' "$WORK/base.new" \
         || { echo "Fail2ban aggressive mode is missing" >&2; exit 1; }
-    grep -Eq '^bantime\.increment[[:space:]]*=[[:space:]]*true$' "$F2B_RENDER" \
+    grep -Eq '^bantime\.increment[[:space:]]*=[[:space:]]*true$' "$WORK/advanced.new" \
         || { echo "Fail2ban escalating bans are missing" >&2; exit 1; }
     :
 }
-run_test "The managed Fail2ban drop-in must use real numeric ports and escalating bans" t_fi_026
+run_test "Shared Fail2ban candidates must use real ports and separate escalating bans" t_fi_026
 
 # Invalid Fail2ban edits must restore the previous managed drop-in.
 t_fi_027() {
@@ -749,7 +751,9 @@ run_test "Invalid Fail2ban edits must restore the previous managed drop-in" t_fi
 
 # Updating SSH while Fail2ban is intentionally stopped must update its file without starting it.
 t_fi_028() {
-    export F2B_JAIL_LOCAL="$TMP/fail2ban-stopped.local"
+    mkdir -p "$TMP/fail2ban-stopped"
+    export F2B_JAIL_LOCAL="$TMP/fail2ban-stopped/jail.local"
+    QUENCH_F2B_STATE_DIR="$TMP/fail2ban-stopped/state"
     printf '[sshd]\nenabled = true\nport = 22\n' > "$F2B_JAIL_LOCAL"
     RESTARTED=false
     info() { :; }
@@ -758,6 +762,7 @@ t_fi_028() {
     f2b_status() { echo stopped; }
     restart_fail2ban() { RESTARTED=true; }
     fail2ban-client() { :; }
+    f2b_shared_effective_check() { return 0; }
     ssh_sync_fail2ban_ports 22,2222 \
         || { echo "Stopped Fail2ban blocked SSH port synchronization" >&2; exit 1; }
     [ "$RESTARTED" = false ] \
@@ -770,21 +775,25 @@ run_test "Updating SSH while Fail2ban is intentionally stopped must update its f
 
 # A running sshd jail health failure must restore the previous Fail2ban port configuration.
 t_fi_029() {
-    export F2B_JAIL_LOCAL="$TMP/fail2ban-jail-health.local"
+    mkdir -p "$TMP/fail2ban-jail-health"
+    export F2B_JAIL_LOCAL="$TMP/fail2ban-jail-health/jail.local"
+    QUENCH_F2B_STATE_DIR="$TMP/fail2ban-jail-health/state"
     printf '[sshd]\nenabled = true\nport = 22\n' > "$F2B_JAIL_LOCAL"
-    RESTART_COUNT=0
+    RESTART_LOG="$TMP/fail2ban-jail-health/restarts"
+    : > "$RESTART_LOG"
     info() { :; }
     warn() { :; }
     error() { :; }
     f2b_status() { echo running; }
     fail2ban-client() { :; }
-    restart_fail2ban() { RESTART_COUNT=$((RESTART_COUNT + 1)); }
-    f2b_runtime_healthy() { [ "$RESTART_COUNT" -ge 2 ]; }
+    restart_fail2ban() { echo restart >> "$RESTART_LOG"; }
+    f2b_runtime_healthy() { [ "$(wc -l < "$RESTART_LOG")" -ge 2 ]; }
+    f2b_shared_effective_check() { [ "$1" = no ] || f2b_runtime_healthy; }
     ! ssh_sync_fail2ban_ports 22,2222 >/dev/null 2>&1 \
         || { echo "Unhealthy Fail2ban sshd jail was accepted" >&2; exit 1; }
     grep -Eq '^port[[:space:]]*=[[:space:]]*22$' "$F2B_JAIL_LOCAL" \
         || { echo "Fail2ban sshd jail health failure did not restore old ports" >&2; exit 1; }
-    [ "$RESTART_COUNT" -eq 2 ] \
+    [ "$(wc -l < "$RESTART_LOG")" -eq 2 ] \
         || { echo "Fail2ban old configuration was not restarted after rollback" >&2; exit 1; }
     :
 }
@@ -818,6 +827,7 @@ t_fi_031() {
     error() { :; }
     f2b_validate_config() { return 0; }
     f2b_status() { echo running; }
+    f2b_shared_effective_check() { return 0; }
     restart_fail2ban() { return 1; }
     f2b_ping() { return 1; }
     ! f2b_config_params <<< $'1\n7200' >/dev/null 2>&1 \

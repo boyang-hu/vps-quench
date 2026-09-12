@@ -181,7 +181,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 
 ### 2. Fail2ban 管理
 
-自动封禁 SSH 暴力破解 IP。安装时自动检测 backend 和 sshd 真实监听端口，支持 `python3-systemd` / `rsyslog` / `auto` 多种方式。Quench 只管理独立 drop-in，不覆盖用户的 `jail.local` 和其他 jail。
+自动封禁 SSH 暴力破解 IP。安装时自动检测 backend 和 sshd 真实监听端口，支持 `python3-systemd` / `rsyslog` / `auto` 多种方式。SSH 基础参数与 1Panel 共用 `/etc/fail2ban/jail.local` 的 `[sshd]` 段；合并时保留其他 jail、白名单及已有策略，不整份覆盖配置文件。
 
 | 功能 | 说明 |
 |------|------|
@@ -189,9 +189,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 | 手动解封 | 立即解封指定 IP |
 | 实时日志 | 彩色显示（UTF-8 兼容） |
 | SSH 防护参数 | bantime / findtime / maxretry / 实际 SSH 端口 |
-| 编辑配置 | 编辑后先验证，语法或重启失败自动恢复 |
-| 安装 / 修复 / 更新 | 使用 `mode = aggressive`，重复攻击递增封禁至 1 周 |
-| 安全卸载 | 默认保留配置；固定确认词只删除 Quench drop-in |
+| 同步 / 迁移 1Panel 共享配置 | 菜单 `p`：备份并迁移旧 Quench drop-in，同步当前 SSH 端口，验证合并配置与运行中的 jail/action |
+| 编辑配置 | 编辑共享 `jail.local`；先验证，语法、配置覆盖或重启失败时尝试恢复，恢复未确认则保留备份并报错 |
+| 安装 / 修复 / 更新 | 新配置默认 `mode = aggressive`、递增封禁至 1 周；已有设置合并保留 |
+| 安全卸载 | 保留共享配置和高级参数，不删除用户或面板的 jail |
+
+**已部署机器迁移：** 使用更新后的脚本进入「Fail2ban 管理 → `p` 同步 / 迁移 1Panel 共享配置」，确认后刷新 1Panel。旧 `/etc/fail2ban/jail.d/zz-vps-quench.local` 会先备份再迁移移除；若其他高优先级 `.local` 文件覆盖基础参数，脚本拒绝自动接管并提示人工合并。备份位于 `/var/lib/quench/fail2ban/quench-config.*`；若存在 `pending` 标记，须先核对其指向的备份与服务状态，不要直接删除标记重试。
+
+这是 Fail2ban 配置读取位置的兼容处理，不改变 SSH 配置存储方式，也不修改 1Panel 程序。针对 1Panel v2.2.5 的前缀解析行为，`bantime.increment` 等高级参数放在独立的 `jail.d/90-quench-sshd.local`，避免面板把它们当作普通封禁时长编辑。使用 systemd backend 时从 journal 取日志，面板日志路径字段留空。
+
+修改 SSH 端口时仍保留新旧端口的 Fail2ban 保护；1Panel v2.2.5 的单整数端口框无法表达双端口列表，须完成 SSH 迁移、关闭旧端口后再刷新显示。不要同时在 Quench 与 1Panel 中编辑配置；迁移成功不代表已验证真实封禁效果，首次部署仍应检查 jail 日志及防火墙状态。
 
 **快速预设：**
 
@@ -565,7 +572,9 @@ Docker 发布端口可能绕过 UFW 的常规 `INPUT` 规则。诊断入口会�
 | `/etc/systemd/system/quench-nft-forward.service` | Quench 独立线路转发持久服务 |
 | `/etc/systemd/system/quench-nft-target-refresh.timer` | NFT 域名目标自动刷新 timer |
 | `/etc/systemd/system/quench-nft-target-refresh.service` | NFT 域名目标刷新任务 |
-| `/etc/fail2ban/jail.d/zz-vps-quench.local` | Quench 最后加载的 Fail2ban SSH jail（不覆盖用户 `jail.local`） |
+| `/etc/fail2ban/jail.local` | Quench / 1Panel 共享的 `[sshd]` 基础参数，保留其他 jail |
+| `/etc/fail2ban/jail.d/90-quench-sshd.local` | SSH 递增封禁等高级参数，不重复覆盖面板基础参数 |
+| `/var/lib/quench/fail2ban` | 共享配置迁移备份及未完成事务标记（仅 root 可读） |
 | `/etc/caddy/Caddyfile` | Caddy 主配置；Quench 只维护带边界标记的 `sites.d` import |
 | `/etc/caddy/sites.d/*.caddy` | 每个 Quench 托管站点的独立配置文件 |
 | `/var/lib/caddy` | Caddy 持久数据与证书缓存（卸载时保留） |
