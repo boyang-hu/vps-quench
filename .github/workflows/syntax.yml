@@ -44,6 +44,9 @@ jobs:
         run: tests/smoke.sh
 
       - name: Run fault injection tests
+        timeout-minutes: 10
+        env:
+          QUENCH_TEST_VERBOSE: "1"
         run: tests/fault-injection.sh
 
       - name: Test Fail2ban and 1Panel shared configuration
