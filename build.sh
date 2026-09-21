@@ -13,6 +13,7 @@ PARTS=(
     src/modules/users.sh
     src/modules/fail2ban.sh
     src/modules/bbr.sh
+    src/modules/bbr-measure.sh
     src/modules/firewall.sh
     src/modules/user-menu.sh
     src/modules/dns.sh

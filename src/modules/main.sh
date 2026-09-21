@@ -40,9 +40,11 @@ Quench CLI — VPS 初始化与管理工具
   --first-run            首次开荒向导
   --user-menu            用户与 SSH 访问管理
   --fail2ban-menu        Fail2ban 管理
-  --bbr-menu             网络性能调优（BBR / tc / initcwnd）
+  --bbr-menu             网络性能（独立 BBR/FQ / 参数调优 / tc / initcwnd）
   --bbr-calibrate        线路实测与 policer 拐点校准
-  --bbr-reconcile-tc     按已保存状态恢复 tc 限速（内部入口）
+  --bbr-measure          实测调优向导（测带宽、推导、可选整形、复测）
+  --bbr-verify           只验证当前吞吐和重传，不修改参数或队列
+  --bbr-reconcile-tc     显式按已保存状态恢复 tc 限速（会修改队列）
   --firewall-menu        防火墙管理
   --dns-menu             DNS 管理与诊断
   --mirror-menu          软件源管理
@@ -234,6 +236,14 @@ case "${1:-}" in
         ;;
     --bbr-calibrate)
         bbr_menu_calibration
+        exit $?
+        ;;
+    --bbr-measure)
+        bbr_measure_menu tune
+        exit $?
+        ;;
+    --bbr-verify)
+        bbr_measure_menu verify
         exit $?
         ;;
     --bbr-reconcile-tc)

@@ -430,13 +430,39 @@ first_run_offer_step() {
     "$FUNCTION"
 }
 
+first_run_performance_setup() {
+    if safety_timer_pending; then
+        warn "防断联回滚仍在计时；请先确认网络正常，再进行性能设置"
+        return 1
+    fi
+    local CHOICE
+    print_header "首次开荒 · 网络性能设置"
+    ui_hint "已启用 BBR 也可以重新实测；测速会消耗流量，进入向导后仍需单独确认"
+    menu_item "1" "实测调优（推荐）  ${DIM}测速、计算参数、可选整形、复测${NC}"
+    menu_item "2" "仅启用 BBR＋FQ  ${DIM}不测速、不调其他参数、不新增限速${NC}"
+    menu_item "3" "暂时跳过（默认）"
+    menu_div
+    while true; do
+        if ! read -rp "$(ui_prompt '选择性能方案 [1-3，回车跳过]: ')" CHOICE; then
+            info "未选择性能方案，已跳过"
+            return 0
+        fi
+        case "$CHOICE" in
+            1) bbr_measure_menu tune; return $? ;;
+            2) bbr_enable_core; return $? ;;
+            ""|3) info "已跳过网络性能设置，可稍后从网络性能调优菜单进入"; return 0 ;;
+            *) warn "请输入 1、2 或 3；回车跳过" ;;
+        esac
+    done
+}
+
 first_run_recommended_flow() {
     print_header "首次开荒 · 推荐流程"
     echo "  环境与 DNS 预检 → 配置备份 → 用户与 SSH → 防火墙与 Fail2ban"
-    echo "  → SSH 基线 → 自动安全更新 → 网络安全基线 → 可选 BBR → 最终体检"
+    echo "  → SSH 基线 → 自动安全更新 → 网络安全基线 → 性能方案选择 → 最终体检"
     echo ""
     ui_hint "每一步都会单独确认；已完成项目按实时状态跳过，可随时退出后重新进入"
-    local ANSWER BACKUP
+    local ANSWER BACKUP PERF_RC=0
     read -rp "  开始推荐流程？(y/N): " ANSWER
     echo "$ANSWER" | grep -qiE '^y(es)?$' || return 0
 
@@ -466,13 +492,15 @@ first_run_recommended_flow() {
         || first_run_offer_step "应用内核网络安全基线" y first_run_network_security_apply \
         || { warn "内核网络安全基线未完成，可稍后继续"; return 1; }
     if safety_timer_pending; then
-        warn "防断联回滚仍在计时；确认网络正常后再继续 BBR"
+        warn "防断联回滚仍在计时；确认网络正常后再继续性能设置"
         return 1
     fi
-    if ! sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | grep -qw bbr; then
-        first_run_offer_step "进入 BBR 智能向导（可选）" n bbr_smart_wizard || true
-    fi
+    first_run_performance_setup || PERF_RC=$?
     first_run_final_audit
+    if [ "$PERF_RC" -ne 0 ]; then
+        warn "最终体检已执行，但性能步骤未完成；请检查提示，可稍后从网络性能调优菜单重试"
+        return "$PERF_RC"
+    fi
     info "首次开荒推荐流程已执行完成；请处理体检中仍显示的警告"
 }
 
@@ -487,7 +515,7 @@ first_run_wizard() {
         menu_pair "1" "环境与 DNS 预检" "2" "创建配置备份"
         menu_pair "3" "用户与 SSH 安全接管" "4" "防火墙与 Fail2ban"
         menu_pair "5" "SSH 基础加固" "6" "自动安全更新"
-        menu_pair "7" "内核网络安全基线" "8" "BBR 智能向导"
+        menu_pair "7" "内核网络安全基线" "8" "网络性能方案选择"
         menu_pair "9" "最终安全体检" "r" "按推荐顺序执行" "$CYAN" "$GREEN"
         menu_pair "0" "返回主菜单" "00" "退出脚本" "$RED" "$RED"
         menu_div
@@ -507,7 +535,7 @@ first_run_wizard() {
             5) first_run_ssh_baseline_apply; ui_pause ;;
             6) first_run_auto_updates_apply; ui_pause ;;
             7) first_run_network_security_apply; ui_pause ;;
-            8) bbr_smart_wizard; ui_pause ;;
+            8) first_run_performance_setup; ui_pause ;;
             9) first_run_final_audit; ui_pause ;;
             r|R) first_run_recommended_flow; ui_pause ;;
             0) return ;;

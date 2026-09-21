@@ -38,4 +38,4 @@ jobs:
             -e EXPECTED_PM="$EXPECTED_PM" \
             -e SETUP="$SETUP" \
             -v "$PWD:/repo" -w /repo "$IMAGE" \
-            sh -c 'sh -c "$SETUP" && bash tests/distro-smoke.sh'
+            sh -c 'sh -c "$SETUP" && bash tests/distro-smoke.sh && bash tests/bbr-measure.sh && bash tests/bbr-separation.sh && bash tests/onboarding-performance.sh'

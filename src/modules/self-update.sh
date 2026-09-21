@@ -44,11 +44,10 @@ self_resolve_script_source() {
     printf '%s\n' "$RESOLVED"
 }
 
-self_reconcile_tc_after_update() {
+self_notice_tc_after_update() {
     local STATE_FILE="${TC_STATE_FILE:-/var/lib/quench/tc-fq.state}"
     [ -s "$STATE_FILE" ] || return 0
-    [ -f "$LOCAL_SCRIPT" ] || return 1
-    QUENCH_TEST_MODE=0 BBR_TUNE_TEST_MODE=0 bash "$LOCAL_SCRIPT" --bbr-reconcile-tc
+    warn "已保留 tc 保存状态，脚本更新未改动运行队列；如需恢复，请进入 tc 出口整形 → 6"
 }
 
 self_remote_main_sha() {
@@ -191,7 +190,7 @@ self_update() {
     rm -rf "$WORK"
     self_install_shortcut v || warn "快捷键 v 修复失败"
     self_install_shortcut V || warn "快捷键 V 修复失败"
-    self_reconcile_tc_after_update || warn "tc 限速状态未能自动恢复，请进入网络性能调优检查"
+    self_notice_tc_after_update
     rm -f "$QUENCH_UPDATE_HINT_FILE" 2>/dev/null || true
     audit_action "脚本更新 ${CUR_VER:-未知} 到 $NEW_VER" SUCCESS
     info "更新完成，正在启动新版本..."

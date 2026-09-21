@@ -1875,7 +1875,7 @@ t_top_037() {
 run_test "Docker Compose risk report is incomplete …+1 项" t_top_037
 
 t_top_038() {
-    for fn in self_install self_script_valid self_resolve_script_source self_reconcile_tc_after_update self_fetch_script self_shortcut_owned self_install_shortcut self_remove_shortcut self_offline_bundle_create self_offline_bundle_install self_update self_remote_main_sha config_health_check diagnostic_bundle_create; do
+    for fn in self_install self_script_valid self_resolve_script_source self_notice_tc_after_update self_fetch_script self_shortcut_owned self_install_shortcut self_remove_shortcut self_offline_bundle_create self_offline_bundle_install self_update self_remote_main_sha config_health_check diagnostic_bundle_create; do
         declare -F "$fn" >/dev/null || { echo "Missing new function: $fn" >&2; exit 1; }
     done
     :

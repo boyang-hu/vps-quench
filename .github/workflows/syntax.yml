@@ -15,7 +15,9 @@ jobs:
       - name: Check shell syntax
         run: |
           for script in vps-quench.sh build-offline-package.sh tests/offline-package.sh \
-            tests/fail2ban-shared.sh tests/fail2ban-shared-integration.sh; do
+            tests/fail2ban-shared.sh tests/fail2ban-shared-integration.sh \
+            tests/bbr-separation.sh tests/bbr-separation-integration.sh tests/lib/bbr-tc-fixture.sh \
+            tests/bbr-measure.sh tests/bbr-measure-integration.sh tests/onboarding-performance.sh; do
             bash -n "$script"
           done
 
@@ -47,8 +49,23 @@ jobs:
       - name: Test Fail2ban and 1Panel shared configuration
         run: bash tests/fail2ban-shared.sh
 
+      - name: Test independent BBR FQ tuning and shaping
+        run: bash tests/bbr-separation.sh
+
+      - name: Test measured tuning and failure paths
+        run: bash tests/bbr-measure.sh
+
+      - name: Test first-run performance choices
+        run: bash tests/onboarding-performance.sh
+
+      - name: Test real Linux FQ and HTB in an isolated network namespace
+        run: sudo bash tests/bbr-separation-integration.sh
+
       - name: Install real Fail2ban test dependency
-        run: sudo apt-get update && sudo apt-get install -y fail2ban
+        run: sudo apt-get update && sudo apt-get install -y fail2ban iperf3
+
+      - name: Test real iperf3 measurement in an isolated network namespace
+        run: sudo bash tests/bbr-measure-integration.sh
 
       - name: Test isolated real Fail2ban parser and runtime
         run: sudo bash tests/fail2ban-shared-integration.sh

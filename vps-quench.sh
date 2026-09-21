@@ -3642,6 +3642,9 @@ bbr_managed_keys() {
         net.ipv4.tcp_notsent_lowat \
         net.ipv4.tcp_fastopen \
         net.ipv4.tcp_mtu_probing \
+        net.ipv4.tcp_window_scaling \
+        net.ipv4.tcp_moderate_rcvbuf \
+        net.ipv4.tcp_slow_start_after_idle \
         net.ipv4.udp_rmem_min
     bbr_scene_keys
 }
@@ -4035,6 +4038,8 @@ bbr_apply_sysctl() {
 
 bbr_apply_sysctl_locked() {
     local CONFIG="$1" STALE_MODE="${2:-ask}" TX_SNAPSHOT SNAPSHOT_CONFIG="$1"
+    # core 只更新 BBR/FQ；tuning 只更新参数。共用持久化文件但不互相重写运行值。
+    case "$STALE_MODE" in ask|baseline|core|tuning|measured) : ;; *) return 1 ;; esac
     ensure_sysctl || return 1
     bbr_ensure_baseline || return 1
     mkdir -p "$(dirname "$SYSCTL_FILE")" 2>/dev/null || return 1
@@ -4052,7 +4057,7 @@ bbr_apply_sysctl_locked() {
     # ── 切换预设时复位「当前配置写过、但新配置不再包含」的场景专有键 ──
     # 否则从中转/落地降级回普通预设后，ip_forward / conntrack 等会一直残留在内核里。
     # 仅复位本脚本场景预设管理的键，且新配置确实不含该键时才动；ip_forward 谨慎处理。
-    if [ -f "$SYSCTL_FILE" ]; then
+    if [ "$STALE_MODE" != core ] && [ "$STALE_MODE" != measured ] && [ -f "$SYSCTL_FILE" ]; then
         local SCENE_KEYS
         SCENE_KEYS=$({ bbr_scene_keys; bbr_config_dynamic_scene_keys "$(cat "$SYSCTL_FILE")"; } | awk '!seen[$0]++')
         local k STALE=""
@@ -4112,6 +4117,22 @@ bbr_apply_sysctl_locked() {
         error "无法创建 sysctl 临时配置"
         return 1
     }
+    if [ -f "$SYSCTL_FILE" ] && { [ "$STALE_MODE" = core ] || [ "$STALE_MODE" = tuning ] || [ "$STALE_MODE" = measured ]; }; then
+        if ! awk -F= -v mode="$STALE_MODE" '
+            FILENAME==ARGV[1] {
+                key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+                replaced[key]=1; next
+            }
+            {
+                key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+                core=(key=="net.core.default_qdisc" || key=="net.ipv4.tcp_congestion_control")
+                if ((mode=="core" && !core) || (mode=="tuning" && core) || (mode=="measured" && !replaced[key])) print
+            }
+        ' <(printf '%s\n' "$CONFIG") "$SYSCTL_FILE" > "$TMP_FILE"; then
+            rm -f "$TMP_FILE" "$TX_SNAPSHOT"
+            return 1
+        fi
+    fi
     while IFS= read -r line; do
         if echo "$line" | grep -qE '^[[:space:]]*#|^[[:space:]]*$'; then
             echo "$line" >> "$TMP_FILE"
@@ -4122,10 +4143,19 @@ bbr_apply_sysctl_locked() {
         VAL=$(printf '%s' "$line" | cut -d= -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         if sysctl -w "${KEY}=${VAL}" > /dev/null 2>&1; then
             echo "$line" >> "$TMP_FILE"
+            if [ "$STALE_MODE" = measured ]; then
+                local READBACK
+                READBACK=$(sysctl -n "$KEY" 2>/dev/null | awk '{$1=$1; print}')
+                if [ "$READBACK" != "$(printf '%s\n' "$VAL" | awk '{$1=$1; print}')" ]; then
+                    error "实测方案参数回读不一致：${KEY}"
+                    CORE_FAILED=1
+                fi
+            fi
         else
             warn "跳过不支持的参数：${KEY}"
             echo "# skipped unsupported: $line" >> "$TMP_FILE"
             SKIPPED=$(( SKIPPED + 1 ))
+            [ "$STALE_MODE" != measured ] || CORE_FAILED=1
             case "$KEY" in
                 net.ipv4.tcp_congestion_control) CORE_FAILED=1 ;;
                 net.core.default_qdisc) QDISC_FAILED=1 ;;
@@ -4151,11 +4181,11 @@ bbr_apply_sysctl_locked() {
     fi
 
     if [ "$QDISC_FAILED" -ne 0 ]; then
-        if bbr_kernel_at_least 4 20; then
+        if [ "$STALE_MODE" != core ] && bbr_kernel_at_least 4 20; then
             warn "fq 默认队列未能启用；Linux 4.20+ 的 BBR 仍有内部 pacing，将继续应用其余参数"
         else
             CORE_FAILED=1
-            error "当前内核低于 4.20，fq 默认队列未能启用，无法安全启用 BBR pacing"
+            error "fq 默认队列未能启用，无法确认本次 BBR＋FQ 设置"
         fi
     fi
 
@@ -4178,7 +4208,6 @@ bbr_apply_sysctl_locked() {
     if [ "$SKIPPED" -gt 0 ]; then
         warn "共跳过 ${SKIPPED} 个不支持的参数（已在配置文件中注释，重启后不报错）"
     fi
-    [ ! -s "$TC_STATE_FILE" ] || bbr_tc_reconcile_saved || true
     info "sysctl 配置已应用到 ${SYSCTL_FILE} ✓"
     return 0
 }
@@ -4511,6 +4540,15 @@ bbr_tc_saved_matches_runtime() {
 }
 
 bbr_tc_reconcile_saved() {
+    local RC
+    txn_write_begin "显式恢复已保存的 tc 限速" || return 1
+    bbr_tc_reconcile_saved_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_tc_reconcile_saved_locked() {
     local CURRENT_DEV SAVED_VALUES SAVED_REST SAVED_DEV SAVED_RATE SAVED_BURST SAVED_FORCE TC_BIN
     [ "${QUENCH_TEST_MODE:-0}" != 1 ] || return 2
     [ "${BBR_TUNE_TEST_MODE:-0}" != 1 ] || return 2
@@ -4547,14 +4585,14 @@ bbr_tc_reconcile_saved() {
         && bbr_tc_restore_owned \
         && bbr_tc_is_owned "$SAVED_DEV" "$TC_BIN" \
         && bbr_tc_rate_matches "$SAVED_DEV" "$TC_BIN" "$SAVED_RATE"; then
-        info "检测到已保存的 ${SAVED_RATE}Mbps 限速未生效，已自动恢复 ✓"
+        info "已按确认恢复保存的 ${SAVED_RATE}Mbps 限速 ✓"
         return 0
     fi
     if bbr_tc_apply_runtime "$SAVED_DEV" "$SAVED_RATE" "$SAVED_BURST" "$TC_BIN" "$SAVED_FORCE"; then
         if bbr_tc_write_persistence "$SAVED_DEV" "$SAVED_RATE" "$SAVED_BURST" "$SAVED_FORCE" \
             && bbr_tc_is_owned "$SAVED_DEV" "$TC_BIN" \
             && bbr_tc_rate_matches "$SAVED_DEV" "$TC_BIN" "$SAVED_RATE"; then
-            info "检测到已保存的 ${SAVED_RATE}Mbps 限速未生效，已自动恢复并刷新持久化配置 ✓"
+            info "已按确认恢复 ${SAVED_RATE}Mbps 限速并刷新持久化配置 ✓"
             return 0
         fi
         warn "tc 限速已恢复运行，但持久化配置更新失败"
@@ -4794,8 +4832,17 @@ EOF
 }
 
 bbr_apply_tc() {
+    local RC
+    txn_write_begin "设置 tc 出口整形" || return 1
+    bbr_apply_tc_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_apply_tc_locked() {
     local RATE="$1" FORCE="${2:-0}" APPLY_RC WAS_MANAGED=0
-    local DEV; DEV=$(default_iface)
+    local DEV="${3:-}"; [ -n "$DEV" ] || DEV=$(default_iface)
     [ -z "$DEV" ] && { error "无法确定默认出口网卡"; return 1; }
     local TC_BIN
     TC_BIN=$(command -v tc 2>/dev/null || echo /sbin/tc)
@@ -4835,15 +4882,35 @@ bbr_apply_tc() {
 }
 
 bbr_remove_tc() {
-    local FORCE="${1:-0}" TC_BIN DEV FAILED=0 FOREIGN=0 QDISCS LINE TYPE SNAPSHOT=""
+    local RC
+    txn_write_begin "取消 tc 出口整形" || return 1
+    bbr_remove_tc_locked "$@"
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_remove_tc_locked() {
+    local FORCE="${1:-0}" TC_BIN DEV FAILED=0 FOREIGN=0 REMOVED=0 QDISCS LINE TYPE SNAPSHOT=""
     TC_BIN=$(command -v tc 2>/dev/null || echo /sbin/tc)
     DEV=$(bbr_state_value "$TC_STATE_FILE" DEV 2>/dev/null || true)
     [ -n "$DEV" ] || DEV=$(default_iface)
+    if { [ -s "$TC_STATE_FILE" ] || [ -e "$TC_HELPER" ]; } && { [ ! -x "$TC_BIN" ] || [ -z "$DEV" ]; }; then
+        error "无法检查实际网卡队列，已保留 tc 状态与配置"
+        return 1
+    fi
     if [ -x "$TC_BIN" ] && [ -n "$DEV" ]; then
         if bbr_tc_is_owned "$DEV" "$TC_BIN"; then
-            "$TC_BIN" qdisc del dev "$DEV" root 2>/dev/null || FAILED=1
+            if "$TC_BIN" qdisc del dev "$DEV" root 2>/dev/null; then REMOVED=1; else FAILED=1; fi
+            if [ "$FAILED" = 0 ] && bbr_tc_topology_matches "$DEV" "$TC_BIN"; then
+                error "删除命令返回成功，但 Quench HTB 仍在生效"
+                FAILED=1
+            fi
         else
-            QDISCS=$("$TC_BIN" qdisc show dev "$DEV" 2>/dev/null || true)
+            QDISCS=$("$TC_BIN" qdisc show dev "$DEV" 2>/dev/null) || {
+                error "无法读取实际队列，已保留 tc 状态"
+                return 1
+            }
             LINE=$(bbr_tc_root_line "$QDISCS")
             TYPE=$(bbr_tc_qdisc_type "$LINE")
             if [ -n "$LINE" ] && ! bbr_tc_qdisc_safe_to_replace "$TYPE"; then
@@ -4859,23 +4926,54 @@ bbr_remove_tc() {
             fi
         fi
     fi
-
+    [ "$FAILED" = 0 ] || { error "tc 队列删除失败，已保留状态与恢复材料"; return 1; }
     if systemd_available; then
-        systemctl disable --now quench-tc-fq >/dev/null 2>&1 || true
-        rm -f "$SERVICE_TC"
+        if [ -f "$SERVICE_TC" ]; then
+            systemctl disable --now quench-tc-fq >/dev/null 2>&1 || {
+                error "无法停用 tc 持久化服务；已保留配置，请先修复服务状态"
+                return 1
+            }
+        fi
+        rm -f "$SERVICE_TC" || FAILED=1
         systemctl daemon-reload >/dev/null 2>&1 || FAILED=1
     elif command -v rc-update >/dev/null 2>&1; then
-        rc-service quench-tc-fq stop >/dev/null 2>&1 || true
-        rc-update del quench-tc-fq default >/dev/null 2>&1 || true
+        if [ -f "$SERVICE_TC_INIT" ]; then
+            if ! rc-service quench-tc-fq stop >/dev/null 2>&1 \
+                || ! rc-update del quench-tc-fq default >/dev/null 2>&1; then
+                error "无法停用 tc OpenRC 服务，已保留配置"
+                return 1
+            fi
+        fi
     elif command -v update-rc.d >/dev/null 2>&1; then
-        service quench-tc-fq stop >/dev/null 2>&1 || true
-        update-rc.d -f quench-tc-fq remove >/dev/null 2>&1 || true
+        if [ -f "$SERVICE_TC_INIT" ]; then
+            if ! service quench-tc-fq stop >/dev/null 2>&1 \
+                || ! update-rc.d -f quench-tc-fq remove >/dev/null 2>&1; then
+                error "无法停用 tc SysV 服务，已保留配置"
+                return 1
+            fi
+        fi
     fi
-    rm -f "$SERVICE_TC_INIT" "$TC_HELPER" "$TC_STATE_FILE"
     if [ "$FAILED" -ne 0 ]; then
-        error "取消 tc 限速时发生错误"
+        error "取消 tc 限速时发生错误，状态文件已保留"
         return 1
     fi
+    # 先停掉整形服务，再按当前默认 FQ 策略恢复不限速队列；不能改 TCP 算法。
+    if [ "$FOREIGN" = 0 ] && { [ "$REMOVED" = 1 ] || [ -s "$TC_STATE_FILE" ]; } \
+        && [ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" = fq ]; then
+        local FQ_RC=0
+        bbr_fq_apply_interface "$DEV" "$TC_BIN" || FQ_RC=$?
+        if [ "$FQ_RC" != 0 ]; then
+            error "限速已移除，但 FQ 恢复未确认；保留状态文件供检查，未修改拥塞算法"
+            return 1
+        fi
+        QDISCS=$("$TC_BIN" qdisc show dev "$DEV" 2>/dev/null) || return 1
+        if ! bbr_fq_runtime_ready "$QDISCS" \
+            || printf '%s\n' "$QDISCS" | grep -Eq ' maxrate [0-9]'; then
+            error "实际队列仍有整形或未使用不限速 FQ；已保留状态供检查"
+            return 1
+        fi
+    fi
+    rm -f "$SERVICE_TC_INIT" "$TC_HELPER" "$TC_STATE_FILE" || return 1
     if [ "$FOREIGN" -eq 1 ]; then
         warn "本工具的 tc 持久化已取消，但外部 root qdisc ${TYPE:-未知} 仍在生效"
         return 2
@@ -4943,10 +5041,6 @@ bbr_generate_config() {
     cat << EOF
 # VPS Quench 网络性能调优配置 — 生成时间：$(date)
 # 预设：${PROFILE_NAME}
-
-# ── BBR 核心 ──
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
 
 # ── 缓冲区 ──
 net.core.rmem_max = ${RMEM}
@@ -5026,6 +5120,10 @@ bbr_preflight() {
         echo -e "  ${DIM}需要宿主机开启 privileged 模式或 sysctl 白名单${NC}"
         return 1
     fi
+}
+
+bbr_core_preflight() {
+    bbr_preflight || return 1
     bbr_check_kernel || return 1
     if ! modprobe sch_fq >/dev/null 2>&1 \
         && ! sysctl -n net.core.default_qdisc 2>/dev/null | grep -qw fq; then
@@ -5036,6 +5134,140 @@ bbr_preflight() {
             return 1
         fi
     fi
+}
+
+# 基础模式不创建 HTB、不写 maxrate，也不接管任何显式命名的外部队列。
+# mq 必须保留多队列结构；这里只允许整体刷新内核自动创建（handle 0）的默认树。
+bbr_fq_runtime_ready() {
+    local QDISCS="$1" ROOT TYPE HANDLE LEAVES
+    ROOT=$(bbr_tc_root_line "$QDISCS")
+    TYPE=$(bbr_tc_qdisc_type "$ROOT")
+    case "$TYPE" in
+        fq) [[ " $ROOT " != *" nopacing "* ]] ;;
+        mq)
+            HANDLE=$(bbr_tc_qdisc_handle "$ROOT")
+            LEAVES=$(bbr_calibration_mq_leaves "$QDISCS" "${HANDLE%:}")
+            [ -n "$LEAVES" ] || return 1
+            ! printf '%s\n' "$LEAVES" | grep -qv '|fq$' || return 1
+            ! printf '%s\n' "$QDISCS" | grep -qw nopacing
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+bbr_fq_default_tree() {
+    local QDISCS="$1" ROOT TYPE HANDLE
+    ROOT=$(bbr_tc_root_line "$QDISCS")
+    TYPE=$(bbr_tc_qdisc_type "$ROOT")
+    HANDLE=$(bbr_tc_qdisc_handle "$ROOT")
+    [ "$HANDLE" = 0: ] || return 1
+    case "$TYPE" in
+        fq_codel|pfifo_fast|noqueue)
+            # 带子树的情况不属于可直接替换的默认 root。
+            ! printf '%s\n' "$QDISCS" | grep -q ' parent '
+            ;;
+        mq)
+            printf '%s\n' "$QDISCS" | awk '
+                $1=="qdisc" && / parent / {
+                    n++
+                    if ($3!="0:" || ($2!="fq" && $2!="fq_codel" && $2!="pfifo_fast")) bad=1
+                    if (/ maxrate | nopacing /) bad=1
+                }
+                END { exit !(n && !bad) }
+            '
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# 返回 2 表示按设计保留外部队列，不声称已完成 FQ 配置；1 表示应用/回读失败。
+bbr_fq_apply_interface() {
+    local DEV="$1" TC_BIN="$2" QDISCS ROOT TYPE FILTERS SNAPSHOT CURRENT
+    QDISCS=$("$TC_BIN" qdisc show dev "$DEV" 2>/dev/null) || return 1
+    if bbr_fq_runtime_ready "$QDISCS"; then
+        info "${DEV} 已使用 FQ pacing，原队列参数与限速保持不变"
+        return 0
+    fi
+    if bbr_tc_is_owned "$DEV" "$TC_BIN"; then
+        if printf '%s\n' "$QDISCS" | grep -qw nopacing; then
+            warn "${DEV} 的 Quench 整形叶子关闭了 pacing；规则已保留，请在 tc 菜单显式修复"
+            return 2
+        fi
+        info "${DEV} 已有 Quench HTB＋FQ，保留现有速率，不重新应用保存值"
+        return 0
+    fi
+    ROOT=$(bbr_tc_root_line "$QDISCS")
+    TYPE=$(bbr_tc_qdisc_type "$ROOT")
+    if ! bbr_fq_default_tree "$QDISCS"; then
+        warn "${DEV} 的 ${TYPE:-未知} 队列非可安全刷新的内核默认树；保留全部 tc 规则，FQ 由原管理工具负责"
+        return 2
+    fi
+    FILTERS=$("$TC_BIN" filter show dev "$DEV" root 2>/dev/null) || return 1
+    if [ -n "$FILTERS" ]; then
+        warn "${DEV} 已有 root filter，未修改队列"
+        return 2
+    fi
+    SNAPSHOT=$(bbr_tc_snapshot_foreign "$DEV" "$TC_BIN") || return 1
+    # 拒绝在读取/用户确认期间出现的新队列，不能覆盖外部刚设置的限速。
+    CURRENT=$("$TC_BIN" qdisc show dev "$DEV" 2>/dev/null) || return 1
+    [ "$CURRENT" = "$QDISCS" ] || { error "${DEV} 队列已改变，请重新检查后操作"; return 1; }
+    FILTERS=$("$TC_BIN" filter show dev "$DEV" root 2>/dev/null) || return 1
+    [ -z "$FILTERS" ] || { warn "${DEV} 出现新的 filter，未修改队列"; return 2; }
+    if [ "$TYPE" = mq ]; then
+        # default_qdisc 已为 fq，重建默认 mq 会为各发送队列创建 fq 叶子。
+        [ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" = fq ] || return 1
+        "$TC_BIN" qdisc replace dev "$DEV" root handle 7ffe: mq || return 1
+    else
+        "$TC_BIN" qdisc replace dev "$DEV" root handle 7ffd: fq || return 1
+    fi
+    CURRENT=$("$TC_BIN" qdisc show dev "$DEV" 2>/dev/null) || return 1
+    bbr_fq_runtime_ready "$CURRENT" || {
+        error "${DEV} 实际 FQ 队列未通过回读；修改前诊断记录：$SNAPSHOT"
+        return 1
+    }
+    info "${DEV} 已应用不限速 FQ；未创建 HTB 或带宽上限"
+}
+
+bbr_enable_core() {
+    print_header "基础 BBR＋FQ（不设置限速）"
+    confirm_change_preview "启用基础 BBR＋FQ" \
+        "只设置 TCP 拥塞算法与默认 FQ；不修改缓冲区、转发和 initcwnd" \
+        "对默认出口的内核默认队列应用 FQ；已有限速/自定义队列保持不变" \
+        "已有调优参数继续保留；这不是恢复出厂参数，也不会恢复保存的 tc 速率" || return 0
+    local RC
+    txn_write_begin "启用基础 BBR＋FQ" || return 1
+    bbr_enable_core_locked
+    RC=$?
+    txn_write_end
+    return "$RC"
+}
+
+bbr_enable_core_locked() {
+    local TC_BIN DEV DEVS RC FAILED=0 PRESERVED=0
+    bbr_core_preflight || return 1
+    TC_BIN=$(command -v tc 2>/dev/null || true)
+    [ -n "$TC_BIN" ] && [ -x "$TC_BIN" ] || { error "需要 tc 来检查实际队列，请先安装 iproute2"; return 1; }
+    DEVS=$({ default_iface; bbr_default_ipv6_iface; } | awk 'NF && !seen[$0]++')
+    [ -n "$DEVS" ] || { error "无法确定默认出口网卡"; return 1; }
+    bbr_apply_sysctl $'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr' core || return 1
+    while IFS= read -r DEV; do
+        if ! printf '%s\n' "$DEV" | grep -qE '^[[:alnum:]_.-]{1,15}$'; then
+            FAILED=1; continue
+        fi
+        RC=0
+        bbr_fq_apply_interface "$DEV" "$TC_BIN" || RC=$?
+        case "$RC" in 0) : ;; 2) PRESERVED=1 ;; *) FAILED=1 ;; esac
+    done <<< "$DEVS"
+    if [ "$FAILED" != 0 ]; then
+        error "BBR 与默认 FQ 已保存，但实际队列未全部应用成功；请检查网络性能诊断，未自动接管外部规则"
+        return 1
+    fi
+    if [ "$PRESERVED" = 1 ]; then
+        warn "BBR 已启用、默认 FQ 已保存；外部队列已保留，不能确认所有出口均使用 FQ"
+    else
+        info "BBR＋FQ 已启用并回读确认；未新增/修改限速或额外调优参数 ✓"
+    fi
+    info "拥塞算法作用于新建 TCP 连接；默认 FQ 随 sysctl 持久化，外部网络管理器仍可设置自己的队列"
 }
 
 # ── 检测常见代理 service 的 LimitNOFILE，偏低则提示写 drop-in ──
@@ -5122,7 +5354,7 @@ bbr_confirm_apply() {
         || warn "无法预加载 nf_conntrack，将按内核实际支持情况应用"
     local CONFIG
     CONFIG=$(bbr_generate_config "$RMEM" "$WMEM" "$NOTSENT" "$PROFILE_NAME" "$ENABLE_FORWARD")
-    bbr_apply_sysctl "$CONFIG" || {
+    bbr_apply_sysctl "$CONFIG" tuning || {
         error "网络性能调优配置应用失败"
         return 1
     }
@@ -5132,7 +5364,7 @@ bbr_confirm_apply() {
     esac
     echo ""
     info "网络性能调优配置完成 ✓"
-    warn "建议配合限速设置使用，避免 Retr 爆炸"
+    info "拥塞算法、FQ 与 tc 限速均未改动；如需启用，请使用各自独立入口"
     return 0
 }
 
@@ -5197,7 +5429,7 @@ bbr_auto_calc() {
 # ── 自动模式：带宽子菜单 ─────────────────────────────────
 bbr_menu_bandwidth() {
     local MEM_MB=$1 LAT_MS=$2 MEM_LBL=$3 LAT_LBL=$4
-    print_header "BBR 自动配置 — 选择带宽"
+    print_header "手填 BDP 计算 — 选择带宽（不测速）"
     echo -e "  内存：${BOLD}${MEM_LBL}${NC}  延迟：${BOLD}${LAT_LBL}${NC}"
     echo ""
     menu_pair "1" "100 Mbps" "2" "200 Mbps"
@@ -5232,7 +5464,7 @@ bbr_menu_bandwidth() {
 # ── 自动模式：延迟子菜单 ─────────────────────────────────
 bbr_menu_latency() {
     local MEM_MB=$1 MEM_LBL=$2
-    print_header "BBR 自动配置 — 选择延迟"
+    print_header "手填 BDP 计算 — 选择业务 RTT（不测速）"
     echo -e "  内存：${BOLD}${MEM_LBL}${NC}"
     echo ""
     menu_item "1" "100ms 以内  ${DIM}国内 / 亚洲${NC}"
@@ -5266,7 +5498,7 @@ bbr_menu_auto() {
     local SYS_MEM_MB
     SYS_MEM_MB=$(bbr_physical_memory_mb)
 
-    print_header "BBR 自动配置 — 选择内存"
+    print_header "手填 BDP 计算 — 内存预算（高级，不测速）"
     echo -e "  系统检测内存：${BOLD}${SYS_MEM_MB}MB${NC}"
     echo ""
     menu_pair "1" "512 MB" "2" "1 GB"
@@ -5432,6 +5664,7 @@ bbr_menu_manual() {
 # ── 线路容量与 policer 拐点实测 ──────────────────────────
 BBR_CAL_QDISC_MODE=""
 BBR_CAL_QDISC_TYPE=""
+BBR_CAL_QDISC_HANDLE=""
 BBR_CAL_QDISC_LEAVES=""
 BBR_CAL_DEV=""
 BBR_CAL_TC_BIN=""
@@ -5516,8 +5749,8 @@ bbr_calibration_parse_iperf() {
             if (rate ~ /^[0-9]+([.][0-9]+)?$/) receiver=rate
         }
         END {
-            if (sender == "" || retr == "") exit 1
-            if (receiver == "") receiver=sender
+            # 发送量可能包含大量重传，不能冒充实际送达吞吐。
+            if (sender == "" || retr == "" || receiver == "") exit 1
             printf "%s %s %s\n", sender, retr, receiver
         }
     ' "$FILE"
@@ -5610,6 +5843,7 @@ bbr_calibration_capture_qdisc() {
     ROOT_LINE=$(bbr_tc_root_line "$QDISCS")
     TYPE=$(bbr_tc_qdisc_type "$ROOT_LINE")
     BBR_CAL_QDISC_TYPE="$TYPE"
+    BBR_CAL_QDISC_HANDLE=$(bbr_tc_qdisc_handle "$ROOT_LINE")
     BBR_CAL_QDISC_LEAVES=""
     if bbr_tc_is_owned "$DEV" "$TC_BIN"; then
         BBR_CAL_QDISC_MODE=managed
@@ -5680,7 +5914,7 @@ bbr_calibration_apply_shaper() {
 }
 
 bbr_calibration_restore_qdisc() {
-    local INDEX LEAF_TYPE CURRENT CURRENT_QDISCS MAJOR
+    local INDEX LEAF_TYPE CURRENT CURRENT_QDISCS MAJOR HANDLE
     [ -n "$BBR_CAL_DEV" ] && [ -n "$BBR_CAL_TC_BIN" ] || return 0
     if [ "$BBR_CAL_QDISC_MODE" = managed ]; then
         bbr_tc_restore_owned
@@ -5691,6 +5925,14 @@ bbr_calibration_restore_qdisc() {
         mq)
             CURRENT_QDISCS=$("$BBR_CAL_TC_BIN" qdisc show dev "$BBR_CAL_DEV" 2>/dev/null || true)
             CURRENT=$(bbr_tc_root_line "$CURRENT_QDISCS")
+            if [ "$(bbr_tc_qdisc_type "$CURRENT")" = mq ]; then
+                HANDLE=$(bbr_tc_qdisc_handle "$CURRENT")
+                # 删除临时 HTB 后，内核通常已重建原默认 mq 树。不要再无谓
+                # 重建成手工 handle，导致下轮把它误认成外部 QoS。
+                if [ "$(bbr_calibration_mq_leaves "$CURRENT_QDISCS" "${HANDLE%:}")" = "$BBR_CAL_QDISC_LEAVES" ]; then
+                    return 0
+                fi
+            fi
             [ "$(bbr_tc_qdisc_type "$CURRENT")" = mq ] \
                 || "$BBR_CAL_TC_BIN" qdisc replace dev "$BBR_CAL_DEV" root handle 1: mq 2>/dev/null \
                 || return 1
@@ -5702,12 +5944,26 @@ bbr_calibration_restore_qdisc() {
             done <<< "$BBR_CAL_QDISC_LEAVES"
             ;;
         fq|fq_codel|pfifo_fast)
-            "$BBR_CAL_TC_BIN" qdisc replace dev "$BBR_CAL_DEV" root "$BBR_CAL_QDISC_TYPE" 2>/dev/null \
-                || return 1
+            CURRENT_QDISCS=$("$BBR_CAL_TC_BIN" qdisc show dev "$BBR_CAL_DEV" 2>/dev/null) || return 1
+            CURRENT=$(bbr_tc_root_line "$CURRENT_QDISCS")
+            if [ "$(bbr_tc_qdisc_type "$CURRENT")" != "$BBR_CAL_QDISC_TYPE" ]; then
+                HANDLE=${BBR_CAL_QDISC_HANDLE:-0:}
+                if [ "$HANDLE" = 0: ] && [ "$BBR_CAL_QDISC_TYPE" = fq ]; then HANDLE=7ffd:; fi
+                "$BBR_CAL_TC_BIN" qdisc replace dev "$BBR_CAL_DEV" root handle "$HANDLE" "$BBR_CAL_QDISC_TYPE" 2>/dev/null \
+                    || return 1
+            fi
             ;;
         ""|noqueue) : ;;
         *) return 1 ;;
     esac
+    CURRENT_QDISCS=$("$BBR_CAL_TC_BIN" qdisc show dev "$BBR_CAL_DEV" 2>/dev/null) || return 1
+    CURRENT=$(bbr_tc_root_line "$CURRENT_QDISCS")
+    [ "$(bbr_tc_qdisc_type "$CURRENT")" = "$BBR_CAL_QDISC_TYPE" ] || return 1
+    if [ "$BBR_CAL_QDISC_TYPE" = mq ]; then
+        HANDLE=$(bbr_tc_qdisc_handle "$CURRENT")
+        [ "$(bbr_calibration_mq_leaves "$CURRENT_QDISCS" "${HANDLE%:}")" = "$BBR_CAL_QDISC_LEAVES" ] || return 1
+    fi
+    return 0
 }
 
 bbr_calibration_stop_child() {
@@ -5734,6 +5990,9 @@ bbr_calibration_measure() {
     local RESULT RC
     local -a TIMEOUT_ARGS=()
     BBR_CAL_SENDER=""; BBR_CAL_RECEIVER=""; BBR_CAL_RETRANS=""; BBR_CAL_LOSS=""
+    if [ -n "${QUENCH_PERF_DEV:-}" ]; then
+        bbr_measure_route_check || return 1
+    fi
     BBR_CAL_TEMP_FILE=$(quench_mktemp "${TMPDIR:-/tmp}/quench-iperf.XXXXXX") || return 1
     timeout --foreground 1 true >/dev/null 2>&1 && TIMEOUT_ARGS=(--foreground)
     echo -e "  ${CYAN}▸${NC} ${LABEL}：${DURATION}s × ${STREAMS} 流 → ${PEER}:${PORT}"
@@ -5758,6 +6017,10 @@ bbr_calibration_measure() {
     RESULT=${RESULT#* }
     BBR_CAL_RETRANS=${RESULT%% *}
     BBR_CAL_RECEIVER=${RESULT##* }
+    if ! awk -v tx="$BBR_CAL_SENDER" -v rx="$BBR_CAL_RECEIVER" 'BEGIN {exit !(tx>0 && rx>0)}'; then
+        warn "iperf3 没有产生有效吞吐，样本作废"
+        return 1
+    fi
     BBR_CAL_LOSS=$(bbr_calibration_loss_pct "$BBR_CAL_RETRANS" "$BBR_CAL_SENDER" "$DURATION")
 }
 
@@ -5839,6 +6102,7 @@ bbr_calibration_show_last() {
 }
 
 bbr_calibration_finish() {
+    local RC=0
     quench_restore_signal_traps
     bbr_calibration_stop_child
     [ -z "$BBR_CAL_TEMP_FILE" ] || rm -f "$BBR_CAL_TEMP_FILE"
@@ -5846,9 +6110,11 @@ bbr_calibration_finish() {
         info "测试前 qdisc 已恢复"
     else
         error "测试前 qdisc 恢复失败，请立即运行网络性能诊断"
+        RC=1
     fi
     bbr_calibration_traffic_report "$BBR_CAL_DEV"
     bbr_calibration_lock_release
+    return "$RC"
 }
 
 bbr_calibration_run() {
@@ -5858,11 +6124,17 @@ bbr_calibration_run() {
     local BASELINE="" LAST_CLEAN="" BROKE_AT="" SLOW_HITS=0 TEST_RC=0 CONTROL
     local FINE_LIMIT KNEE MARGIN RECOMMEND ANSWER STATUS=""
 
-    BBR_CAL_DEV=$(default_iface)
+    BBR_CAL_DEV="${6:-}"
+    [ -n "$BBR_CAL_DEV" ] || BBR_CAL_DEV=$(default_iface)
     [ -n "$BBR_CAL_DEV" ] || { error "无法确定默认出口网卡"; return 1; }
     BBR_CAL_TC_BIN=$(command -v tc 2>/dev/null || echo /sbin/tc)
     [ -x "$BBR_CAL_TC_BIN" ] || { error "tc 命令不可用，请先安装 iproute2"; return 1; }
     bbr_calibration_lock_acquire || return 1
+    if ! bbr_calibration_write_result RUNNING "$PEER" "$PORT" "$FAMILY" "$NOMINAL" 0; then
+        bbr_calibration_lock_release
+        error "无法记录本轮校准，已停止，旧结果不会用于自动应用"
+        return 1
+    fi
     if ! bbr_calibration_capture_qdisc "$BBR_CAL_DEV" "$BBR_CAL_TC_BIN"; then
         bbr_calibration_lock_release
         return 1
@@ -5896,10 +6168,13 @@ bbr_calibration_run() {
     BBR_CAL_RECEIVER=$BEST_RECEIVER; BBR_CAL_SENDER=$BEST_SENDER
     BBR_CAL_RETRANS=$BEST_RETRANS; BBR_CAL_LOSS=$BEST_LOSS
 
-    if awk -v good="$BEST_RECEIVER" -v nominal="$NOMINAL" 'BEGIN {exit !(good < nominal*0.7)}'; then
-        info "单流低于标称带宽 70%，增加一次 4 流对照，排除单流窗口或远端限制"
-        if bbr_calibration_measure "$PEER" "$PORT" "$FAMILY" "$DURATION" 4 "不限速 4 流对照"; then
-            echo -e "  4 流样本：接收 ${BOLD}${BBR_CAL_RECEIVER}Mbps${NC} · 重传 ${BBR_CAL_RETRANS} · 估算损失 ${BBR_CAL_LOSS}%"
+    if awk -v good="$BEST_RECEIVER" -v nominal="$NOMINAL" -v loss="$BEST_LOSS" \
+        'BEGIN {exit !(good < nominal*0.7 || (nominal>=2500 && loss>0.1))}'; then
+        local CHECK_STREAMS=4
+        [ "$NOMINAL" -lt 2500 ] || CHECK_STREAMS=8
+        info "单流结果需要复核，增加 ${CHECK_STREAMS} 流对照，排除单流窗口或远端限制"
+        if bbr_calibration_measure "$PEER" "$PORT" "$FAMILY" "$DURATION" "$CHECK_STREAMS" "不限速多流对照"; then
+            echo -e "  ${CHECK_STREAMS} 流样本：接收 ${BOLD}${BBR_CAL_RECEIVER}Mbps${NC} · 重传 ${BBR_CAL_RETRANS} · 估算损失 ${BBR_CAL_LOSS}%"
             if awk -v now="$BBR_CAL_RECEIVER" -v best="$BEST_RECEIVER" 'BEGIN {exit !(now > best)}'; then
                 BEST_RECEIVER=$BBR_CAL_RECEIVER; BEST_SENDER=$BBR_CAL_SENDER
                 BEST_RETRANS=$BBR_CAL_RETRANS; BEST_LOSS=$BBR_CAL_LOSS
@@ -5912,7 +6187,7 @@ bbr_calibration_run() {
         warn "对端或路径只能稳定送达 ${BEST_RECEIVER}Mbps，未达到标称带宽的 70%"
         warn "结果不足以区分本机限速与远端瓶颈，不会生成整形值"
         bbr_calibration_write_result INCONCLUSIVE "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$BEST_RECEIVER" || true
-        bbr_calibration_finish
+        bbr_calibration_finish || return 1
         return 2
     fi
 
@@ -5920,13 +6195,20 @@ bbr_calibration_run() {
         info "不限速时损失率 ${BEST_LOSS}%：未检测到上游 policer"
         echo -e "  ${BOLD}建议：保留 BBR/fq，不增加 HTB 聚合上限。${NC}"
         bbr_calibration_write_result NO_KNEE "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$BEST_RECEIVER" || true
-        bbr_calibration_finish
+        bbr_calibration_finish || return 1
         if [ -s "$TC_STATE_FILE" ]; then
             read -rp "  当前存在 Quench HTB 限速，是否取消？(y/N，默认N): " ANSWER
             [ -n "$ANSWER" ] || ANSWER=n
             echo "$ANSWER" | grep -qiE '^y(es)?$' && bbr_tc_remove_selected "$BBR_CAL_DEV"
         fi
         return 0
+    fi
+
+    if awk -v good="$BEST_RECEIVER" 'BEGIN {exit !(good>10000)}'; then
+        warn "实测吞吐超过 10Gbps 自动扫描上限，保留现有整形，不推测限速值"
+        bbr_calibration_write_result ABOVE_CAP "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$BEST_RECEIVER" || true
+        bbr_calibration_finish || return 1
+        return 2
     fi
 
     LOW=$(awk -v good="$BEST_RECEIVER" 'BEGIN {v=int(good*0.90); if(v<1)v=1; print v}')
@@ -5937,6 +6219,7 @@ bbr_calibration_run() {
     NOMINAL_HIGH=$(( NOMINAL * 120 / 100 ))
     HIGH=$FACTOR_HIGH; [ "$HIGH" -ge "$NOMINAL_HIGH" ] || HIGH=$NOMINAL_HIGH
     [ "$HIGH" -le $(( NOMINAL * 2 )) ] || HIGH=$(( NOMINAL * 2 ))
+    [ "$HIGH" -le 10000 ] || HIGH=10000
     [ "$HIGH" -gt "$LOW" ] || HIGH=$(( LOW + 2 ))
     echo ""
     warn "不限速测试存在明显重传，开始寻找 policer 拐点"
@@ -5986,20 +6269,20 @@ bbr_calibration_run() {
 
     if [ -n "$STATUS" ]; then
         bbr_calibration_write_result "$STATUS" "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$BEST_RECEIVER" || true
-        bbr_calibration_finish
+        bbr_calibration_finish || return 1
         return 2
     fi
     if [ -z "$BROKE_AT" ]; then
         warn "扫到 ${HIGH}Mbps 仍未定位拐点，但不限速样本存在损失"
         warn "可能是路径底噪、对端拥塞或拐点超出范围，不会猜测整形值"
         bbr_calibration_write_result OUT_OF_RANGE "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$BEST_RECEIVER" || true
-        bbr_calibration_finish
+        bbr_calibration_finish || return 1
         return 2
     fi
     if [ -z "$LAST_CLEAN" ]; then
         warn "没有获得可用的干净速率，不会生成整形值"
         bbr_calibration_write_result INCONCLUSIVE "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$BEST_RECEIVER" || true
-        bbr_calibration_finish
+        bbr_calibration_finish || return 1
         return 2
     fi
 
@@ -6018,7 +6301,7 @@ bbr_calibration_run() {
         else
             warn "细扫测试失败，不会使用不完整结果"
             bbr_calibration_write_result ERROR "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$BEST_RECEIVER" || true
-            bbr_calibration_finish
+            bbr_calibration_finish || return 1
             return 2
         fi
     done
@@ -6027,7 +6310,7 @@ bbr_calibration_run() {
     MARGIN=$(bbr_calibration_margin "$KNEE") || MARGIN=1
     RECOMMEND=$(( KNEE - MARGIN )); [ "$RECOMMEND" -ge 1 ] || RECOMMEND=$KNEE
     bbr_calibration_write_result KNEE "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$BEST_RECEIVER" "$KNEE" "$RECOMMEND" || true
-    bbr_calibration_finish
+    bbr_calibration_finish || return 1
     echo ""
     info "实测干净上限 ${KNEE}Mbps，下一档 ${BROKE_AT}Mbps 出现重传跳变"
     echo -e "  建议退让 ${BOLD}${MARGIN}Mbps${NC} → HTB ${GREEN}${BOLD}${RECOMMEND}Mbps${NC}"
@@ -6125,12 +6408,12 @@ bbr_tc_link_speed_reference() {
 
 bbr_tc_apply_selected_rate() {
     local DEV="$1" RATE="$2" APPLY_RC TC_BIN
-    bbr_apply_tc "$RATE"
+    bbr_apply_tc "$RATE" 0 "$DEV"
     APPLY_RC=$?
     if [ "$APPLY_RC" -eq 2 ]; then
         TC_BIN=$(command -v tc 2>/dev/null || echo /sbin/tc)
         bbr_tc_force_confirm "$DEV" "$RATE" "$TC_BIN" || return
-        bbr_apply_tc "$RATE" 1
+        bbr_apply_tc "$RATE" 1 "$DEV"
     elif [ "$APPLY_RC" -ne 0 ]; then
         return "$APPLY_RC"
     fi
@@ -6256,10 +6539,11 @@ bbr_menu_tc() {
     menu_item "3" "精确设置  ${DIM}直接填写最终 tc rate${NC}"
     menu_item "4" "查看当前 qdisc、回读速率与统计"
     menu_item "5" "取消本工具限速" "$YELLOW"
+    menu_item "6" "按已保存配置恢复限速  ${DIM}需明确确认${NC}"
     menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
     menu_div
     echo ""
-    read -rp "$(ui_prompt '选择操作 [0-5]: ')" CH
+    read -rp "$(ui_prompt '选择操作 [0-6]: ')" CH
     case "$CH" in
         1) bbr_menu_calibration; return ;;
         2)
@@ -6276,6 +6560,12 @@ bbr_menu_tc() {
             ;;
         4) bbr_tc_show_stats "$DEV"; return ;;
         5) bbr_tc_remove_selected "$DEV"; return ;;
+        6)
+            bbr_tc_saved_values >/dev/null || { warn "没有有效的已保存 tc 配置"; return 1; }
+            confirm_change_preview "恢复已保存的 tc 整形" \
+                "将重新应用 $TC_STATE_FILE 的网卡与速率；不会修改 BBR 或缓冲区" || return 0
+            bbr_tc_reconcile_saved; return $?
+            ;;
         0) return ;;
         00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         *) warn "无效选项"; return ;;
@@ -6736,7 +7026,7 @@ bbr_recommend_profile() {
 }
 
 bbr_smart_wizard() {
-    print_header "智能 TCP 调优向导"
+    print_header "高级场景预设（不测速，不修改 BBR/FQ 或 tc）"
     local MEM_MB KERNEL CUR_CC
     MEM_MB=$(bbr_physical_memory_mb)
     KERNEL=$(uname -r 2>/dev/null || echo "未知")
@@ -6923,7 +7213,7 @@ bbr_menu() {
     fi
     # 进入菜单是只读动作：只提示运行值与保存值不一致，恢复由用户在 tc 子菜单明确触发。
     if [ -s "$TC_STATE_FILE" ] && ! bbr_tc_saved_matches_runtime 2>/dev/null; then
-        warn "已保存的 tc 限速与当前运行值不一致；如需恢复，请进入「tc 智能整形」手动应用"
+        warn "已保存的 tc 限速与当前运行值不一致；如需恢复，请进入「tc 出口整形 → 6」手动应用"
     fi
     while true; do
         print_header "网络性能调优"
@@ -6937,10 +7227,18 @@ bbr_menu() {
         fi
         echo ""
         menu_div
-        menu_group "调优"
-        menu_item "1" "智能向导  ${DIM}推荐${NC}"
-        menu_pair "2" "自动配置" "3" "手动配置"
-        menu_pair "4" "tc 智能整形" "5" "initcwnd 设置"
+        menu_group "基础拥塞控制"
+        menu_item "b" "只启用 BBR＋FQ  ${DIM}不设置限速或额外参数${NC}"
+        echo ""
+        menu_group "实测优先"
+        menu_item "1" "实测调优向导  ${DIM}测速 → 推导 → 可选整形 → 复测，推荐${NC}"
+        menu_item "v" "只验证性能  ${DIM}不修改配置或队列${NC}"
+        menu_group "高级参数设置（不测速）"
+        menu_pair "2" "手填带宽 / RTT 计算" "3" "手动配置"
+        menu_item "p" "场景预设  ${DIM}不代表实测最优${NC}"
+        echo ""
+        menu_group "独立整形与路由"
+        menu_pair "4" "tc 出口整形" "5" "initcwnd 设置"
         echo ""
         menu_group "维护"
         menu_pair "6" "备份网络配置" "7" "还原时间戳备份"
@@ -6949,10 +7247,13 @@ bbr_menu() {
         menu_pair "0" "返回主菜单" "00" "退出脚本" "$RED" "$RED"
         menu_div
         echo ""
-        read -rp "$(ui_prompt '选择操作 [0-9]: ')" CH
+        read -rp "$(ui_prompt '选择操作 [b / v / p / 0-9]: ')" CH
 
         case "$CH" in
-            1) bbr_smart_wizard ;;
+            b|B) bbr_enable_core ;;
+            1) bbr_measure_menu tune ;;
+            v|V) bbr_measure_menu verify ;;
+            p|P) bbr_smart_wizard ;;
             2) bbr_menu_auto ;;
             3) bbr_menu_manual ;;
             4) bbr_menu_tc ;;
@@ -6968,6 +7269,407 @@ bbr_menu() {
 
         [ "${CH}" != "0" ] && ui_pause
     done
+}
+# ══════════════════════════════════════════════════════════
+#  实测调优：出口带宽测量与业务 RTT 分离，不把预设当实测结果。
+#  所有持久化操作仍经过 bbr/事务模块；测速不执行对端提供的内容。
+# ══════════════════════════════════════════════════════════
+QUENCH_PERF_REPORT_DIR="/var/lib/quench/performance"
+
+bbr_measure_uint() {
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#1}" -le 7 ] && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+}
+
+bbr_measure_yes() {
+    local ANSWER
+    read -rp "  $1 " ANSWER || return 1
+    case "${ANSWER:-${2:-n}}" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+bbr_measure_dependencies() {
+    local TOOL
+    for TOOL in iperf3 timeout ip tc; do
+        command -v "$TOOL" >/dev/null 2>&1 && continue
+        bbr_measure_yes "需要安装 ${TOOL}，继续？(Y/n):" y || return 1
+        case "$TOOL" in
+            iperf3) pkg_install iperf3 || return 1 ;;
+            timeout) pkg_install coreutils || return 1 ;;
+            ip|tc) pkg_install iproute2 || return 1 ;;
+        esac
+        command -v "$TOOL" >/dev/null 2>&1 || { error "请手动安装 ${TOOL}"; return 1; }
+    done
+}
+
+# 仅提供候选，不承诺公共节点可用或容量足够；必须先获测速许可再调用。
+bbr_measure_peer_pool() {
+    printf '%s\n' \
+        speedtest.hkg12.hk.leaseweb.net speedtest.sin1.sg.leaseweb.net \
+        speedtest.tyo11.jp.leaseweb.net speedtest.syd12.au.leaseweb.net \
+        speedtest.fra1.de.leaseweb.net speedtest.ams2.nl.leaseweb.net \
+        speedtest.lon12.uk.leaseweb.net speedtest.lax12.us.leaseweb.net \
+        speedtest.sea11.us.leaseweb.net speedtest.dal13.us.leaseweb.net \
+        speedtest.nyc1.us.leaseweb.net
+}
+
+# 固定协议族和字面地址，后续 ping、route get、iperf 必须使用同一个目标。
+bbr_measure_resolve() {
+    local HOST="$1" FAMILY="$2" ADDR LOOKUP OUTPUT
+    bbr_calibration_host_valid "$HOST" || return 1
+    if ip_address_valid "$FAMILY" "$HOST" 2>/dev/null; then
+        case "$HOST" in ::ffff:*|::FFFF:*) return 1 ;; esac
+        printf '%s\n' "$HOST"; return 0
+    fi
+    LOOKUP=ahostsv4; [ "$FAMILY" != 6 ] || LOOKUP=ahostsv6
+    OUTPUT=$(timeout 5 getent "$LOOKUP" "$HOST" 2>/dev/null || true)
+    [ -n "$OUTPUT" ] || OUTPUT=$(timeout 5 getent hosts "$HOST" 2>/dev/null || true)
+    while read -r ADDR _; do
+        case "$ADDR" in ::ffff:*|::FFFF:*) continue ;; esac
+        if ip_address_valid "$FAMILY" "$ADDR" 2>/dev/null; then
+            printf '%s\n' "$ADDR"; return 0
+        fi
+    done <<< "$OUTPUT"
+    error "无法解析 ${HOST} 的 IPv${FAMILY} 地址；可直接填写对应协议的 IP" >&2
+    return 1
+}
+
+bbr_measure_rtt() {
+    local ADDR="$1" FAMILY="$2" OUTPUT
+    OUTPUT=$(LC_ALL=C timeout 5 ping "-$FAMILY" -n -c 2 "$ADDR" 2>/dev/null) || return 1
+    printf '%s\n' "$OUTPUT" | awk -F/ '/rtt|round-trip/ {
+        if ($5+0>0) {printf "%.2f\n",$5; found=1; exit}
+    } END {if(!found) exit 1}'
+}
+
+bbr_measure_peer_ready() {
+    # 1 秒、1 Mbps 的协议握手测试；不扫描自有节点未指定的端口。
+    LC_ALL=C timeout 8 iperf3 "-$3" -c "$1" -p "$2" -t 1 -P 1 -b 1M >/dev/null 2>&1
+}
+
+bbr_measure_pick_peer() {
+    local FAMILY="$1" HOST ADDR RTT PORT LIST COUNT=0
+    command -v ping >/dev/null 2>&1 || { error "自动选点需要 ping；请安装或手填自有节点"; return 1; }
+    LIST=$(quench_mktemp "${TMPDIR:-/tmp}/quench-peer-list.XXXXXX") || return 1
+    # 顺序探测有硬超时；逐节点反馈，避免后台进程在取消后继续运行。
+    while IFS= read -r HOST; do
+        info "检查公共候选：$HOST"
+        ADDR=$(bbr_measure_resolve "$HOST" "$FAMILY" 2>/dev/null) || continue
+        RTT=$(bbr_measure_rtt "$ADDR" "$FAMILY") || continue
+        awk -v r="$RTT" 'BEGIN {exit !(r<=100)}' || continue
+        printf '%s %s %s\n' "$RTT" "$ADDR" "$HOST" >> "$LIST" || return 1
+    done < <(bbr_measure_peer_pool)
+    while read -r RTT ADDR HOST; do
+        COUNT=$((COUNT + 1)); [ "$COUNT" -le 4 ] || break
+        for PORT in 5201 5202 5203 5200; do
+            if bbr_measure_peer_ready "$ADDR" "$PORT" "$FAMILY"; then
+                QUENCH_PERF_PEER=$ADDR; QUENCH_PERF_PORT=$PORT
+                info "选中 ${HOST} → ${ADDR}:${PORT}，RTT ${RTT}ms（不代表带宽足够）"
+                rm -f "$LIST"; return 0
+            fi
+        done
+    done < <(sort -n "$LIST")
+    rm -f "$LIST"
+    error "没有找到 100ms 内可用的公共节点；可能是 ICMP 被禁、节点忙或距离远，请使用自有节点"
+    return 1
+}
+
+bbr_measure_iface() {
+    local ROUTE DEV
+    ROUTE=$(ip "-$2" route get "$1" 2>/dev/null) || return 1
+    DEV=$(printf '%s\n' "$ROUTE" | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    printf '%s\n' "$DEV" | grep -qE '^[[:alnum:]_.-]{1,15}$' || return 1
+    printf '%s\n' "$DEV"
+}
+
+bbr_measure_route_check() {
+    local DEV
+    DEV=$(bbr_measure_iface "$QUENCH_PERF_PEER" "$QUENCH_PERF_FAMILY") || return 1
+    [ "$DEV" = "$QUENCH_PERF_DEV" ] || { error "测速出口已改变，停止操作；请重新开始"; return 1; }
+}
+
+bbr_measure_queue_guard() {
+    local DEV="$1" TC_BIN="$2" QDISCS ROOT HANDLE FILTERS SAVED
+    QDISCS=$("$TC_BIN" qdisc show dev "$DEV") || return 1
+    FILTERS=$("$TC_BIN" filter show dev "$DEV" root) || return 1
+    [ -z "$FILTERS" ] || { error "出口已有 root filter，拒绝临时接管"; return 1; }
+    if [ -s "$TC_STATE_FILE" ]; then
+        SAVED=$(bbr_state_value "$TC_STATE_FILE" DEV)
+        [ "$SAVED" = "$DEV" ] || { error "已有另一网卡的 Quench 整形，本向导不迁移或覆盖它"; return 1; }
+    fi
+    if bbr_tc_is_owned "$DEV" "$TC_BIN"; then
+        bbr_tc_saved_matches_runtime || { error "现有 Quench 整形与保存值不同，请先检查"; return 1; }
+        return 0
+    fi
+    bbr_fq_default_tree "$QDISCS" && return 0
+    ROOT=$(bbr_tc_root_line "$QDISCS"); HANDLE=$(bbr_tc_qdisc_handle "$ROOT")
+    # 接受内核默认 fq 或基础模式创建的队列，但拒绝外部限速/关闭 pacing。
+    if bbr_fq_runtime_ready "$QDISCS" && ! printf '%s\n' "$QDISCS" | grep -Eq ' maxrate | nopacing'; then
+        case "$HANDLE" in 0:|7ffd:|7ffe:) return 0 ;; esac
+    fi
+    error "出口存在自定义队列；可以只验证性能，实测调优不会覆盖外部 QoS"
+    return 1
+}
+
+# 内存仅作单 socket 上限，不据此选择带宽/用途。默认窗口按用途计算而非内存档位。
+bbr_measure_buffer_plan() {
+    local BW="$1" RTT="$2" MEM="$3" ROLE="$4"
+    bbr_measure_uint "$BW" 1 100000 || return 1
+    bbr_measure_uint "$RTT" 1 2000 || return 1
+    bbr_measure_uint "$MEM" 1 4194304 || return 1
+    case "$ROLE" in proxy|mixed|bulk) : ;; *) return 1 ;; esac
+    awk -v bw="$BW" -v rtt="$RTT" -v mem="$MEM" -v role="$ROLE" 'BEGIN {
+        bdp=bw*rtt*125; target=2*bdp+2097152
+        target=int((target+65535)/65536)*65536
+        cap=mem*1048576/32; if(cap>268435456) cap=268435456
+        if(cap<4194304) cap=4194304
+        max=target; if(max<4194304) max=4194304; if(max>cap) max=cap
+        def=1048576
+        if(role=="mixed") def=2097152
+        if(role=="bulk") {def=bdp; if(def<1048576) def=1048576; if(def>8388608) def=8388608}
+        if(def>max) def=max
+        printf "%.0f %.0f %.0f\n",max,def,target
+    }'
+}
+
+bbr_measure_generate_config() {
+    local BW="$1" RTT="$2" MEM="$3" ROLE="$4" PLAN MAX DEFAULT TARGET LOWAT
+    PLAN=$(bbr_measure_buffer_plan "$BW" "$RTT" "$MEM" "$ROLE") || return 1
+    read -r MAX DEFAULT TARGET <<< "$PLAN"
+    printf '# Quench 实测方案：带宽基准=%sMbps 目标RTT=%sms 内存上限=%sMB 用途=%s\n' "$BW" "$RTT" "$MEM" "$ROLE"
+    printf 'net.core.rmem_max = %s\nnet.core.wmem_max = %s\n' "$MAX" "$MAX"
+    printf 'net.ipv4.tcp_rmem = 4096 %s %s\nnet.ipv4.tcp_wmem = 4096 %s %s\n' "$DEFAULT" "$MAX" "$DEFAULT" "$MAX"
+    printf '%s\n' 'net.ipv4.tcp_window_scaling = 1' 'net.ipv4.tcp_moderate_rcvbuf = 1' \
+        'net.ipv4.tcp_mtu_probing = 1' 'net.ipv4.tcp_slow_start_after_idle = 0'
+    printf 'net.ipv4.tcp_fastopen = %s\n' "$(bbr_tcp_fastopen_value)"
+    # 不臆设 tcp_mem/min_free_kbytes/废弃的 adv_win_scale，不碰转发或 initcwnd。
+    # 老预设压低过 notsent 时，恢复记录的原始值；无基线时不猜内核默认。
+    if [ -f "$SYSCTL_FILE" ] && bbr_config_has_key "$(cat "$SYSCTL_FILE")" net.ipv4.tcp_notsent_lowat; then
+        LOWAT=$(bbr_baseline_value net.ipv4.tcp_notsent_lowat 2>/dev/null || true)
+        if [ -n "$LOWAT" ]; then
+            printf 'net.ipv4.tcp_notsent_lowat = %s\n' "$LOWAT"
+        else
+            warn "旧 notsent_lowat 没有原始基线，保持原值；本轮结果受它影响" >&2
+        fi
+    fi
+}
+
+bbr_measure_record() {
+    local LABEL="$1" STREAMS="$2"
+    printf '%s\t%s\t8\t%s\t%s\t%s\t%s\n' "$LABEL" "$STREAMS" "$BBR_CAL_SENDER" "$BBR_CAL_RECEIVER" "$BBR_CAL_RETRANS" "$BBR_CAL_LOSS" \
+        >> "$QUENCH_PERF_REPORT/samples.tsv"
+}
+
+bbr_measure_pair() {
+    local LABEL="$1" STREAMS FAILED=0
+    QUENCH_PERF_SINGLE=""; QUENCH_PERF_MULTI=""
+    for STREAMS in 1 4; do
+        bbr_measure_route_check || return 1
+        if bbr_calibration_measure "$QUENCH_PERF_PEER" "$QUENCH_PERF_PORT" "$QUENCH_PERF_FAMILY" 8 "$STREAMS" "$LABEL"; then
+            bbr_measure_record "$LABEL" "$STREAMS" || return 1
+            printf '  %s %s流：接收 %sMbps，重传 %s，估算重传比例 %s%%\n' \
+                "$LABEL" "$STREAMS" "$BBR_CAL_RECEIVER" "$BBR_CAL_RETRANS" "$BBR_CAL_LOSS"
+            if [ "$STREAMS" = 1 ]; then QUENCH_PERF_SINGLE=$BBR_CAL_RECEIVER
+            else QUENCH_PERF_MULTI=$BBR_CAL_RECEIVER; fi
+        else
+            FAILED=1
+        fi
+        sleep 3
+    done
+    return "$FAILED"
+}
+
+bbr_measure_probe() {
+    local ROUND VALUES="" COUNT=0 BW
+    bbr_measure_route_check || return 1
+    bbr_measure_queue_guard "$QUENCH_PERF_DEV" "$BBR_CAL_TC_BIN" || return 1
+    bbr_calibration_capture_qdisc "$QUENCH_PERF_DEV" "$BBR_CAL_TC_BIN" || return 1
+    QUENCH_PERF_RESTORE=1
+    bbr_calibration_set_fq "$QUENCH_PERF_DEV" "$BBR_CAL_TC_BIN" || return 1
+    # 三次聚合样本取中位数，保留每份原始统计，不把单次峰值当稳定带宽。
+    for ROUND in 1 2 3; do
+        bbr_measure_route_check || return 1
+        if bbr_calibration_measure "$QUENCH_PERF_PEER" "$QUENCH_PERF_PORT" "$QUENCH_PERF_FAMILY" 8 4 "不限速带宽估计 $ROUND/3"; then
+            bbr_measure_record probe 4 || return 1
+            VALUES="${VALUES}${BBR_CAL_RECEIVER}"$'\n'
+            COUNT=$((COUNT + 1))
+        fi
+        sleep 3
+    done
+    bbr_calibration_restore_qdisc || { error "测速后队列恢复失败，停止调优"; return 1; }
+    QUENCH_PERF_RESTORE=0
+    [ "$COUNT" -ge 2 ] || { error "有效带宽样本不足，不生成参数方案"; return 1; }
+    BW=$(printf '%s' "$VALUES" | sort -n | awk 'NF {a[++n]=$1} END {
+        if(n<2) exit 1
+        # 两份时使用较低值，三份时中位数。
+        v=a[int((n+1)/2)]; if(v<1) v=1
+        printf "%.0f",v
+    }') || return 1
+    bbr_measure_uint "$BW" 1 100000 || return 1
+    QUENCH_PERF_BW=$BW
+    info "本轮可用带宽估计：${BW}Mbps（不是套餐保证值，也不是跨境速度）"
+    if printf '%s' "$VALUES" | awk 'NF {if(!n++ || $1<lo) lo=$1; if($1>hi) hi=$1} END {exit !(hi>lo*1.3)}'; then
+        warn "样本波动超过 30%，公共节点或线路可能繁忙；建议换节点复测"
+        bbr_measure_yes "仍使用本轮估计生成建议？(y/N):" n || return 1
+    fi
+}
+
+bbr_measure_compare() {
+    local BEFORE="$1" AFTER="$2" LABEL="$3"
+    if [ -z "$BEFORE" ] || [ -z "$AFTER" ]; then
+        warn "${LABEL}：缺少有效对照，无法判断收益"; return 0
+    fi
+    awk -v b="$BEFORE" -v a="$AFTER" -v label="$LABEL" 'BEGIN {
+        printf "  %s：%.2f → %.2f Mbps（%+.1f%%）\n",label,b,a,b>0?(a/b-1)*100:0
+    }'
+    if awk -v b="$BEFORE" -v a="$AFTER" 'BEGIN {exit !(a<b*0.9)}'; then
+        warn "${LABEL}本轮下降超过 10%；不能判定优化成功，请换时段复测或恢复参数快照"
+    fi
+}
+
+bbr_measure_cleanup() {
+    local RC=$?
+    trap - EXIT
+    bbr_calibration_stop_child
+    if [ "${QUENCH_PERF_RESTORE:-0}" = 1 ]; then
+        bbr_calibration_restore_qdisc || { error "原队列恢复失败，请立即检查 tc"; RC=1; }
+    fi
+    if [ -n "${QUENCH_PERF_REPORT:-}" ]; then
+        if ! printf 'exit_code=%s\n' "$RC" >> "$QUENCH_PERF_REPORT/outcome.txt"; then
+            error "无法写入最终报告状态"; RC=1
+        fi
+        info "本轮报告与参数快照：$QUENCH_PERF_REPORT"
+    fi
+    bbr_calibration_lock_release
+    txn_write_end
+    quench_tmp_cleanup
+    exit "$RC"
+}
+
+# 子 shell 隔离测速信号/EXIT trap，不污染主菜单；锁覆盖取样、修改和复测全过程。
+bbr_measure_session() (
+    local MODE="$1" HOST="$2" PORT="$3" FAMILY="$4" NOMINAL="$5" RTT="$6" ROLE="$7" CORE="$8" SHAPE="$9"
+    local MEM PLAN MAX DEFAULT TARGET CONFIG BEFORE1 BEFORE4 SCAN_RC=0
+    # EXIT 在某些 Bash 版本中会在函数 local 作用域销毁后执行；清理状态必须
+    # 用子 shell 内的全局变量。外层菜单不受这些赋值影响。
+    QUENCH_PERF_PEER=$HOST; QUENCH_PERF_PORT=$PORT; QUENCH_PERF_FAMILY=$FAMILY
+    QUENCH_PERF_DEV=""; QUENCH_PERF_REPORT=""; QUENCH_PERF_RESTORE=0
+    QUENCH_PERF_SINGLE=""; QUENCH_PERF_MULTI=""; QUENCH_PERF_BW=""
+    # 父菜单可能也有登记中的临时资源，绝不能在子流程退出时清掉它们。
+    QUENCH_TMP_REGISTRY=""
+    txn_write_begin "实测性能流程" || exit 1
+    trap bbr_measure_cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    quench_tmp_registry_init || exit 1
+    bbr_calibration_lock_acquire || exit 1
+    bbr_measure_dependencies || exit 1
+    if [ -z "$HOST" ]; then
+        bbr_measure_pick_peer "$FAMILY" || exit 1
+    else
+        QUENCH_PERF_PEER=$(bbr_measure_resolve "$HOST" "$FAMILY") || exit 1
+        bbr_measure_peer_ready "$QUENCH_PERF_PEER" "$PORT" "$FAMILY" || { error "对端忙或 iperf3 不可达"; exit 1; }
+    fi
+    QUENCH_PERF_DEV=$(bbr_measure_iface "$QUENCH_PERF_PEER" "$FAMILY") || exit 1
+    BBR_CAL_DEV=$QUENCH_PERF_DEV; BBR_CAL_TC_BIN=$(command -v tc)
+    mkdir -p "$QUENCH_PERF_REPORT_DIR" || exit 1
+    chmod 700 "$QUENCH_PERF_REPORT_DIR" || exit 1
+    QUENCH_PERF_REPORT=$(mktemp -d "$QUENCH_PERF_REPORT_DIR/run-$(date +%Y%m%d-%H%M%S).XXXXXX") || exit 1
+    printf 'phase\tstreams\tduration_seconds\tsender_mbps\treceiver_mbps\tretransmits\testimated_retrans_pct\n' > "$QUENCH_PERF_REPORT/samples.tsv" || exit 1
+    printf 'peer=%s\nport=%s\nfamily=%s\ndev=%s\nmode=%s\nnominal=%s\ntarget_rtt=%s\nrole=%s\n' \
+        "$QUENCH_PERF_PEER" "$QUENCH_PERF_PORT" "$FAMILY" "$QUENCH_PERF_DEV" "$MODE" "$NOMINAL" "$RTT" "$ROLE" > "$QUENCH_PERF_REPORT/context.txt" || exit 1
+    printf 'version=%s\nenable_core=%s\ncalibrate_shaping=%s\n' "$APP_VERSION" "$CORE" "$SHAPE" >> "$QUENCH_PERF_REPORT/context.txt" || exit 1
+    if [ "$MODE" = verify ]; then
+        bbr_measure_pair verify || exit 1
+        info "只做了吞吐测试，未修改 sysctl、拥塞算法、路由窗口或 tc 队列"
+        exit 0
+    fi
+    bbr_measure_queue_guard "$QUENCH_PERF_DEV" "$BBR_CAL_TC_BIN" || exit 1
+    bbr_runtime_snapshot "$QUENCH_PERF_REPORT/before.conf" || exit 1
+    if [ -f "$SYSCTL_FILE" ]; then
+        cp "$SYSCTL_FILE" "$QUENCH_PERF_REPORT/saved-before.conf" || exit 1
+    fi
+    bbr_measure_pair before || { error "调优前对照不完整，请换节点后重试；未修改配置"; exit 1; }
+    BEFORE1=$QUENCH_PERF_SINGLE; BEFORE4=$QUENCH_PERF_MULTI
+    bbr_measure_probe || exit 1
+    MEM=$(bbr_physical_memory_mb)
+    bbr_measure_uint "$MEM" 1 4194304 || { error "无法确定物理内存安全上限"; exit 1; }
+    # 用户知道套餐时，它比临时繁忙的公网测速更适合做 BDP 的容量基准。
+    local BW=$QUENCH_PERF_BW
+    if [ -n "$NOMINAL" ]; then
+        info "实测 ${BW}Mbps；使用你指定的 ${NOMINAL}Mbps 作为缓冲计算基准"
+        BW=$NOMINAL
+    fi
+    PLAN=$(bbr_measure_buffer_plan "$BW" "$RTT" "$MEM" "$ROLE") || exit 1
+    read -r MAX DEFAULT TARGET <<< "$PLAN"
+    printf '\n  带宽基准 %sMbps × 业务目标 RTT %sms\n  单连接缓冲上限 %.0fMiB，起点 %.0fKiB；内存仅用于封顶\n' \
+        "$BW" "$RTT" "$(( MAX / 1048576 ))" "$(( DEFAULT / 1024 ))"
+    [ "$MAX" -ge "$TARGET" ] || warn "BDP 目标超过单连接内存预算，本轮采用安全上限"
+    CONFIG=$(bbr_measure_generate_config "$BW" "$RTT" "$MEM" "$ROLE") || exit 1
+    printf '%s\n' "$CONFIG" > "$QUENCH_PERF_REPORT/proposed.conf" || exit 1
+    printf 'measured_mbps=%s\nbuffer_basis_mbps=%s\n' "$QUENCH_PERF_BW" "$BW" >> "$QUENCH_PERF_REPORT/context.txt" || exit 1
+    bbr_measure_yes "应用上述实测方案？(Y/n，选择 n 只保留报告):" y || exit 0
+    bbr_measure_route_check || exit 1
+    # 纳入现有「还原时间戳备份」入口；即使首次运行也能回到本轮之前。
+    bbr_backup_sysctl || exit 1
+    if [ "$CORE" = y ]; then
+        bbr_enable_core_locked || { error "基础 BBR/FQ 未全部完成，停止后续调优"; exit 1; }
+    fi
+    bbr_apply_sysctl "$CONFIG" measured || exit 1
+    if [ "$SHAPE" = y ]; then
+        bbr_measure_route_check || exit 1
+        info "下面寻找重传开始显著增加的速率；只有测准并确认后才持久化限速"
+        # 复用独立校准，交出其专用锁；事务锁仍由整个向导持有。
+        bbr_calibration_lock_release
+        bbr_measure_queue_guard "$QUENCH_PERF_DEV" "$BBR_CAL_TC_BIN" || exit 1
+        sleep 15
+        bbr_calibration_run "$QUENCH_PERF_PEER" "$QUENCH_PERF_PORT" "$FAMILY" "$BW" 8 "$QUENCH_PERF_DEV" || SCAN_RC=$?
+        trap 'exit 130' INT TERM HUP
+        bbr_calibration_lock_acquire || exit 1
+        if [ "$SCAN_RC" = 1 ]; then
+            error "整形步骤出错；参数可能已生效，请检查报告与队列，不报告调优成功"
+            exit 1
+        fi
+        [ "$SCAN_RC" = 0 ] || warn "本轮未得到可靠拐点，未应用新的限速值"
+        if [ -f "$BBR_CALIBRATION_RESULT_FILE" ]; then
+            cp "$BBR_CALIBRATION_RESULT_FILE" "$QUENCH_PERF_REPORT/calibration.state" || exit 1
+        fi
+    fi
+    info "等待 15 秒让测试突发消退，再验证实际效果"
+    sleep 15
+    bbr_measure_pair after || { error "参数已应用，但复测不完整，不能判断收益"; exit 1; }
+    bbr_measure_compare "$BEFORE1" "$QUENCH_PERF_SINGLE" 单流
+    bbr_measure_compare "$BEFORE4" "$QUENCH_PERF_MULTI" 四流
+    bbr_runtime_snapshot "$QUENCH_PERF_REPORT/after.conf" || exit 1
+    info "以上只是本轮同节点对照，不是严格 A/B，也不代表跨境或 UDP 性能；忙闲变化会影响结果"
+    info "若需撤回参数，可用「还原时间戳备份」选择本轮备份；tc 限速需在独立菜单取消/调整"
+)
+
+bbr_measure_menu() {
+    local MODE="${1:-tune}" HOST PORT FAMILY NOMINAL="" RTT=150 ROLE=proxy CORE=n SHAPE=n INPUT
+    print_header "实测网络性能（${MODE}）"
+    echo "  出口测速用于估计本机容量，不等于到用户的跨境速度。"
+    echo "  测试会产生高带宽流量、影响同机业务；建议在空闲时段运行。"
+    read -rp "  协议族 4/6（默认4）: " FAMILY || return 1
+    FAMILY=${FAMILY:-4}; case "$FAMILY" in 4|6) : ;; *) error "请选择 4 或 6"; return 1 ;; esac
+    read -rp "  iperf3 主机/IP（回车自动挑公共节点，自有近端节点更可靠）: " HOST || return 1
+    if [ -n "$HOST" ]; then bbr_calibration_host_valid "$HOST" || { error "无效主机"; return 1; }; fi
+    read -rp "  对端端口（默认5201；自动选点时会检查候选端口）: " PORT || return 1
+    PORT=${PORT:-5201}; bbr_calibration_port_valid "$PORT" || { error "无效端口"; return 1; }
+    if [ "$MODE" = tune ]; then
+        read -rp "  套餐带宽（留空实测；已知可填 400M / 600M / 1G）: " INPUT || return 1
+        if [ -n "$INPUT" ]; then NOMINAL=$(bbr_parse_bandwidth_mbps "$INPUT") || { error "无效带宽"; return 1; }; fi
+        read -rp "  业务目标 RTT（默认150ms，估计值；不是近端测速延迟）: " RTT || return 1
+        RTT=${RTT:-150}; bbr_measure_uint "$RTT" 1 2000 || { error "RTT 必须为 1-2000ms"; return 1; }
+        read -rp "  用途：1 代理/多连接（默认）  2 混合  3 少量大文件: " INPUT || return 1
+        case "$INPUT" in ''|1) ROLE=proxy ;; 2) ROLE=mixed ;; 3) ROLE=bulk ;; *) return 1 ;; esac
+        bbr_measure_yes "同时启用 BBR＋FQ？(Y/n，不会因此新增限速):" y && CORE=y
+        bbr_measure_yes "同时实测是否需要 tc 整形？(Y/n，可独立跳过):" y && SHAPE=y
+        echo "  RTT 为目标假设；带宽优先使用你填写的套餐值，否则使用本轮实测。"
+        echo "  不自动改 initcwnd、tcp_mem、转发、Swap；原有外部 QoS 不接管。"
+    fi
+    echo "  未知带宽时无法预报流量：仅 8 秒 × 1Gbps 就约 1GB；整套可能消耗数十GB。"
+    echo "  公共节点将看到本机 IP；没有可用节点时会停止，不会退回内存预设。"
+    bbr_measure_yes "确认开始联网测试？(y/N):" n || return 0
+    bbr_measure_session "$MODE" "$HOST" "$PORT" "$FAMILY" "$NOMINAL" "$RTT" "$ROLE" "$CORE" "$SHAPE"
 }
 # ══════════════════════════════════════════════════════════
 #  防火墙模块
@@ -15233,13 +15935,39 @@ first_run_offer_step() {
     "$FUNCTION"
 }
 
+first_run_performance_setup() {
+    if safety_timer_pending; then
+        warn "防断联回滚仍在计时；请先确认网络正常，再进行性能设置"
+        return 1
+    fi
+    local CHOICE
+    print_header "首次开荒 · 网络性能设置"
+    ui_hint "已启用 BBR 也可以重新实测；测速会消耗流量，进入向导后仍需单独确认"
+    menu_item "1" "实测调优（推荐）  ${DIM}测速、计算参数、可选整形、复测${NC}"
+    menu_item "2" "仅启用 BBR＋FQ  ${DIM}不测速、不调其他参数、不新增限速${NC}"
+    menu_item "3" "暂时跳过（默认）"
+    menu_div
+    while true; do
+        if ! read -rp "$(ui_prompt '选择性能方案 [1-3，回车跳过]: ')" CHOICE; then
+            info "未选择性能方案，已跳过"
+            return 0
+        fi
+        case "$CHOICE" in
+            1) bbr_measure_menu tune; return $? ;;
+            2) bbr_enable_core; return $? ;;
+            ""|3) info "已跳过网络性能设置，可稍后从网络性能调优菜单进入"; return 0 ;;
+            *) warn "请输入 1、2 或 3；回车跳过" ;;
+        esac
+    done
+}
+
 first_run_recommended_flow() {
     print_header "首次开荒 · 推荐流程"
     echo "  环境与 DNS 预检 → 配置备份 → 用户与 SSH → 防火墙与 Fail2ban"
-    echo "  → SSH 基线 → 自动安全更新 → 网络安全基线 → 可选 BBR → 最终体检"
+    echo "  → SSH 基线 → 自动安全更新 → 网络安全基线 → 性能方案选择 → 最终体检"
     echo ""
     ui_hint "每一步都会单独确认；已完成项目按实时状态跳过，可随时退出后重新进入"
-    local ANSWER BACKUP
+    local ANSWER BACKUP PERF_RC=0
     read -rp "  开始推荐流程？(y/N): " ANSWER
     echo "$ANSWER" | grep -qiE '^y(es)?$' || return 0
 
@@ -15269,13 +15997,15 @@ first_run_recommended_flow() {
         || first_run_offer_step "应用内核网络安全基线" y first_run_network_security_apply \
         || { warn "内核网络安全基线未完成，可稍后继续"; return 1; }
     if safety_timer_pending; then
-        warn "防断联回滚仍在计时；确认网络正常后再继续 BBR"
+        warn "防断联回滚仍在计时；确认网络正常后再继续性能设置"
         return 1
     fi
-    if ! sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | grep -qw bbr; then
-        first_run_offer_step "进入 BBR 智能向导（可选）" n bbr_smart_wizard || true
-    fi
+    first_run_performance_setup || PERF_RC=$?
     first_run_final_audit
+    if [ "$PERF_RC" -ne 0 ]; then
+        warn "最终体检已执行，但性能步骤未完成；请检查提示，可稍后从网络性能调优菜单重试"
+        return "$PERF_RC"
+    fi
     info "首次开荒推荐流程已执行完成；请处理体检中仍显示的警告"
 }
 
@@ -15290,7 +16020,7 @@ first_run_wizard() {
         menu_pair "1" "环境与 DNS 预检" "2" "创建配置备份"
         menu_pair "3" "用户与 SSH 安全接管" "4" "防火墙与 Fail2ban"
         menu_pair "5" "SSH 基础加固" "6" "自动安全更新"
-        menu_pair "7" "内核网络安全基线" "8" "BBR 智能向导"
+        menu_pair "7" "内核网络安全基线" "8" "网络性能方案选择"
         menu_pair "9" "最终安全体检" "r" "按推荐顺序执行" "$CYAN" "$GREEN"
         menu_pair "0" "返回主菜单" "00" "退出脚本" "$RED" "$RED"
         menu_div
@@ -15310,7 +16040,7 @@ first_run_wizard() {
             5) first_run_ssh_baseline_apply; ui_pause ;;
             6) first_run_auto_updates_apply; ui_pause ;;
             7) first_run_network_security_apply; ui_pause ;;
-            8) bbr_smart_wizard; ui_pause ;;
+            8) first_run_performance_setup; ui_pause ;;
             9) first_run_final_audit; ui_pause ;;
             r|R) first_run_recommended_flow; ui_pause ;;
             0) return ;;
@@ -16059,11 +16789,10 @@ self_resolve_script_source() {
     printf '%s\n' "$RESOLVED"
 }
 
-self_reconcile_tc_after_update() {
+self_notice_tc_after_update() {
     local STATE_FILE="${TC_STATE_FILE:-/var/lib/quench/tc-fq.state}"
     [ -s "$STATE_FILE" ] || return 0
-    [ -f "$LOCAL_SCRIPT" ] || return 1
-    QUENCH_TEST_MODE=0 BBR_TUNE_TEST_MODE=0 bash "$LOCAL_SCRIPT" --bbr-reconcile-tc
+    warn "已保留 tc 保存状态，脚本更新未改动运行队列；如需恢复，请进入 tc 出口整形 → 6"
 }
 
 self_remote_main_sha() {
@@ -16206,7 +16935,7 @@ self_update() {
     rm -rf "$WORK"
     self_install_shortcut v || warn "快捷键 v 修复失败"
     self_install_shortcut V || warn "快捷键 V 修复失败"
-    self_reconcile_tc_after_update || warn "tc 限速状态未能自动恢复，请进入网络性能调优检查"
+    self_notice_tc_after_update
     rm -f "$QUENCH_UPDATE_HINT_FILE" 2>/dev/null || true
     audit_action "脚本更新 ${CUR_VER:-未知} 到 $NEW_VER" SUCCESS
     info "更新完成，正在启动新版本..."
@@ -18120,9 +18849,11 @@ Quench CLI — VPS 初始化与管理工具
   --first-run            首次开荒向导
   --user-menu            用户与 SSH 访问管理
   --fail2ban-menu        Fail2ban 管理
-  --bbr-menu             网络性能调优（BBR / tc / initcwnd）
+  --bbr-menu             网络性能（独立 BBR/FQ / 参数调优 / tc / initcwnd）
   --bbr-calibrate        线路实测与 policer 拐点校准
-  --bbr-reconcile-tc     按已保存状态恢复 tc 限速（内部入口）
+  --bbr-measure          实测调优向导（测带宽、推导、可选整形、复测）
+  --bbr-verify           只验证当前吞吐和重传，不修改参数或队列
+  --bbr-reconcile-tc     显式按已保存状态恢复 tc 限速（会修改队列）
   --firewall-menu        防火墙管理
   --dns-menu             DNS 管理与诊断
   --mirror-menu          软件源管理
@@ -18314,6 +19045,14 @@ case "${1:-}" in
         ;;
     --bbr-calibrate)
         bbr_menu_calibration
+        exit $?
+        ;;
+    --bbr-measure)
+        bbr_measure_menu tune
+        exit $?
+        ;;
+    --bbr-verify)
+        bbr_measure_menu verify
         exit $?
         ;;
     --bbr-reconcile-tc)

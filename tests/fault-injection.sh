@@ -1274,7 +1274,7 @@ t_fitop_014() {
 }
 run_test "Updater replaced script after checksum mismatch" t_fitop_014
 
-# Post-update tc reconciliation must execute the newly installed script, not a function from the old process.
+# An update must not mutate qdiscs or revive a saved, intentionally disabled rate.
 TC_STATE_FILE="$TMP/update-tc.state"
 LOCAL_SCRIPT="$TMP/newly-installed-vps-quench"
 UPDATE_TC_MARKER="$TMP/update-tc.marker"
@@ -1289,13 +1289,13 @@ cat > "$LOCAL_SCRIPT" <<'EOF'
 EOF
 chmod +x "$LOCAL_SCRIPT"
 t_fitop_015() {
-    self_reconcile_tc_after_update >/dev/null \
-        || { echo "Updater could not invoke the new tc reconciliation endpoint" >&2; exit 1; }
-    [ -f "$UPDATE_TC_MARKER" ] \
-        || { echo "Updater reconciled tc through the old process" >&2; exit 1; }
+    self_notice_tc_after_update >/dev/null \
+        || { echo "Updater tc notice failed" >&2; exit 1; }
+    [ ! -f "$UPDATE_TC_MARKER" ] \
+        || { echo "Updater unexpectedly reconciled tc" >&2; exit 1; }
     :
 }
-run_test "Updater could not invoke the new tc reconciliation endpoint …+1 项" t_fitop_015
+run_test "Updater only reports saved tc configuration without applying it" t_fitop_015
 
 # NFT firewall reconciliation must add the replacement before deleting the old
 # route, and an add/remove failure must retain the ownership state for rollback.
