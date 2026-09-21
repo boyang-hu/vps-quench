@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 exec < /dev/null
+command -v cmp >/dev/null 2>&1 || { echo 'BBR separation tests require cmp (diffutils).' >&2; exit 1; }
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -79,6 +80,25 @@ t_core_only() {
     :
 }
 run_test 'Basic BBR/FQ changes exactly two sysctls and installs no limiter' t_core_only
+
+t_integration_sysctl_scope() {
+    setup_bbr integration_sysctl_scope
+    QUENCH_TEST_INTEGRATION_ROOT="$CASE_DIR"
+    # Reuse the real integration fixture without creating links or namespaces.
+    # This also exercises it on macOS and in every distribution smoke job.
+    eval "$(sed -n '/^sysctl() {/,/^}/p' "$ROOT/tests/bbr-separation-integration.sh")"
+    local TMP="$CASE_DIR/not-the-fixture-directory"
+    assert_ok bbr_runtime_snapshot "$CASE_DIR/runtime.conf"
+    assert_file_contains "$CASE_DIR/runtime.conf" 'net.core.default_qdisc = fq_codel'
+    assert_file_contains "$CASE_DIR/runtime.conf" 'net.ipv4.tcp_congestion_control = cubic'
+    assert_ok bbr_apply_sysctl $'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr' core
+    assert_eq "$(sysctl -n net.core.default_qdisc)" fq
+    assert_eq "$(sysctl -n net.ipv4.tcp_congestion_control)" bbr
+    assert_file_contains "$BBR_BASELINE_FILE" 'net.ipv4.tcp_congestion_control = cubic'
+    [ ! -e "$TMP" ] || fail 'integration fixture wrote through a caller-local TMP'
+    :
+}
+run_test 'Integration sysctl fixture survives caller-local TMP during snapshot and apply' t_integration_sysctl_scope
 
 t_preserve_tuning() {
     setup_bbr preserve_tuning

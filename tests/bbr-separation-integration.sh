@@ -13,27 +13,29 @@ if [ -z "${QUENCH_TEST_PARENT_NETNS:-}" ]; then
     exec unshare --net env QUENCH_TEST_PARENT_NETNS="$CURRENT_NS" bash "$0"
 fi
 [ "$CURRENT_NS" != "$QUENCH_TEST_PARENT_NETNS" ] || { echo 'Refusing host network namespace' >&2; exit 1; }
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+QUENCH_TEST_INTEGRATION_ROOT=$(mktemp -d)
+trap 'rm -rf "$QUENCH_TEST_INTEGRATION_ROOT"' EXIT
 export QUENCH_TEST_MODE=1
-QUENCH_TXN_DIR="$TMP/transactions"
-QUENCH_TXN_LOCK_FILE="$TMP/lock"
+QUENCH_TXN_DIR="$QUENCH_TEST_INTEGRATION_ROOT/transactions"
+QUENCH_TXN_LOCK_FILE="$QUENCH_TEST_INTEGRATION_ROOT/lock"
 source "$ROOT/vps-quench.sh"
-TC_STATE_FILE="$TMP/tc.state"
-TC_BACKUP_DIR="$TMP/tc-backups"
-TC_HELPER="$TMP/tc-helper"
-SERVICE_TC="$TMP/tc.service"
-SERVICE_TC_INIT="$TMP/tc.init"
-SYSCTL_FILE="$TMP/quench-bbr.conf"
-BBR_BASELINE_FILE="$TMP/baseline.conf"
+TC_STATE_FILE="$QUENCH_TEST_INTEGRATION_ROOT/tc.state"
+TC_BACKUP_DIR="$QUENCH_TEST_INTEGRATION_ROOT/tc-backups"
+TC_HELPER="$QUENCH_TEST_INTEGRATION_ROOT/tc-helper"
+SERVICE_TC="$QUENCH_TEST_INTEGRATION_ROOT/tc.service"
+SERVICE_TC_INIT="$QUENCH_TEST_INTEGRATION_ROOT/tc.init"
+SYSCTL_FILE="$QUENCH_TEST_INTEGRATION_ROOT/quench-bbr.conf"
+BBR_BASELINE_FILE="$QUENCH_TEST_INTEGRATION_ROOT/baseline.conf"
 TC_BIN=$(command -v tc)
-mkdir "$TMP/sysctl"
-printf 'cubic\n' > "$TMP/sysctl/net.ipv4.tcp_congestion_control"
-printf 'fq_codel\n' > "$TMP/sysctl/net.core.default_qdisc"
+mkdir "$QUENCH_TEST_INTEGRATION_ROOT/sysctl"
+printf 'cubic\n' > "$QUENCH_TEST_INTEGRATION_ROOT/sysctl/net.ipv4.tcp_congestion_control"
+printf 'fq_codel\n' > "$QUENCH_TEST_INTEGRATION_ROOT/sysctl/net.core.default_qdisc"
+# Bash functions inherit caller locals. Do not use generic TMP/ROOT here:
+# bbr_runtime_snapshot has its own local TMP holding a file, not this directory.
 sysctl() {
     case "$1" in
-        -n) cat "$TMP/sysctl/$2" 2>/dev/null ;;
-        -w) printf '%s\n' "${2#*=}" > "$TMP/sysctl/${2%%=*}" ;;
+        -n) cat "$QUENCH_TEST_INTEGRATION_ROOT/sysctl/$2" 2>/dev/null ;;
+        -w) printf '%s\n' "${2#*=}" > "$QUENCH_TEST_INTEGRATION_ROOT/sysctl/${2%%=*}" ;;
         *) return 1 ;;
     esac
 }
