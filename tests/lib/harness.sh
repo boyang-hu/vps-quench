@@ -35,6 +35,8 @@ run_test() {
     fi
     QUENCH_TESTS_RUN=$((QUENCH_TESTS_RUN + 1))
     local OUT RC=0
+    # 在命令替换开始前记录名称；用例卡住时，仅输出上一个 ok 无法直接定位。
+    [ -z "${QUENCH_TEST_VERBOSE:-}" ] || printf '  run   %s\n' "$NAME"
     # 子 shell 内必须重新 set：命令替换处在 `|| RC=$?` 这个条件上下文里，
     # bash 会在整棵子树上关掉 -e，用例体中间的失败命令就会被静默跳过，
     # 于是只靠 exit/fail 才算失败，普通命令失败一律算通过。

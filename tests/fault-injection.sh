@@ -128,13 +128,18 @@ t_fi_004() {
 run_test "A failed DNS apply requests an immediate rollback" t_fi_004
 
 t_fi_005() {
-    sleep 600 &
+    # 不让模拟进程继承 run_test 命令替换的输出管道；成功路径也必须显式回收，
+    # 不能只靠 EXIT trap（不同 Bash 的后台作业/命令替换退出时序有差异）。
+    sleep 600 >/dev/null 2>&1 &
     STALE_PID=$!
     trap 'kill "$STALE_PID" 2>/dev/null || true; wait "$STALE_PID" 2>/dev/null || true' EXIT
     SAFETY_PID="$STALE_PID"
     SAFETY_SCRIPT="$TMP/already-finished-rollback.sh"
     ! safety_confirm >/dev/null 2>&1 || { echo "A finished safety timer was treated as active" >&2; exit 1; }
     kill -0 "$STALE_PID" 2>/dev/null || { echo "Safety confirmation killed an unrelated reused PID" >&2; exit 1; }
+    kill "$STALE_PID" 2>/dev/null || true
+    wait "$STALE_PID" 2>/dev/null || true
+    trap - EXIT
     :
 }
 run_test "A finished safety timer is no longer reported as pending" t_fi_005
