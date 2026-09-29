@@ -24,6 +24,7 @@ PARTS=(
     src/modules/swap.sh
     src/modules/stun.sh
     src/modules/toolbox.sh
+    src/modules/system-updates.sh
     src/modules/onboarding.sh
     src/modules/software.sh
     src/modules/docker.sh

@@ -85,6 +85,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 | `--https-time-sync` | 手动执行 HTTPS 应急粗校时 |
 | `--swap-menu` | Swap 管理 |
 | `--system-toolbox-menu` | 安全与诊断 |
+| `--system-update-menu` | 系统与软件更新中心 |
 | `--stun-test` | STUN、多端口 UDP 与 NAT 类型检测 |
 | `--hostname-menu` | 修改系统 hostname |
 | `--docker-menu` | Docker 管理 |
@@ -137,7 +138,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
     8  Caddy 网站入口          n  线路机端口转发
     t  时间与 NTP              s  Swap 管理
     a  常用软件管理             d  Docker 管理
-    m  脚本管理
+    u  系统与软件更新           m  脚本管理
     0  退出脚本
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
@@ -493,7 +494,7 @@ HTTPS 应急校时保持证书验证开启，不使用 `curl -k`；依次探测 
 | 配置备份恢复 | 统一备份 SSH、防火墙、DNS、sysctl、Caddy 和 NFT 配置 |
 | 操作记录 | 将关键操作、来源 IP 和结果写入 `/var/log/quench-audit.log` |
 | 系统资源健康 | CPU、负载、内存、磁盘、inode、连接、进程及失败服务 |
-| 系统更新管理 | 检查更新、安全更新、完整更新、自动安全更新和缓存清理 |
+| 系统与软件更新 | 转到主菜单 `u` 的更新中心，保留原 `h → 7` 入口 |
 | 修改系统 Hostname | 修改系统 hostname，并同步 `/etc/hostname` 与 `/etc/hosts`；用于改变 `root@主机名` 里的系统名 |
 | 配置体检中心 | 汇总检查本地脚本、SSH、Fail2ban、备份与历史版本 |
 | 生成诊断包 | 导出脱敏诊断包，包含系统概览、服务状态、路由、资源、最近审计记录和关键配置快照 |
@@ -505,6 +506,32 @@ SSH、防火墙、DNS、glibc 地址选择、IPv6 内核状态及临时多 IP �
 DNS 管理会识别 `systemd-resolved`、NetworkManager、resolvconf 或静态 `/etc/resolv.conf`，只修改实际生效的作用域，并在直连预检、后端生效检查和系统解析测试全部通过后保留配置。
 
 ---
+
+### u. 系统与软件更新
+
+主菜单 `u` 或 `--system-update-menu`；原 `h → 7` 也进入同一中心。Debian 12/13 的更新会明确保持当前发行版代号：12.x 更新到仓库最新 12.x、13.x 更新到最新 13.x，不因点版本较旧而重装或跨大版本。该模块的 APT 源检查需要 `python3`，缺少时先从常用软件管理安装。
+
+| 入口 | 行为 |
+|------|------|
+| `1` 检查更新 | 刷新索引并模拟升级，显示当前/候选版本、仓库来源和保留包 |
+| `2` 更新当前系统（推荐） | 允许必要的新依赖、禁止删除已安装包；不更改软件源，不强制处理锁定包 |
+| `3` 仅安全更新 | 使用已有的 `unattended-upgrades`；临时隔离配置，只允许当前 Debian `*-security`，先 dry-run，再确认执行；禁止自动重启和自动清理依赖 |
+| `4` 按包更新 | 输入一个或多个已安装包名；允许依赖更新，不允许顺手删除其他包、强制降级或切换仓库 |
+| `5` 自动安全更新 | 查看、启用、关闭；Debian 仅允许 security 来源，使用当前代号宏，禁止自动重启；关闭只停止后续 timer，不杀正在执行的包管理任务 |
+| `6` 更新后检查 | dpkg/APT 状态、sshd 配置、systemd 失败服务、运行内核和重启提示 |
+| `7 / 8` 清理 | 下载缓存和删除不再需要的依赖分开，后者必须先看计划并确认 |
+| `f` 完整依赖更新 | 允许解决需要增删包的依赖变化；拒绝自动删除 SSH、sudo、引导、内核及包管理关键包 |
+| `v` 大版本升级向导 | 独立的 Debian 12 → 13 高风险流程，不会由开荒或自动更新触发 |
+
+日常更新会检查传统 `.list` 和 deb822 `.sources`，拒绝浮动 `stable` / `testing`、混合 Debian 发行版和绕过签名校验的源；刷新失败、模拟失败、安装失败或后检查异常都不会记为成功。第三方仓库保持原样，不自动添加源追逐上游最新版；APT 源位置自定义、Ubuntu 等其他 APT 发行版暂不使用此受控流程。DNF/YUM 保留交互式普通/安全更新，Alpine 保留交互式普通更新；OpenWrt 不执行全量升级。
+
+更新需交互终端；通过 SSH 操作须先进入 `tmux` / `screen`。软件包安装可能重启服务，配置文件冲突由管理员选择，不全局使用 `-y` 或强制覆盖现有配置。不会自动重启服务器；没有 `reboot-required` 标记也不代表一定无需重启。容器镜像、1Panel 自身、Quench 脚本以及手动安装的二进制不属于 APT 包更新范围，请使用各自管理入口。
+
+**Debian 12 → 13 的支持边界：** 当前只接管 amd64/arm64、systemd、标准内核元包的非容器 Debian 12；官方 main/security/updates 源需集中在一个普通文件。第三方源、backports、APT pinning、锁定包、非 Debian/仓库不可追溯包、自定义内核或未完成的 dpkg 事务会拦截，不替你自动卸载或迁移。需先完成 Debian 12 的更新，并确认供应商快照、独立业务备份、控制台和维护窗口，核对 1Panel、Docker、数据库等兼容性。
+
+向导按[Debian 官方升级说明](https://www.debian.org/releases/trixie/release-notes/upgrading.en.html)分阶段执行：源备份 → 原子切换 trixie → 刷新并预览 → 再确认 → 最小升级 → 完整升级 → 健康检查。开始软件包升级前取消/失败，只在文件未被外部改动时恢复源；开始后失败不切回旧源，不尝试降级，保留记录并暂停已由本次停止的自动更新 timer，等待人工恢复。成功后恢复原先活动的 timer，重启仍需你自行安排。
+
+记录及配置/包状态备份保存在 `/var/lib/quench/updates/run-*`（仅 root 可访问）。**这不是完整系统快照，不能用 Quench 的配置回滚或 180 秒防断联保护撤销系统升级。** 真正的跨版本失败恢复依赖供应商快照/救援控制台；大版本路径仍应先在可丢弃的 VPS 克隆上演练。
 
 ### a. 常用软件管理
 
@@ -589,6 +616,7 @@ Docker 发布端口可能绕过 UFW 的常规 `INPUT` 规则。诊断入口会�
 | `/usr/local/bin/v` `/V` | 快捷命令（软链接） |
 | `/var/lib/quench/backups` | 统一配置备份与防断联快照 |
 | `/var/lib/quench/versions` | 更新前的历史脚本版本 |
+| `/var/lib/quench/updates/run-*` | 系统包更新计划、输出、退出状态、APT 配置及包状态备份；不是整机回滚镜像 |
 | `/var/lib/quench/mirrors` | APT/DNF 软件源事务快照、最近恢复点和当前源状态（仅 root 可读） |
 | `/var/lib/quench/ip` | IPv6 持久化配置与逐接口运行时状态快照（仅 root 可读） |
 | `/var/lib/quench/ssh-port-migration.state` | 尚未完成的 SSH 双端口迁移状态（600） |
@@ -650,7 +678,7 @@ tests/smoke.sh
 tests/fault-injection.sh
 ```
 
-GitHub Actions 还会在 Debian、Ubuntu、Alpine、Rocky Linux 容器中加载生成脚本并执行冒烟测试，并在 Linux network namespace 中实际验证 TCP/UDP 线路转发。
+GitHub Actions 还会在 Debian 12/13、Ubuntu、Alpine、Rocky Linux 容器中加载生成脚本并执行冒烟测试，并在 Linux network namespace 中实际验证 TCP/UDP 线路转发。`bash tests/system-updates.sh` 覆盖更新预检、取消、失败审计、跨版本源恢复和禁止错误降级；Debian 容器另运行真实 APT 配置解析测试，不在 CI runner 上升级系统。容器测试不等价于整台 VPS 的引导/跨版本演练。
 
 ### BBR 模块维护
 
@@ -659,6 +687,8 @@ BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-me
 ---
 
 ## 更新日志
+
+未发布：主菜单新增系统与软件更新中心；保持 Debian 12/13 当前大版本的日常更新、按包/安全更新、自动更新设置与后检查；Debian 12 → 13 使用独立受控向导。当前脚本版本号仍为 V0.1.6，尚未为这些改动发布新 Release。
 
 | 版本 | Quench 主要变更 |
 |------|----------------|

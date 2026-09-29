@@ -1327,6 +1327,9 @@ system_auto_updates_enabled() {
                 && grep -Eq 'APT::Periodic::Unattended-Upgrade[[:space:]]+"1";' "$PERIODIC" 2>/dev/null \
                 && grep -Eq 'Unattended-Upgrade::Automatic-Reboot[[:space:]]+"false";' "$REBOOT_CFG" 2>/dev/null \
                 || return 1
+            if [ "$(system_update_os_value ID 2>/dev/null)" = debian ]; then
+                system_update_auto_policy_verify >/dev/null 2>&1 || return 1
+            fi
             if systemd_available; then
                 systemctl is-enabled --quiet apt-daily.timer 2>/dev/null \
                     && systemctl is-enabled --quiet apt-daily-upgrade.timer 2>/dev/null
@@ -1359,23 +1362,42 @@ system_enable_auto_security_updates_locked() {
     DNF_CFG="${QUENCH_DNF_AUTOMATIC_FILE:-/etc/dnf/automatic.conf}"
     case "$PM" in
         apt)
+            if [ "$(system_update_os_value ID)" = debian ]; then
+                system_update_apt_preflight || return 1
+            fi
             pkg_install unattended-upgrades || { error "unattended-upgrades 安装失败"; return 1; }
             mkdir -p "$(dirname "$PERIODIC")" "$(dirname "$REBOOT_CFG")" || return 1
-            TMP1=$(quench_mktemp) || return 1
-            TMP2=$(quench_mktemp) || { rm -f "$TMP1"; return 1; }
+            TMP1=$(quench_mktemp "${PERIODIC}.quench.XXXXXX") || return 1
+            TMP2=$(quench_mktemp "${REBOOT_CFG}.quench.XXXXXX") || { rm -f "$TMP1"; return 1; }
             printf '%s\n' \
                 'APT::Periodic::Update-Package-Lists "1";' \
                 'APT::Periodic::Unattended-Upgrade "1";' > "$TMP1"
             printf '%s\n' \
                 '// Managed by Quench. Production reboots remain an explicit administrator action.' \
                 'Unattended-Upgrade::Automatic-Reboot "false";' > "$TMP2"
-            if ! cp "$TMP1" "$PERIODIC" || ! cp "$TMP2" "$REBOOT_CFG"; then
+            if [ "$(system_update_os_value ID)" = debian ]; then
+                cat >> "$TMP2" <<'EOF'
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern { "origin=Debian,codename=${distro_codename}-security,label=Debian-Security"; };
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+EOF
+            fi
+            if ! chmod 644 "$TMP1" "$TMP2" || ! mv "$TMP1" "$PERIODIC" || ! mv "$TMP2" "$REBOOT_CFG"; then
                 rm -f "$TMP1" "$TMP2"
                 error "自动安全更新配置写入失败"
                 return 1
             fi
             rm -f "$TMP1" "$TMP2"
-            chmod 0644 "$PERIODIC" "$REBOOT_CFG"
+            if command -v apt-config >/dev/null 2>&1; then
+                apt-config dump | awk '$0=="Unattended-Upgrade::Automatic-Reboot \"false\";" {ok=1} END {exit !ok}' \
+                    || { error "其他 APT 配置覆盖了禁止自动重启设置"; return 1; }
+            fi
+            if [ "$(system_update_os_value ID)" = debian ]; then
+                system_update_auto_policy_verify || return 1
+            fi
             if systemd_available; then
                 systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 \
                     || { error "APT 自动更新 timer 启用失败"; return 1; }
@@ -1413,93 +1435,13 @@ system_enable_auto_security_updates_locked() {
     info "自动安全更新已启用；自动重启保持关闭"
 }
 
-system_update_manager() {
-    while true; do
-        print_header "系统更新管理"
-        local PM="unknown" PENDING="未知"
-        PM=$(system_package_manager)
-        case "$PM" in
-            apt) PENDING=$(apt list --upgradable 2>/dev/null | tail -n +2 | wc -l) ;;
-            dnf) PENDING=$(dnf -q check-update 2>/dev/null | awk 'NF>=3 {n++} END {print n+0}') ;;
-            yum) PENDING=$(yum -q check-update 2>/dev/null | awk 'NF>=3 {n++} END {print n+0}') ;;
-            apk) PENDING=$(apk version -l '<' 2>/dev/null | wc -l) ;;
-            opkg) PENDING=$(opkg list-upgradable 2>/dev/null | wc -l) ;;
-        esac
-        echo -e "  包管理器：${BOLD}$PM${NC}   待更新：${BOLD}$PENDING${NC}"
-        menu_div
-        menu_pair "1" "刷新并检查更新" "2" "安装安全更新"
-        menu_pair "3" "安装全部更新" "4" "自动安全更新" "$YELLOW" "$GREEN"
-        menu_pair "5" "清理软件包缓存" "0" "返回上级" "$GREEN" "$RED"
-        read -rp "$(ui_prompt '选择操作 [0-5]: ')" CH
-        case "$CH" in
-            1)
-                case "$PM" in
-                    apt) apt-get update ;;
-                    dnf) dnf check-update || [ "$?" -eq 100 ] ;;
-                    yum) yum check-update || [ "$?" -eq 100 ] ;;
-                    apk) apk update ;;
-                    opkg) opkg update; opkg list-upgradable ;;
-                    *) error "不支持当前包管理器" ;;
-                esac
-                audit_action "刷新系统软件包索引" SUCCESS
-                ;;
-            2)
-                confirm_change_preview "安全更新" "包管理器：$PM" "仅安装安全修复（Alpine 安装仓库可用更新）" || { warn "已取消"; continue; }
-                case "$PM" in
-                    apt) pkg_install unattended-upgrades && unattended-upgrade -d ;;
-                    dnf) dnf upgrade --security -y ;;
-                    yum) yum update --security -y ;;
-                    apk) apk upgrade ;;
-                    opkg) warn "OpenWrt 不区分安全更新，请按包逐项升级"; continue ;;
-                    *) error "不支持当前包管理器"; continue ;;
-                esac
-                audit_action "安装系统安全更新" SUCCESS
-                ;;
-            3)
-                confirm_change_preview "全部系统更新" "将更新所有已安装软件包" "可能需要重启服务器" || { warn "已取消"; continue; }
-                case "$PM" in
-                    apt) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y ;;
-                    dnf) dnf upgrade -y ;;
-                    yum) yum update -y ;;
-                    apk) apk update && apk upgrade ;;
-                    opkg) warn "OpenWrt 不建议无差别升级全部基础包，请使用固件升级或逐包维护"; continue ;;
-                    *) error "不支持当前包管理器"; continue ;;
-                esac
-                audit_action "安装全部系统更新" SUCCESS
-                ;;
-            4)
-                confirm_change_preview "自动安全更新" \
-                    "启用发行版提供的定时安全更新" \
-                    "Debian / Ubuntu 明确禁止自动重启" \
-                    "更新行为由系统包管理器维护" || { warn "已取消"; continue; }
-                system_enable_auto_security_updates || continue
-                ;;
-            5)
-                case "$PM" in
-                    apt) apt-get autoremove -y && apt-get clean ;;
-                    dnf) dnf autoremove -y; dnf clean all ;;
-                    yum) yum autoremove -y; yum clean all ;;
-                    apk) rm -rf /var/cache/apk/* ;;
-                    opkg) rm -rf /tmp/opkg-lists/* ;;
-                    *) error "不支持当前包管理器"; continue ;;
-                esac
-                audit_action "清理软件包缓存" SUCCESS
-                info "清理完成"
-                ;;
-            0) return ;;
-            *) warn "无效选项"; continue ;;
-        esac
-        ui_pause
-    done
-}
-
 system_toolbox_menu() {
     while true; do
         print_header "安全与诊断工具箱"
         menu_pair "1" "系统安全体检" "2" "登录与安全日志"
         menu_pair "3" "网络诊断" "4" "配置备份与恢复"
         menu_pair "5" "脚本操作记录" "6" "系统资源健康"
-        menu_pair "7" "系统更新管理" "8" "配置导出 / 导入"
+        menu_pair "7" "系统与软件更新" "8" "配置导出 / 导入"
         menu_pair "9" "统一回滚中心" "10" "配置体检中心" "$CYAN" "$GREEN"
         menu_pair "11" "生成诊断包" "12" "修改系统 Hostname" "$YELLOW" "$CYAN"
         menu_item "13" "STUN / NAT 检测" "$GREEN"

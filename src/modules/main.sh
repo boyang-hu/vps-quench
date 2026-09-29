@@ -55,6 +55,7 @@ Quench CLI — VPS 初始化与管理工具
   --https-time-sync      手动执行 HTTPS 应急粗校时
   --swap-menu            Swap 管理
   --system-toolbox-menu  安全与诊断
+  --system-update-menu   系统与软件更新
   --stun-test            STUN / UDP / NAT 检测
   --hostname-menu        修改系统 hostname
   --docker-menu          Docker 管理
@@ -170,12 +171,12 @@ main_menu() {
         menu_pair "8" "Caddy 网站入口" "n" "线路机端口转发"
         menu_pair "t" "时间与 NTP" "s" "Swap 管理"
         menu_pair "a" "常用软件管理" "d" "Docker 管理"
-        menu_item "m" "脚本管理"
+        menu_pair "u" "系统与软件更新" "m" "脚本管理"
         echo ""
         menu_item "0" "退出脚本" "$RED"
         box_bot
         echo ""
-        read -rp "$(ui_prompt '选择功能 [0-8 / w / h / n / t / s / a / d / m]: ')" CHOICE
+        read -rp "$(ui_prompt '选择功能 [0-8 / w / h / n / t / s / a / d / u / m]: ')" CHOICE
         audit_action "主菜单选择 $CHOICE" INFO
 
         case "$CHOICE" in
@@ -195,6 +196,7 @@ main_menu() {
             a|A) software_menu ;;
             d|D) docker_menu ;;
             m|M) self_manage_menu ;;
+            u|U) system_update_manager ;;
             0) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -292,6 +294,10 @@ case "${1:-}" in
         ;;
     --system-toolbox-menu)
         system_toolbox_menu
+        exit $?
+        ;;
+    --system-update-menu)
+        system_update_manager
         exit $?
         ;;
     --stun-test)

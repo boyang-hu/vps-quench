@@ -356,6 +356,9 @@ t_sm_013() {
     QUENCH_APT_UNATTENDED_FILE="$TMP/52quench-unattended-upgrades"
     system_package_manager() { echo apt; }
     systemd_available() { return 1; }
+    # This fixture checks the file markers; effective apt-config precedence is
+    # covered separately by system-updates.sh and the Debian APT integration test.
+    system_update_auto_policy_verify() { return 0; }
     unattended-upgrade() { :; }
     printf '%s\n' \
         'APT::Periodic::Update-Package-Lists "1";' \
