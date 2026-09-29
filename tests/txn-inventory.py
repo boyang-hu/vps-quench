@@ -5,38 +5,64 @@
 import re,glob,io,collections
 import os
 ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-files=glob.glob(ROOT+"/src/lib/*.sh")+glob.glob(ROOT+"/src/modules/*.sh")
-src={f:io.open(f,encoding='utf-8').read() for f in files}
-funcs={}; where={}
+files=sorted(glob.glob(ROOT+"/src/lib/*.sh")+glob.glob(ROOT+"/src/modules/*.sh"))
+src={}
+for f in files:
+    with io.open(f,encoding='utf-8') as source:
+        src[f]=source.read()
+# 普通函数与子 shell 函数都要识别；否则后者的局部赋值会被误当成全局。
+FUNCTION=re.compile(r'(?m)^([A-Za-z_][A-Za-z0-9_]*)\(\) (?:(\{)|\()\n(.*?)\n(?(2)\}|\))(?=\n|$)', re.S)
+funcs={}; where={}; locals_={}
 for f,s in src.items():
-    for m in re.finditer(r'(?m)^([A-Za-z_][A-Za-z0-9_]*)\(\) \{\n(.*?)\n\}\n', s, re.S):
-        funcs[m.group(1)]=m.group(2); where[m.group(1)]=f
+    for m in FUNCTION.finditer(s):
+        name,_,body=m.groups()
+        funcs[name]=body; where[name]=f
+        locals_[name]={v for decl in re.findall(r'(?m)^\s*local\s+([^\n;]+)',body)
+                      for v in re.findall(r'(?:^|\s)([A-Z][A-Z0-9_]*)(?==|\s|$)',decl)}
 # 快照根
 tb=src[ROOT+'/src/modules/toolbox.sh']
 m=re.search(r'config_backup_allowed_roots\(\) \{\n(.*?)\n\}\n',tb,re.S)
 body=m.group(1); seg=body[body.index('for p in'):body.index('; do')]
 roots=[t for t in seg.replace('\\','').split() if '/' in t or t.startswith('etc')]
 roots=[r.rstrip('/') for r in roots]
-# 路径变量：默认值以 /etc /var/spool 等开头
+# 路径值采用集合，不用 setdefault 留下第一次的值：多个可能路径都应检查，
+# 不能由 APFS/ext4 的文件枚举顺序决定结果。局部变量仅在自身函数里解析。
+ASSIGN=r'(?<![A-Za-z0-9_$])([A-Z][A-Z0-9_]*)='
+DEFAULT_PATH=re.compile(ASSIGN+r'''["']?\$\{[A-Z0-9_]+:-(/[^"'}]+)\}''')
+ABS_PATH=re.compile(ASSIGN+r'''["']?(/[^"'\s;$]+)''')
+DERIVED_PATH=re.compile(ASSIGN+r'"\$\{?([A-Z][A-Z0-9_]*)\}?/([^"\s$]+)"')
+def collect_paths(body,paths,exclude=()):
+    for pattern in (DEFAULT_PATH,ABS_PATH):
+        for v,p in pattern.findall(body):
+            if v not in exclude: paths.setdefault(v,set()).add(p)
+def derive_paths(bodies,paths):
+    for _ in range(3):
+        for body,exclude in bodies:
+            for v,o,sub in DERIVED_PATH.findall(body):
+                if v not in exclude and o not in exclude and o in paths:
+                    values={p+'/'+sub for p in paths[o]}
+                    paths.setdefault(v,set()).update(values)
 pathvars={}
-for f,s in src.items():
-    for v,p in re.findall(r'(?m)^\s*([A-Z][A-Z0-9_]*)=["\']?\$\{[A-Z0-9_]+:-(/[^"\'}]+)\}',s): pathvars.setdefault(v,p)
-    for v,p in re.findall(r'(?m)^\s*([A-Z][A-Z0-9_]*)=["\']?(/(?:etc|var/spool|root)[^"\'\s]*)',s): pathvars.setdefault(v,p)
-# 二级派生：VAR="$OTHER/sub"
-for _ in range(3):
-    for f,s in src.items():
-        for v,o,sub in re.findall(r'(?m)^\s*([A-Z][A-Z0-9_]*)="\$\{?([A-Z][A-Z0-9_]*)\}?/([^"\s$]+)"',s):
-            if o in pathvars: pathvars.setdefault(v,pathvars[o]+'/'+sub)
+global_bodies=[(FUNCTION.sub('',s),()) for s in src.values()]
+# 非 local 赋值可能设置共享路径，但不能把函数局部路径串到别处。
+global_bodies += [(body,locals_[name]) for name,body in funcs.items()]
+for body,exclude in global_bodies: collect_paths(body,pathvars,exclude)
+derive_paths(global_bodies,pathvars)
 def covered(path):
     p=path.lstrip('/')
     return any(p==r or p.startswith(r+'/') or r.startswith(p+'/') for r in roots)
-cov={v:p for v,p in pathvars.items() if covered(p)}
-WRITE=re.compile(r'(?:(?<![<0-9])>>?\s*"?\$\{?(%s)\b|\b(?:cp|mv|install|tee|ln|truncate)\b[^\n|]*"?\$\{?(%s)\b|\brm\s+-[rf]+\s+[^\n]*"?\$\{?(%s)\b|\bsed\s+-i[^\n]*"?\$\{?(%s)\b|\b(?:atomic_replace_file|atomic_restore_file|set_config_file|restore_backup_or_remove)\b[^\n]*"?\$\{?(%s)\b|\bmkdir\b[^\n]*"?\$\{?(%s)\b)'%((('|'.join(map(re.escape,cov)) or 'NOPE'),)*6))
+def write_pattern(names):
+    variables='|'.join(re.escape(v) for v in sorted(names)) or 'NOPE'
+    return re.compile(r'(?:(?<![<0-9])>>?\s*"?\$\{?(%s)\b|\b(?:cp|mv|install|tee|ln|truncate)\b[^\n|]*"?\$\{?(%s)\b|\brm\s+-[rf]+\s+[^\n]*"?\$\{?(%s)\b|\bsed\s+-i[^\n]*"?\$\{?(%s)\b|\b(?:atomic_replace_file|atomic_restore_file|set_config_file|restore_backup_or_remove)\b[^\n]*"?\$\{?(%s)\b|\bmkdir\b[^\n]*"?\$\{?(%s)\b)'%((variables,)*6))
 LIT=re.compile(r'(?:>>?\s*"?(/etc/[^\s"]+)|\b(?:cp|mv|tee|install|rm\s+-[rf]+|sed\s+-i)\b[^\n|]*\s"?(/etc/[^\s"]+))')
 # 运行时写入：默认路由被出口源地址回滚整条替换，disable_ipv6 被 IPv6 回滚整体恢复
 RUNTIME=re.compile(r'\bip\s+(?:"?-\$\{?FAMILY\}?"?|-4|-6)?\s*route\s+(?:replace|change|add|del|delete|flush)\b|disable_ipv6"?\s*$|>\s*"?\$\{?[A-Z_]*PROC[A-Z_]*\b')
 writers={}
 for n,b in funcs.items():
+    paths={v:set(values) for v,values in pathvars.items() if v not in locals_[n]}
+    collect_paths(b,paths)
+    derive_paths([(b,())],paths)
+    WRITE=write_pattern(v for v,values in paths.items() if any(covered(p) for p in values))
     hits=set()
     for line in b.split('\n'):
         ls=line.strip()
@@ -59,7 +85,7 @@ calls={n:{w for w in re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\b',b) if w in names
 entries=set()
 for n,b in funcs.items():
     if n.endswith('_menu') or n=='main' or 'first_run_offer_step' in b:
-        entries|=calls[n]
+        entries.add(n)
 # 生成脚本/只读/读取类误报
 SKIP={'diagnostic_bundle_create','get_config','f2b_status','config_backup_create','config_backup_allowed_roots','ufw_port_rule_present','sshd_effective_reload'}
 def reach(start):

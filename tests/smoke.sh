@@ -2327,4 +2327,12 @@ t_txn_inventory() {
 }
 run_test "Every menu-reachable writer of a snapshot-covered path is transaction-guarded" t_txn_inventory
 
+t_txn_inventory_regression() {
+    command -v python3 >/dev/null 2>&1 || { echo "python3 unavailable, inventory regression skipped"; return 0; }
+    local OUT
+    OUT=$(python3 "$ROOT/tests/txn-inventory-test.py" 2>&1) || fail "$OUT"
+    :
+}
+run_test "Transaction inventory respects local scopes and is independent of file enumeration order" t_txn_inventory_regression
+
 test_summary "Smoke ($OS)"
