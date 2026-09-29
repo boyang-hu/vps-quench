@@ -68,6 +68,72 @@ Quench CLI — VPS 初始化与管理工具
 EOF
 }
 
+# 只解析展示字段，不 source/eval 系统文件；不执行其中的 shell 内容。
+quench_os_label() {
+    local OS_FILE="${1:-/etc/os-release}" DEBIAN_FILE="${2:-/etc/debian_version}"
+    local FALLBACK_FILE="${3:-/usr/lib/os-release}"
+    [ -r "$OS_FILE" ] || OS_FILE="$FALLBACK_FILE"
+    [ -r "$OS_FILE" ] || OS_FILE=/dev/null
+    [ -r "$DEBIAN_FILE" ] || DEBIAN_FILE=/dev/null
+    LC_ALL=C awk '
+        function value(s, q, i, c, out) {
+            sub(/^[^=]*=/, "", s)
+            sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s)
+            q = substr(s, 1, 1)
+            if ((q == "\"" || q == sprintf("%c", 39)) && substr(s, length(s), 1) == q) {
+                s = substr(s, 2, length(s) - 2)
+                if (q == "\"") {
+                    out = ""
+                    for (i = 1; i <= length(s); i++) {
+                        c = substr(s, i, 1)
+                        if (c == "\\" && substr(s, i + 1, 1) ~ /^[\\"$`]$/) c = substr(s, ++i, 1)
+                        out = out c
+                    }
+                    s = out
+                }
+            }
+            gsub(/[[:cntrl:]]/, "", s)
+            return s
+        }
+        FILENAME == ARGV[1] {
+            if ($0 ~ /^(ID|NAME|PRETTY_NAME|VERSION_ID|VERSION_CODENAME)=/) {
+                key = $0; sub(/=.*/, "", key); os[key] = value($0)
+            }
+            next
+        }
+        FNR == 1 { point = $0; sub(/\r$/, "", point) }
+        END {
+            label = os["PRETTY_NAME"]
+            if (label == "") {
+                label = os["NAME"]
+                if (label == "") label = "未知发行版"
+                if (os["VERSION_ID"] != "") label = label " " os["VERSION_ID"]
+                if (os["VERSION_CODENAME"] != "") label = label " (" os["VERSION_CODENAME"] ")"
+            }
+            # Ubuntu 等衍生系统也可能有 debian_version，不能据此改成 Debian。
+            # testing/sid 标记或不同主版本的小版本不能冒充当前发行版版本。
+            split(point, parts, ".")
+            if (os["ID"] == "debian" && os["VERSION_ID"] ~ /^[0-9]+$/ &&
+                point ~ /^[0-9]+([.][0-9]+)*$/ && parts[1] == os["VERSION_ID"]) {
+                name = os["NAME"]; if (name == "") name = "Debian GNU/Linux"
+                label = name " " point
+                if (os["VERSION_CODENAME"] != "") label = label " (" os["VERSION_CODENAME"] ")"
+            }
+            print label
+        }
+    ' "$OS_FILE" "$DEBIAN_FILE"
+}
+
+quench_system_overview() {
+    local OS_LABEL ARCH KERNEL
+    OS_LABEL=$(quench_os_label)
+    ARCH=$(uname -m 2>/dev/null) || ARCH=""
+    KERNEL=$(uname -r 2>/dev/null) || KERNEL=""
+    # printf 不把发行版名称中的反斜线解释成终端控制符。
+    printf '  %s系统%s  %s · %s\n' "$DIM" "$NC" "${OS_LABEL:-未知发行版}" "${ARCH:-未知架构}"
+    printf '  %s内核%s  %s\n' "$DIM" "$NC" "${KERNEL:-未知}"
+}
+
 main_menu() {
     while true; do
         # 每轮在父 shell 里读一次真实状态；本轮内的多次 get_config（都是命令
@@ -147,6 +213,7 @@ main_menu() {
         esac
 
         menu_group "系统概览"
+        quench_system_overview
         status_pair "用户" "$USER_TOTAL · 管理员 $ADMIN_TOTAL" "active" "SSH" "${CUR_PORT:-22} · $AUTH_LABEL" "$AUTH_STATE"
         status_pair "BBR" "$BBR_CC · ${TC_RATE}${TC_MISMATCH}" "$BBR_STATE" "Fail2ban" "$F2B_LABEL" "$F2B_STATE"
         status_pair "防火墙" "$FW_STAT" "$FW_STATE" "Caddy" "$CADDY_LABEL" "$CADDY_STATE"

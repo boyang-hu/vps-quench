@@ -387,7 +387,7 @@ bbr_measure_menu() {
         if [ -n "$INPUT" ]; then NOMINAL=$(bbr_parse_bandwidth_mbps "$INPUT") || { error "无效带宽"; return 1; }; fi
         read -rp "  业务目标 RTT（默认150ms，估计值；不是近端测速延迟）: " RTT || return 1
         RTT=${RTT:-150}; bbr_measure_uint "$RTT" 1 2000 || { error "RTT 必须为 1-2000ms"; return 1; }
-        read -rp "  用途：1 代理/多连接（默认）  2 混合  3 少量大文件: " INPUT || return 1
+        read -rp "  用途：1 代理/多连接（默认）  2 网站 / API / 混合服务  3 少量大文件: " INPUT || return 1
         case "$INPUT" in ''|1) ROLE=proxy ;; 2) ROLE=mixed ;; 3) ROLE=bulk ;; *) return 1 ;; esac
         bbr_measure_yes "同时启用 BBR＋FQ？(Y/n，不会因此新增限速):" y && CORE=y
         bbr_measure_yes "同时实测是否需要 tc 整形？(Y/n，可独立跳过):" y && SHAPE=y

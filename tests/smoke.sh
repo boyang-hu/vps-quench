@@ -2228,6 +2228,94 @@ t_build_001() {
 run_test "Rebuilding unchanged sources leaves the manifest untouched" t_build_001
 
 
+t_overview_os_label() {
+    printf '%s\n' "$1" > "$TMP/quench-os-release"
+    printf '%s\n' "$2" > "$TMP/quench-debian-version"
+    assert_eq "$(quench_os_label "$TMP/quench-os-release" "$TMP/quench-debian-version" "$TMP/no-os-release")" "$3"
+    :
+}
+run_test 'Overview displays Debian 12 point release and codename' t_overview_os_label \
+    $'ID=debian\nNAME="Debian GNU/Linux"\nPRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\nVERSION_ID="12"\nVERSION_CODENAME=bookworm' \
+    '12.11' 'Debian GNU/Linux 12.11 (bookworm)'
+run_test 'Overview displays Debian 13 point release and codename' t_overview_os_label \
+    $'ID=debian\nNAME="Debian GNU/Linux"\nPRETTY_NAME="Debian GNU/Linux 13 (trixie)"\nVERSION_ID="13"\nVERSION_CODENAME=trixie' \
+    '13.0' 'Debian GNU/Linux 13.0 (trixie)'
+run_test 'Overview does not replace Ubuntu with its Debian base version' t_overview_os_label \
+    $'ID=ubuntu\nNAME="Ubuntu"\nPRETTY_NAME="Ubuntu 24.04.3 LTS"\nVERSION_ID="24.04"' \
+    'trixie/sid' 'Ubuntu 24.04.3 LTS'
+run_test 'Overview preserves Debian version if point release major mismatches' t_overview_os_label \
+    $'ID=debian\nPRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\nVERSION_ID=12' \
+    '13.0' 'Debian GNU/Linux 12 (bookworm)'
+run_test 'Overview does not mistake a Debian testing marker for a point release' t_overview_os_label \
+    $'ID=debian\nPRETTY_NAME="Debian GNU/Linux 13 (trixie)"\nVERSION_ID=13' \
+    'trixie/sid' 'Debian GNU/Linux 13 (trixie)'
+run_test 'Overview supports single-quoted fields and missing PRETTY_NAME' t_overview_os_label \
+    "ID='alpine'
+NAME='Alpine Linux'
+VERSION_ID='3.22.1'" '' 'Alpine Linux 3.22.1'
+run_test 'Overview supports OpenWrt version display' t_overview_os_label \
+    $'ID=openwrt\nPRETTY_NAME="OpenWrt 24.10.0"' '' 'OpenWrt 24.10.0'
+run_test 'Overview decodes quoted escapes without shell evaluation' t_overview_os_label \
+    'PRETTY_NAME="Example \"Linux\" \\$literal"' '' 'Example "Linux" \$literal'
+run_test 'Overview strips terminal controls from OS fields' t_overview_os_label \
+    $'PRETTY_NAME="Example\033 Linux\t 1"\r' '' 'Example Linux 1'
+
+t_overview_fallback() {
+    printf '%s\n' 'PRETTY_NAME="Fallback Linux 1"' > "$TMP/quench-fallback-release"
+    assert_eq "$(quench_os_label "$TMP/no-os-release" "$TMP/no-debian-version" "$TMP/quench-fallback-release")" 'Fallback Linux 1'
+    assert_eq "$(quench_os_label "$TMP/no-os-release" "$TMP/no-debian-version" "$TMP/no-fallback")" '未知发行版'
+    # 不缓存发行版信息：同一会话更新系统后，下一轮概览立即读到新版本。
+    printf '%s\n' 'PRETTY_NAME="Fallback Linux 2"' > "$TMP/quench-fallback-release"
+    assert_eq "$(quench_os_label "$TMP/no-os-release" "$TMP/no-debian-version" "$TMP/quench-fallback-release")" 'Fallback Linux 2'
+    :
+}
+run_test 'Overview falls back to vendor release, handles missing files, and refreshes live data' t_overview_fallback
+
+t_overview_no_eval() {
+    printf 'PRETTY_NAME="$(touch %s)"\n' "$TMP/quench-os-executed" > "$TMP/quench-os-data"
+    assert_eq "$(quench_os_label "$TMP/quench-os-data" "$TMP/no-debian-version")" "\$(touch $TMP/quench-os-executed)"
+    [ ! -e "$TMP/quench-os-executed" ] || fail 'os-release content was executed'
+    :
+}
+run_test 'Overview treats os-release as data, not shell code' t_overview_no_eval
+
+t_overview_runtime() {
+    quench_os_label() { printf '%s\n' 'Debian GNU/Linux 13.0 (trixie)'; }
+    uname() { case "$1" in -m) echo aarch64 ;; -r) echo 6.12-test-running ;; *) fail 'unexpected uname option' ;; esac; }
+    DIM=""; NC=""
+    assert_eq "$(quench_system_overview)" $'  系统  Debian GNU/Linux 13.0 (trixie) · aarch64\n  内核  6.12-test-running'
+    uname() { return 1; }
+    assert_contains "$(quench_system_overview)" '未知架构'
+    assert_contains "$(quench_system_overview)" '内核  未知'
+    assert_file_contains "$ROOT/src/modules/main.sh" '        quench_system_overview'
+    :
+}
+run_test 'Overview renders running kernel and architecture on separate lines with safe fallbacks' t_overview_runtime
+
+t_web_profile_menu() {
+    bbr_physical_memory_mb() { echo 1024; }
+    sysctl() { echo bbr; }
+    quench_tcp_profile() { printf 'selected:%s\n' "$1"; }
+    local OUT
+    OUT=$(bbr_smart_wizard <<< 1)
+    assert_contains "$OUT" '通用建站 / 混合服务'
+    assert_contains "$OUT" '代理与线路场景'
+    assert_contains "$OUT" 'selected:balanced'
+    :
+}
+run_test 'Web hosting preset label retains the existing balanced dispatch' t_web_profile_menu
+
+t_web_measured_role() {
+    bbr_measure_session() { printf 'role:%s core:%s shape:%s\n' "$7" "$8" "$9"; }
+    local OUT
+    OUT=$(bbr_measure_menu tune <<< "$(printf '4\n192.0.2.1\n5201\n\n150\n%s\nn\nn\ny\n' "$1")")
+    assert_contains "$OUT" "role:$2 core:n shape:n"
+    :
+}
+run_test 'Measured web hosting choice remains mixed without enabling BBR or shaping implicitly' t_web_measured_role 2 mixed
+run_test 'Measured wizard default remains proxy' t_web_measured_role '' proxy
+run_test 'Measured large-file choice remains bulk' t_web_measured_role 3 bulk
+
 # 事务保护盘点：从菜单可达的入口出发，凡是写入回滚快照覆盖路径的函数都必须经过
 # txn_write_begin / safety_arm。名单式测试只能覆盖已知函数，这里用调用图兜底。
 t_txn_inventory() {

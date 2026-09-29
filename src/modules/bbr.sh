@@ -1956,7 +1956,7 @@ bbr_menu_manual() {
     menu_item "1" "中转机  ${DIM}双向转发 / 大并发${NC}"
     menu_item "2" "落地机  ${DIM}跨境上行 / 大缓冲${NC}"
     menu_item "3" "线路落地机  ${DIM}低延迟优先${NC}"
-    menu_item "4" "通用单机  ${DIM}网页 / SSH / 服务${NC}"
+    menu_item "4" "通用建站 / 混合服务  ${DIM}网站 / API / SSH${NC}"
     menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
     menu_div
     echo ""
@@ -1966,7 +1966,7 @@ bbr_menu_manual() {
         1) PROFILE="relay";        SCENE_LABEL="中转机" ;;
         2) PROFILE="landing";      SCENE_LABEL="落地机" ;;
         3) PROFILE="line_landing"; SCENE_LABEL="线路落地机" ;;
-        4) PROFILE="default";      SCENE_LABEL="通用单机" ;;
+        4) PROFILE="default";      SCENE_LABEL="通用建站 / 混合服务" ;;
         0) return ;;
         00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         *) warn "无效选项"; return ;;
@@ -3332,7 +3332,7 @@ bbr_menu_initcwnd_locked() {
 
 # ── BBR 主菜单 ────────────────────────────────────────────
 
-# ── 一键 TCP 预设（三种场景）────────────────────────────
+# ── TCP 通用预设与代理/线路场景（不测速）────────────────
 quench_tcp_profile() {
     local PROFILE="${1:-balanced}"
     local RMEM WMEM NOTSENT LABEL BUF_MB MEM_MB BUFFER_CAP
@@ -3351,7 +3351,7 @@ quench_tcp_profile() {
                 RMEM=67108864; BUF_MB=64
             fi
             NOTSENT=262144
-            LABEL="均衡跨境  — 网页/代理/日常综合（推荐）" ;;
+            LABEL="通用建站 / 混合服务 — 网站/API/日常综合（均衡）" ;;
         latency)
             if [ "$MEM_MB" -lt 1024 ]; then RMEM=16777216; BUF_MB=16
             else RMEM=33554432; BUF_MB=32
@@ -3449,11 +3449,11 @@ bbr_smart_wizard() {
     echo ""
     menu_div
     menu_group "通用预设"
-    menu_item "1" "均衡跨境  ${DIM}默认推荐${NC}"
+    menu_item "1" "通用建站 / 混合服务  ${DIM}均衡，默认推荐${NC}"
     menu_item "2" "低延迟交互  ${DIM}SSH / 游戏 / 远程桌面${NC}"
     menu_item "3" "高吞吐传输  ${DIM}大带宽优先${NC}"
     echo ""
-    menu_group "场景化预设"
+    menu_group "代理与线路场景"
     menu_item "4" "中转机  ${DIM}双向转发 / 大并发${NC}"
     menu_item "5" "落地机  ${DIM}跨境上行 / 大缓冲${NC}"
     menu_item "6" "线路落地机  ${DIM}低延迟优先${NC}"

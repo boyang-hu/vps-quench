@@ -5545,7 +5545,7 @@ bbr_menu_manual() {
     menu_item "1" "中转机  ${DIM}双向转发 / 大并发${NC}"
     menu_item "2" "落地机  ${DIM}跨境上行 / 大缓冲${NC}"
     menu_item "3" "线路落地机  ${DIM}低延迟优先${NC}"
-    menu_item "4" "通用单机  ${DIM}网页 / SSH / 服务${NC}"
+    menu_item "4" "通用建站 / 混合服务  ${DIM}网站 / API / SSH${NC}"
     menu_pair "0" "返回上级" "00" "退出脚本" "$RED" "$RED"
     menu_div
     echo ""
@@ -5555,7 +5555,7 @@ bbr_menu_manual() {
         1) PROFILE="relay";        SCENE_LABEL="中转机" ;;
         2) PROFILE="landing";      SCENE_LABEL="落地机" ;;
         3) PROFILE="line_landing"; SCENE_LABEL="线路落地机" ;;
-        4) PROFILE="default";      SCENE_LABEL="通用单机" ;;
+        4) PROFILE="default";      SCENE_LABEL="通用建站 / 混合服务" ;;
         0) return ;;
         00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         *) warn "无效选项"; return ;;
@@ -6921,7 +6921,7 @@ bbr_menu_initcwnd_locked() {
 
 # ── BBR 主菜单 ────────────────────────────────────────────
 
-# ── 一键 TCP 预设（三种场景）────────────────────────────
+# ── TCP 通用预设与代理/线路场景（不测速）────────────────
 quench_tcp_profile() {
     local PROFILE="${1:-balanced}"
     local RMEM WMEM NOTSENT LABEL BUF_MB MEM_MB BUFFER_CAP
@@ -6940,7 +6940,7 @@ quench_tcp_profile() {
                 RMEM=67108864; BUF_MB=64
             fi
             NOTSENT=262144
-            LABEL="均衡跨境  — 网页/代理/日常综合（推荐）" ;;
+            LABEL="通用建站 / 混合服务 — 网站/API/日常综合（均衡）" ;;
         latency)
             if [ "$MEM_MB" -lt 1024 ]; then RMEM=16777216; BUF_MB=16
             else RMEM=33554432; BUF_MB=32
@@ -7038,11 +7038,11 @@ bbr_smart_wizard() {
     echo ""
     menu_div
     menu_group "通用预设"
-    menu_item "1" "均衡跨境  ${DIM}默认推荐${NC}"
+    menu_item "1" "通用建站 / 混合服务  ${DIM}均衡，默认推荐${NC}"
     menu_item "2" "低延迟交互  ${DIM}SSH / 游戏 / 远程桌面${NC}"
     menu_item "3" "高吞吐传输  ${DIM}大带宽优先${NC}"
     echo ""
-    menu_group "场景化预设"
+    menu_group "代理与线路场景"
     menu_item "4" "中转机  ${DIM}双向转发 / 大并发${NC}"
     menu_item "5" "落地机  ${DIM}跨境上行 / 大缓冲${NC}"
     menu_item "6" "线路落地机  ${DIM}低延迟优先${NC}"
@@ -7660,7 +7660,7 @@ bbr_measure_menu() {
         if [ -n "$INPUT" ]; then NOMINAL=$(bbr_parse_bandwidth_mbps "$INPUT") || { error "无效带宽"; return 1; }; fi
         read -rp "  业务目标 RTT（默认150ms，估计值；不是近端测速延迟）: " RTT || return 1
         RTT=${RTT:-150}; bbr_measure_uint "$RTT" 1 2000 || { error "RTT 必须为 1-2000ms"; return 1; }
-        read -rp "  用途：1 代理/多连接（默认）  2 混合  3 少量大文件: " INPUT || return 1
+        read -rp "  用途：1 代理/多连接（默认）  2 网站 / API / 混合服务  3 少量大文件: " INPUT || return 1
         case "$INPUT" in ''|1) ROLE=proxy ;; 2) ROLE=mixed ;; 3) ROLE=bulk ;; *) return 1 ;; esac
         bbr_measure_yes "同时启用 BBR＋FQ？(Y/n，不会因此新增限速):" y && CORE=y
         bbr_measure_yes "同时实测是否需要 tc 整形？(Y/n，可独立跳过):" y && SHAPE=y
@@ -19480,6 +19480,72 @@ Quench CLI — VPS 初始化与管理工具
 EOF
 }
 
+# 只解析展示字段，不 source/eval 系统文件；不执行其中的 shell 内容。
+quench_os_label() {
+    local OS_FILE="${1:-/etc/os-release}" DEBIAN_FILE="${2:-/etc/debian_version}"
+    local FALLBACK_FILE="${3:-/usr/lib/os-release}"
+    [ -r "$OS_FILE" ] || OS_FILE="$FALLBACK_FILE"
+    [ -r "$OS_FILE" ] || OS_FILE=/dev/null
+    [ -r "$DEBIAN_FILE" ] || DEBIAN_FILE=/dev/null
+    LC_ALL=C awk '
+        function value(s, q, i, c, out) {
+            sub(/^[^=]*=/, "", s)
+            sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s)
+            q = substr(s, 1, 1)
+            if ((q == "\"" || q == sprintf("%c", 39)) && substr(s, length(s), 1) == q) {
+                s = substr(s, 2, length(s) - 2)
+                if (q == "\"") {
+                    out = ""
+                    for (i = 1; i <= length(s); i++) {
+                        c = substr(s, i, 1)
+                        if (c == "\\" && substr(s, i + 1, 1) ~ /^[\\"$`]$/) c = substr(s, ++i, 1)
+                        out = out c
+                    }
+                    s = out
+                }
+            }
+            gsub(/[[:cntrl:]]/, "", s)
+            return s
+        }
+        FILENAME == ARGV[1] {
+            if ($0 ~ /^(ID|NAME|PRETTY_NAME|VERSION_ID|VERSION_CODENAME)=/) {
+                key = $0; sub(/=.*/, "", key); os[key] = value($0)
+            }
+            next
+        }
+        FNR == 1 { point = $0; sub(/\r$/, "", point) }
+        END {
+            label = os["PRETTY_NAME"]
+            if (label == "") {
+                label = os["NAME"]
+                if (label == "") label = "未知发行版"
+                if (os["VERSION_ID"] != "") label = label " " os["VERSION_ID"]
+                if (os["VERSION_CODENAME"] != "") label = label " (" os["VERSION_CODENAME"] ")"
+            }
+            # Ubuntu 等衍生系统也可能有 debian_version，不能据此改成 Debian。
+            # testing/sid 标记或不同主版本的小版本不能冒充当前发行版版本。
+            split(point, parts, ".")
+            if (os["ID"] == "debian" && os["VERSION_ID"] ~ /^[0-9]+$/ &&
+                point ~ /^[0-9]+([.][0-9]+)*$/ && parts[1] == os["VERSION_ID"]) {
+                name = os["NAME"]; if (name == "") name = "Debian GNU/Linux"
+                label = name " " point
+                if (os["VERSION_CODENAME"] != "") label = label " (" os["VERSION_CODENAME"] ")"
+            }
+            print label
+        }
+    ' "$OS_FILE" "$DEBIAN_FILE"
+}
+
+quench_system_overview() {
+    local OS_LABEL ARCH KERNEL
+    OS_LABEL=$(quench_os_label)
+    ARCH=$(uname -m 2>/dev/null) || ARCH=""
+    KERNEL=$(uname -r 2>/dev/null) || KERNEL=""
+    # printf 不把发行版名称中的反斜线解释成终端控制符。
+    printf '  %s系统%s  %s · %s\n' "$DIM" "$NC" "${OS_LABEL:-未知发行版}" "${ARCH:-未知架构}"
+    printf '  %s内核%s  %s\n' "$DIM" "$NC" "${KERNEL:-未知}"
+}
+
 main_menu() {
     while true; do
         # 每轮在父 shell 里读一次真实状态；本轮内的多次 get_config（都是命令
@@ -19559,6 +19625,7 @@ main_menu() {
         esac
 
         menu_group "系统概览"
+        quench_system_overview
         status_pair "用户" "$USER_TOTAL · 管理员 $ADMIN_TOTAL" "active" "SSH" "${CUR_PORT:-22} · $AUTH_LABEL" "$AUTH_STATE"
         status_pair "BBR" "$BBR_CC · ${TC_RATE}${TC_MISMATCH}" "$BBR_STATE" "Fail2ban" "$F2B_LABEL" "$F2B_STATE"
         status_pair "防火墙" "$FW_STAT" "$FW_STATE" "Caddy" "$CADDY_LABEL" "$CADDY_STATE"
