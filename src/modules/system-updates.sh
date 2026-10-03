@@ -223,7 +223,7 @@ system_update_apt_layout_guard() {
     printf '%s\n' "$CFG" | python3 -c '
 import re, sys
 d = dict(re.findall(r"^([\w:.-]+)\s+\"([^\"]*)\";", sys.stdin.read(), re.M))
-expected = {"Dir":"/", "Dir::Etc":"etc/apt", "Dir::Etc::sourcelist":"sources.list", "Dir::Etc::sourceparts":"sources.list.d"}
+expected = {"Dir":"/", "Dir::Etc":"etc/apt", "Dir::Etc::sourcelist":"sources.list", "Dir::Etc::sourceparts":"sources.list.d", "Dir::Etc::parts":"apt.conf.d", "Dir::Etc::main":"apt.conf"}
 safe = all(d.get(k, v).rstrip("/") == v.rstrip("/") for k,v in expected.items())
 for key in ("APT::Get::AllowUnauthenticated", "Acquire::AllowInsecureRepositories", "Acquire::AllowDowngradeToInsecureRepositories"):
     safe = safe and d.get(key, "false").lower() in ("false", "no", "0")
@@ -352,22 +352,329 @@ EOF
 
 system_update_auto_policy_verify() {
     local CFG
-    CFG=$(apt-config dump) || return 1
+    if [ -n "${1:-}" ]; then CFG=$(cat "$1") || return 1
+    else CFG=$(apt-config dump) || { error "无法读取有效 APT 配置"; return 1; }; fi
     # shellcheck disable=SC2016 # ${distro_codename} is an unattended-upgrades macro, not a shell variable.
     printf '%s\n' "$CFG" | python3 -c '
 import re,sys
 text = sys.stdin.read()
 def values(key):
-    return re.findall(r"^"+re.escape(key)+r"(?:::)?\s+\"([^\"]*)\";", text, re.M)
+    return re.findall(r"^"+re.escape(key)+r"(?:::)?\s+\"([^\"]*)\";", text, re.M | re.I)
 expected = "origin=Debian,codename=${distro_codename}-security,label=Debian-Security"
 patterns = [v for v in values("Unattended-Upgrade::Origins-Pattern") if v]
 allowed = [v for v in values("Unattended-Upgrade::Allowed-Origins") if v]
-ok = patterns == [expected] and not allowed
-ok = ok and values("Unattended-Upgrade::Automatic-Reboot") == ["false"]
-ok = ok and values("APT::Periodic::Unattended-Upgrade") == ["1"]
-sys.exit(0 if ok else 1)
-' || { error "有效 APT 配置被其他文件覆盖，不能确认仅安全更新且禁止自动重启"; return 1; }
+problems = []
+def check(key, valid, default=None):
+    actual = values(key)
+    effective = actual if actual else ([default] if default is not None else [])
+    if len(effective) != 1 or effective[0].lower() not in valid:
+        problems.append(key + " = " + repr(actual) + "; 需要 " + "/".join(valid))
+if patterns != [expected]:
+    problems.append("Unattended-Upgrade::Origins-Pattern = " + repr(patterns) + "; 需要仅 Debian security 来源")
+if allowed:
+    problems.append("Unattended-Upgrade::Allowed-Origins 仍有额外来源：" + repr(allowed))
+check("APT::Periodic::Enable", ("1",), "1")
+check("APT::Periodic::Update-Package-Lists", ("1",))
+check("APT::Periodic::Unattended-Upgrade", ("1",))
+for key in ("Automatic-Reboot", "Remove-Unused-Dependencies", "Remove-New-Unused-Dependencies", "Remove-Unused-Kernel-Packages"):
+    check("Unattended-Upgrade::" + key, ("false", "no", "0"))
+for problem in problems:
+    print("APT 策略不符合：" + problem, file=sys.stderr)
+sys.exit(1 if problems else 0)
+' || { error "自动安全更新策略未通过验证；请核对以上具体键值及 /etc/apt/apt.conf.d、/etc/apt/apt.conf"; return 1; }
 }
+
+# Only this known, pure disabling template can be moved automatically. A file
+# with extra directives (including #include/#clear) requires manual review.
+system_update_auto_template_safe() {
+    python3 - "$1" <<'PY'
+import pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+try:
+    if p.is_symlink() or not p.is_file():
+        raise ValueError('不是普通文件')
+    count = 0
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('//'):
+            continue
+        if not re.fullmatch(r'APT::Periodic::(Enable|Update-Package-Lists|Download-Upgradeable-Packages|Unattended-Upgrade|AutocleanInterval)\s+"0"\s*;\s*(?://.*)?', line, re.I):
+            raise ValueError('包含纯禁用开关以外的内容：' + line)
+        count += 1
+    if not count:
+        raise ValueError('没有可识别的禁用开关')
+except (OSError, ValueError) as exc:
+    print(str(p) + '：' + str(exc) + '；不自动移除此文件', file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+system_update_auto_config_write() {
+    printf '%s\n' 'APT::Periodic::Enable "1";' \
+        'APT::Periodic::Update-Package-Lists "1";' \
+        'APT::Periodic::Unattended-Upgrade "1";' > "$1" || return 1
+    cat > "$2" <<'EOF'
+// Managed by Quench. Only security updates; no automatic reboot or removal.
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern { "origin=Debian,codename=${distro_codename}-security,label=Debian-Security"; };
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+EOF
+}
+
+system_update_auto_candidate_check() {
+    local DIR="$1" TEMPLATE="$2"
+    mkdir -p "$DIR/parts" || return 1
+    cp -a "$QUENCH_UPDATE_APT_DIR/apt.conf.d/." "$DIR/parts/" || return 1
+    if [ -f "$QUENCH_UPDATE_APT_DIR/apt.conf" ]; then
+        cp -p "$QUENCH_UPDATE_APT_DIR/apt.conf" "$DIR/main" || return 1
+    else : > "$DIR/main" || return 1; fi
+    # Never follow target symlinks in the staged copy.
+    rm -f "$DIR/parts/20auto-upgrades" "$DIR/parts/52quench-unattended-upgrades" || return 1
+    [ "$TEMPLATE" != yes ] || rm -f "$DIR/parts/99-template-no-auto-upgrades" || return 1
+    system_update_auto_config_write "$DIR/parts/20auto-upgrades" "$DIR/parts/52quench-unattended-upgrades" || return 1
+    # APT_CONFIG is read before config fragments, unlike late command-line -o.
+    printf 'Dir::Etc::parts "%s/parts";\nDir::Etc::main "%s/main";\n' "$DIR" "$DIR" > "$DIR/bootstrap" || return 1
+    APT_CONFIG="$DIR/bootstrap" apt-config dump > "$DIR/effective" || return 1
+    system_update_auto_policy_verify "$DIR/effective"
+}
+
+system_update_auto_units_ready() {
+    local UNIT STATE
+    for UNIT in apt-daily.service apt-daily-upgrade.service unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer; do
+        STATE=$(systemctl show "$UNIT" -p LoadState --value) || return 1
+        [ "$STATE" = loaded ] || { error "$UNIT 的 LoadState=${STATE}，自动更新不可用"; return 1; }
+    done
+    for UNIT in apt-daily.timer apt-daily-upgrade.timer; do
+        if ! systemctl is-enabled --quiet "$UNIT" || ! systemctl is-active --quiet "$UNIT"; then
+            error "$UNIT 未启用或未运行"; return 1
+        fi
+    done
+}
+
+system_update_auto_install_dependency() {
+    local STATUS
+    STATUS=$(dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null) || STATUS=""
+    [ "$STATUS" != 'install ok installed' ] || return 0
+    system_update_logged env LC_ALL=C apt-get -o APT::Update::Error-Mode=any update || return 1
+    system_update_logged env LC_ALL=C apt-get -o DPkg::Lock::Timeout=60 --no-remove install -y unattended-upgrades
+}
+
+system_update_auto_units_snapshot() {
+    local UNIT STATE ACTIVE LOAD
+    for UNIT in apt-daily.service apt-daily-upgrade.service unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer; do
+        LOAD=$(systemctl show "$UNIT" -p LoadState --value) || {
+            [ "$UNIT:$LOAD" = unattended-upgrades.service:not-found ] || return 1;
+        }
+        if [ "$UNIT:$LOAD" = unattended-upgrades.service:not-found ]; then
+            printf '%s\tnot-found\tinactive\n' "$UNIT"
+            continue
+        fi
+        case "$LOAD" in loaded|masked) : ;; *) error "$UNIT 的 LoadState=${LOAD}，请先修复服务" >&2; return 1 ;; esac
+        STATE=$(systemctl show "$UNIT" -p UnitFileState --value) || return 1
+        ACTIVE=$(systemctl show "$UNIT" -p ActiveState --value) || return 1
+        case "$STATE" in masked|masked-runtime|disabled|enabled|enabled-runtime|static|not-found) : ;; *) error "无法自动恢复 $UNIT 的状态 $STATE" >&2; return 1 ;; esac
+        case "$ACTIVE" in active|inactive|failed) : ;; *) error "$UNIT 正在切换状态，请稍后再试" >&2; return 1 ;; esac
+        case "$UNIT:$ACTIVE" in apt-daily.service:active|apt-daily-upgrade.service:active) error "$UNIT 正在执行软件包任务，请等待完成" >&2; return 1 ;; esac
+        printf '%s\t%s\t%s\n' "$UNIT" "$STATE" "$ACTIVE"
+    done
+}
+
+system_update_auto_workers_idle() {
+    local UNIT ACTIVE
+    for UNIT in apt-daily.service apt-daily-upgrade.service; do
+        ACTIVE=$(systemctl show "$UNIT" -p ActiveState --value) || return 1
+        case "$ACTIVE" in inactive|failed) : ;; *) return 1 ;; esac
+    done
+    # Also cover manually started APT/dpkg processes outside systemd services.
+    # Probe existing POSIX locks without creating/deleting any lock files.
+    python3 - <<'PY'
+import fcntl, os, sys
+handles = []
+try:
+    for path in ('/var/lib/dpkg/lock', '/var/lib/dpkg/lock-frontend', '/var/cache/apt/archives/lock'):
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except FileNotFoundError:
+            continue
+        handles.append(fd)
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)
+finally:
+    for fd in handles:
+        os.close(fd)
+PY
+}
+
+# EXIT recovery uses the local QUENCH_AUTO_* transaction state of the caller.
+# Packages installed by APT are deliberately not uninstalled on failure.
+system_update_auto_enable_cleanup() {
+    local RC="$1" UNIT STATE ACTIVE I FILE FAILED=0
+    if [ "$RC" -eq 0 ] || [ "$QUENCH_AUTO_MUTATED" != yes ]; then return "$RC"; fi
+    warn "启用未完成，尝试恢复配置和原服务状态；已安装的软件包不会卸载"
+    systemctl stop apt-daily.timer apt-daily-upgrade.timer || FAILED=1
+    # A timer may already have fired. Never kill an APT/dpkg job to roll back.
+    if [ "$FAILED" -ne 0 ] || ! system_update_auto_workers_idle; then
+        error "timer 无法暂停、APT 任务仍在运行或状态不可确认：不终止任务、不回写配置。请等待完成后核对备份"
+        FAILED=1
+    else
+        for I in 0 1; do
+            [ "${QUENCH_AUTO_TOUCHED[$I]}" = yes ] || continue
+            FILE=${QUENCH_AUTO_TARGETS[$I]}
+            if [ ! -L "$FILE" ] && cmp -s "$FILE" "${QUENCH_AUTO_CANDIDATES[$I]}"; then
+                if [ -f "$QUENCH_UPDATE_RUN/before-$I" ]; then
+                    atomic_restore_file "$QUENCH_UPDATE_RUN/before-$I" "$FILE" || FAILED=1
+                else rm -f "$FILE" || FAILED=1; fi
+            elif [ ! -L "$FILE" ] && cmp -s "$FILE" "$QUENCH_UPDATE_RUN/before-$I"; then
+                : # Replacement failed before changing the file.
+            elif [ ! -e "$FILE" ] && [ ! -L "$FILE" ] && [ ! -e "$QUENCH_UPDATE_RUN/before-$I" ]; then
+                :
+            else
+                error "不覆盖外部改动：$FILE"; FAILED=1
+            fi
+        done
+        if [ "$QUENCH_AUTO_TEMPLATE_TOUCHED" = yes ]; then
+            if [ ! -e "$QUENCH_AUTO_TEMPLATE" ] && [ ! -L "$QUENCH_AUTO_TEMPLATE" ]; then
+                atomic_restore_file "$QUENCH_UPDATE_RUN/template-before" "$QUENCH_AUTO_TEMPLATE" || FAILED=1
+            elif [ ! -L "$QUENCH_AUTO_TEMPLATE" ] && cmp -s "$QUENCH_AUTO_TEMPLATE" "$QUENCH_UPDATE_RUN/template-before"; then :
+            else error "模板被外部修改，不覆盖：$QUENCH_AUTO_TEMPLATE"; FAILED=1; fi
+        fi
+        while IFS=$'\t' read -r UNIT STATE ACTIVE; do
+            case "$UNIT" in
+                unattended-upgrades.service)
+                    [ "$QUENCH_AUTO_UNITS_TOUCHED" = yes ] || continue
+                    [ "$ACTIVE" = active ] || systemctl stop "$UNIT" || FAILED=1 ;;
+                *.service) [ "$QUENCH_AUTO_UNITS_TOUCHED" = yes ] || continue ;;
+            esac
+            case "$STATE" in
+                masked) systemctl mask "$UNIT" || FAILED=1 ;;
+                masked-runtime) systemctl mask --runtime "$UNIT" || FAILED=1 ;;
+                disabled|not-found) systemctl disable "$UNIT" || FAILED=1 ;;
+                enabled-runtime)
+                    systemctl disable "$UNIT" || FAILED=1
+                    systemctl enable --runtime "$UNIT" || FAILED=1 ;;
+                enabled) systemctl enable "$UNIT" || FAILED=1 ;;
+            esac
+        done < "$QUENCH_UPDATE_RUN/units-before"
+        # A failed package installation may have left dpkg half-configured.
+        # Do not resume automatic scheduling into that state.
+        system_update_apt_health >/dev/null 2>&1 || FAILED=1
+        if [ "$FAILED" -eq 0 ]; then
+            while IFS=$'\t' read -r UNIT STATE ACTIVE; do
+                [ "$ACTIVE" != active ] || systemctl start "$UNIT" || FAILED=1
+            done < "$QUENCH_UPDATE_RUN/units-before"
+        fi
+    fi
+    if [ "$FAILED" -eq 0 ]; then warn "已恢复本次配置/服务变更（软件包安装不回退）"
+    elif systemctl stop apt-daily.timer apt-daily-upgrade.timer; then
+        error "恢复未完全完成；已暂停后续 timer，请检查 $QUENCH_UPDATE_RUN"
+    else error "恢复未完全完成且 timer 无法暂停，请立即人工核对 $QUENCH_UPDATE_RUN"; fi
+    printf 'operation=auto-security-enable\nexit_code=%s\nrecovery_failed=%s\n' "$RC" "$FAILED" > "$QUENCH_UPDATE_RUN/result.txt" || true
+    audit_action "自动安全更新启用失败；恢复状态 ${FAILED}；$QUENCH_UPDATE_RUN" FAILED
+    return "$RC"
+}
+
+system_update_auto_enable_apt() (
+    umask 077
+    system_update_apt_preflight || return 1
+    systemd_available || { error "Debian 自动安全更新入口需要 systemd；其他调度方式请人工配置"; return 1; }
+    local QUENCH_AUTO_TEMPLATE="$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
+    local QUENCH_AUTO_MUTATED=no QUENCH_AUTO_TEMPLATE_TOUCHED=no QUENCH_AUTO_UNITS_TOUCHED=no
+    local QUENCH_AUTO_TARGETS=("${QUENCH_APT_AUTO_UPGRADES_FILE:-$QUENCH_UPDATE_APT_DIR/apt.conf.d/20auto-upgrades}" "${QUENCH_APT_UNATTENDED_FILE:-$QUENCH_UPDATE_APT_DIR/apt.conf.d/52quench-unattended-upgrades}")
+    local QUENCH_AUTO_TOUCHED=(no no) QUENCH_AUTO_CANDIDATES=()
+    local TEMPLATE=no MASKS="" UNIT STATE ACTIVE FILE I
+    # Candidate validation must use exactly the files we intend to install.
+    [ "${QUENCH_AUTO_TARGETS[0]}" = "$QUENCH_UPDATE_APT_DIR/apt.conf.d/20auto-upgrades" ] \
+        && [ "${QUENCH_AUTO_TARGETS[1]}" = "$QUENCH_UPDATE_APT_DIR/apt.conf.d/52quench-unattended-upgrades" ] \
+        || { error "自动启用不接管自定义 APT 配置文件路径"; return 1; }
+    for FILE in "${QUENCH_AUTO_TARGETS[@]}"; do
+        if [ -L "$FILE" ] || { [ -e "$FILE" ] && [ ! -f "$FILE" ]; }; then
+            error "配置不是普通文件：$FILE"; return 1
+        fi
+    done
+    if [ -e "$QUENCH_AUTO_TEMPLATE" ] || [ -L "$QUENCH_AUTO_TEMPLATE" ]; then
+        system_update_auto_template_safe "$QUENCH_AUTO_TEMPLATE" || return 1
+        TEMPLATE=yes
+    fi
+    system_update_run_prepare || return 1
+    system_update_auto_units_snapshot > "$QUENCH_UPDATE_RUN/units-before" || { error "无法安全读取自动更新服务状态"; return 1; }
+    if [ "$TEMPLATE" = yes ]; then cp -p "$QUENCH_AUTO_TEMPLATE" "$QUENCH_UPDATE_RUN/template-before" || return 1; fi
+    while IFS=$'\t' read -r UNIT STATE ACTIVE; do
+        case "$STATE" in masked|masked-runtime) MASKS="$MASKS $UNIT ($STATE)" ;; esac
+    done < "$QUENCH_UPDATE_RUN/units-before"
+    # Check precedence before installing anything. Arbitrary administrator
+    # overrides are diagnosed, never renamed/deleted just to pass validation.
+    if ! system_update_auto_candidate_check "$QUENCH_UPDATE_RUN/candidate" "$TEMPLATE"; then
+        info "候选策略仍被其他配置影响；以下为相关设置的位置："
+        grep -RnsE 'APT::Periodic|Origins-Pattern|Allowed-Origins|Automatic-Reboot|Remove-.*Dependencies|Remove-Unused-Kernel' \
+            "$QUENCH_UPDATE_APT_DIR/apt.conf.d" "$QUENCH_UPDATE_APT_DIR/apt.conf" 2>/dev/null || true
+        return 1
+    fi
+    [ "$TEMPLATE" != yes ] || warn "检测到纯禁用模板：${QUENCH_AUTO_TEMPLATE}（确认后备份并移出生效配置）"
+    [ -z "$MASKS" ] || warn "检测到服务/定时器屏蔽：$MASKS"
+    confirm_change_preview "启用自动安全更新及处理以上冲突" \
+        "仅处理列出的纯禁用模板与屏蔽项，其他管理员配置保留；备份：$QUENCH_UPDATE_RUN" \
+        "只安装安全更新，不自动重启或清理软件包；timer 启用后可能很快执行，服务可能重启" \
+        "失败时尝试恢复配置和服务状态，不卸载本次安装的软件包，不终止正在运行的 APT 任务" || return 1
+    system_update_auto_units_snapshot > "$QUENCH_UPDATE_RUN/units-recheck" || return 1
+    cmp -s "$QUENCH_UPDATE_RUN/units-before" "$QUENCH_UPDATE_RUN/units-recheck" || { error "确认期间服务状态变化，请重试"; return 1; }
+    if [ "$TEMPLATE" = yes ]; then
+        if [ -L "$QUENCH_AUTO_TEMPLATE" ] || ! cmp -s "$QUENCH_AUTO_TEMPLATE" "$QUENCH_UPDATE_RUN/template-before"; then
+            error "确认期间禁用模板变化，请重试"; return 1
+        fi
+    fi
+    trap 'QUENCH_AUTO_RC=$?; trap - EXIT; system_update_auto_enable_cleanup "$QUENCH_AUTO_RC"; exit "$QUENCH_AUTO_RC"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    QUENCH_AUTO_MUTATED=yes
+    systemctl stop apt-daily.timer apt-daily-upgrade.timer || return 1
+    system_update_auto_workers_idle || { error "APT/dpkg 任务已启动或锁状态不可确认，请等待完成"; return 1; }
+    # Keep masks during installation. Package postinst may report them; this is
+    # expected. Unmask only after the live security-only policy has been verified.
+    [ -z "$MASKS" ] || info "安装依赖时暂保留屏蔽，安装器可能提示 masked；策略验证成功后才解除"
+    system_update_auto_install_dependency || { error "unattended-upgrades 安装失败；详情见 $QUENCH_UPDATE_RUN/commands.log"; return 1; }
+    # Package-created defaults form the rollback baseline; installation itself
+    # is not reversible. Save them before overwriting, including file absence.
+    QUENCH_AUTO_CANDIDATES=("$QUENCH_UPDATE_RUN/candidate/parts/20auto-upgrades" "$QUENCH_UPDATE_RUN/candidate/parts/52quench-unattended-upgrades")
+    for I in 0 1; do
+        FILE=${QUENCH_AUTO_TARGETS[$I]}
+        [ ! -L "$FILE" ] && { [ ! -e "$FILE" ] || [ -f "$FILE" ]; } || return 1
+        if [ -f "$FILE" ]; then cp -p "$FILE" "$QUENCH_UPDATE_RUN/before-$I" || return 1; fi
+    done
+    # Revalidate after package installation added its own default fragments.
+    system_update_auto_candidate_check "$QUENCH_UPDATE_RUN/recheck" "$TEMPLATE" || return 1
+    for I in 0 1; do
+        QUENCH_AUTO_TOUCHED[$I]=yes
+        atomic_replace_file "${QUENCH_AUTO_CANDIDATES[$I]}" "${QUENCH_AUTO_TARGETS[$I]}" || return 1
+    done
+    if [ "$TEMPLATE" = yes ]; then
+        if [ -L "$QUENCH_AUTO_TEMPLATE" ] || ! cmp -s "$QUENCH_AUTO_TEMPLATE" "$QUENCH_UPDATE_RUN/template-before"; then
+            error "禁用模板被修改，不移除"; return 1
+        fi
+        QUENCH_AUTO_TEMPLATE_TOUCHED=yes
+        rm "$QUENCH_AUTO_TEMPLATE" || return 1
+        info "禁用模板已移出 APT 配置；原文件保存在 $QUENCH_UPDATE_RUN/template-before"
+    fi
+    system_update_auto_policy_verify || return 1
+    QUENCH_AUTO_UNITS_TOUCHED=yes
+    while IFS=$'\t' read -r UNIT STATE ACTIVE; do
+        case "$STATE" in
+            masked) systemctl unmask "$UNIT" || return 1 ;;
+            masked-runtime) systemctl unmask --runtime "$UNIT" || return 1 ;;
+        esac
+    done < "$QUENCH_UPDATE_RUN/units-before"
+    systemctl enable --now unattended-upgrades.service || return 1
+    systemctl enable apt-daily.timer apt-daily-upgrade.timer || return 1
+    systemctl start apt-daily.timer apt-daily-upgrade.timer || return 1
+    system_update_auto_policy_verify && system_update_auto_units_ready || return 1
+    printf 'operation=auto-security-enable\nexit_code=0\n' > "$QUENCH_UPDATE_RUN/result.txt" || return 1
+    audit_action "启用自动安全更新；备份 $QUENCH_UPDATE_RUN" SUCCESS
+    info "自动安全更新已启用并验证；禁止自动重启，配置/服务状态备份：$QUENCH_UPDATE_RUN"
+)
 
 system_update_apt_locked() {
     local MODE="$1" CODE PLAN PACKAGE STATUS INPUT

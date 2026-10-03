@@ -1331,6 +1331,10 @@ system_auto_updates_enabled() {
                 system_update_auto_policy_verify >/dev/null 2>&1 || return 1
             fi
             if systemd_available; then
+                if [ "$(system_update_os_value ID 2>/dev/null)" = debian ]; then
+                    system_update_auto_units_ready >/dev/null 2>&1
+                    return $?
+                fi
                 systemctl is-enabled --quiet apt-daily.timer 2>/dev/null \
                     && systemctl is-enabled --quiet apt-daily-upgrade.timer 2>/dev/null
             fi
@@ -1363,7 +1367,8 @@ system_enable_auto_security_updates_locked() {
     case "$PM" in
         apt)
             if [ "$(system_update_os_value ID)" = debian ]; then
-                system_update_apt_preflight || return 1
+                system_update_auto_enable_apt
+                return $?
             fi
             pkg_install unattended-upgrades || { error "unattended-upgrades 安装失败"; return 1; }
             mkdir -p "$(dirname "$PERIODIC")" "$(dirname "$REBOOT_CFG")" || return 1
@@ -1375,16 +1380,6 @@ system_enable_auto_security_updates_locked() {
             printf '%s\n' \
                 '// Managed by Quench. Production reboots remain an explicit administrator action.' \
                 'Unattended-Upgrade::Automatic-Reboot "false";' > "$TMP2"
-            if [ "$(system_update_os_value ID)" = debian ]; then
-                cat >> "$TMP2" <<'EOF'
-#clear Unattended-Upgrade::Allowed-Origins;
-#clear Unattended-Upgrade::Origins-Pattern;
-Unattended-Upgrade::Origins-Pattern { "origin=Debian,codename=${distro_codename}-security,label=Debian-Security"; };
-Unattended-Upgrade::Remove-Unused-Dependencies "false";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "false";
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
-EOF
-            fi
             if ! chmod 644 "$TMP1" "$TMP2" || ! mv "$TMP1" "$PERIODIC" || ! mv "$TMP2" "$REBOOT_CFG"; then
                 rm -f "$TMP1" "$TMP2"
                 error "自动安全更新配置写入失败"
@@ -1394,9 +1389,6 @@ EOF
             if command -v apt-config >/dev/null 2>&1; then
                 apt-config dump | awk '$0=="Unattended-Upgrade::Automatic-Reboot \"false\";" {ok=1} END {exit !ok}' \
                     || { error "其他 APT 配置覆盖了禁止自动重启设置"; return 1; }
-            fi
-            if [ "$(system_update_os_value ID)" = debian ]; then
-                system_update_auto_policy_verify || return 1
             fi
             if systemd_available; then
                 systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 \

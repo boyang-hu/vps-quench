@@ -55,4 +55,25 @@ grep -q '/dists/trixie/' "$QUENCH_TEST_APT_ROOT/cloud-uris"
 grep -q '/dists/trixie-updates/' "$QUENCH_TEST_APT_ROOT/cloud-uris"
 grep -q '/dists/trixie-security/' "$QUENCH_TEST_APT_ROOT/cloud-uris"
 ! grep -Eq 'bookworm|backports|example.invalid|mirror\+file' "$QUENCH_TEST_APT_ROOT/cloud-uris"
+
+# The auto-enable preflight must use real APT merge order (parts, then apt.conf),
+# not merely grep the two files Quench writes. Nothing is written to host /etc.
+mkdir -p "$QUENCH_UPDATE_APT_DIR/apt.conf.d"
+printf '%s\n' 'APT::Periodic::Enable "0";' 'APT::Periodic::Update-Package-Lists "0";' \
+    'APT::Periodic::Unattended-Upgrade "0";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
+system_update_auto_template_safe "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
+system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-good" yes
+if system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-disabled" no; then
+    echo 'Real APT ignored the late template override' >&2; exit 1
+fi
+echo 'APT::Periodic::Enable "0";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-admin-policy"
+if system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-admin" yes; then
+    echo 'Candidate validation bypassed an administrator override' >&2; exit 1
+fi
+rm "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-admin-policy"
+echo 'Unattended-Upgrade::Automatic-Reboot "true";' > "$QUENCH_UPDATE_APT_DIR/apt.conf"
+if system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-main" yes; then
+    echo 'Candidate validation bypassed the main apt.conf' >&2; exit 1
+fi
+grep -q '"0"' "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
 echo "Real APT parsing and security-policy isolation passed on $CODE."

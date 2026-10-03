@@ -368,18 +368,230 @@ t_auto_effective() {
     QUENCH_TEST_POLICY_VARIANT="$1"
     apt-config() {
         printf '%s\n' 'APT::Periodic::Unattended-Upgrade "1";' \
+            'APT::Periodic::Update-Package-Lists "1";' \
+            'Unattended-Upgrade::Remove-Unused-Dependencies "false";' \
+            'Unattended-Upgrade::Remove-New-Unused-Dependencies "false";' \
+            'Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";' \
             'Unattended-Upgrade::Automatic-Reboot "false";' \
             'Unattended-Upgrade::Origins-Pattern:: "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";'
         case "$QUENCH_TEST_POLICY_VARIANT" in
             broad) echo 'Unattended-Upgrade::Allowed-Origins:: "Debian:stable";' ;;
             reboot) echo 'Unattended-Upgrade::Automatic-Reboot "true";' ;;
+            global_off) echo 'APT::Periodic::Enable "0";' ;;
+            refresh_off) echo 'APT::Periodic::Update-Package-Lists "0";' ;;
+            remove_kernel) echo 'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";' ;;
         esac
     }
     if [ "$1" = valid ]; then assert_ok system_update_auto_policy_verify
     else assert_fail system_update_auto_policy_verify; fi
     :
 }
-for POLICY in valid broad reboot; do run_test "Effective automatic-update policy: $POLICY" t_auto_effective "$POLICY"; done
+for POLICY in valid broad reboot global_off refresh_off remove_kernel; do run_test "Effective automatic-update policy: $POLICY" t_auto_effective "$POLICY"; done
+
+t_auto_enable() {
+    setup_update "auto_enable_$1"
+    QUENCH_TEST_AUTO_CASE="$1"
+    mkdir -p "$QUENCH_UPDATE_APT_DIR/apt.conf.d" "$QUENCH_TEST_UPDATE_CASE/units"
+    local PARTS="$QUENCH_UPDATE_APT_DIR/apt.conf.d" UNIT STATE
+    printf '%s\n' 'APT::Periodic::Enable "0";' 'APT::Periodic::Update-Package-Lists "0";' \
+        'APT::Periodic::Unattended-Upgrade "0";' 'APT::Periodic::Download-Upgradeable-Packages "0";' \
+        'APT::Periodic::AutocleanInterval "0";' > "$PARTS/99-template-no-auto-upgrades"
+    echo '// original periodic' > "$PARTS/20auto-upgrades"
+    echo '// original quench policy' > "$PARTS/52quench-unattended-upgrades"
+    for UNIT in apt-daily.service apt-daily-upgrade.service unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer; do
+        case "$UNIT" in *.service) STATE=masked ;; *) STATE=disabled ;; esac
+        [ "$1" != runtime ] || STATE=masked-runtime
+        if [ "$1" = unmasked ]; then
+            case "$UNIT" in apt-*.service) STATE=static ;; *) STATE=disabled ;; esac
+        fi
+        printf '%s\n' "$STATE" > "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.state"
+        echo inactive > "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.active"
+    done
+    case "$1" in
+        no_template) rm "$PARTS/99-template-no-auto-upgrades" ;;
+        missing_unit) echo not-found > "$QUENCH_TEST_UPDATE_CASE/units/unattended-upgrades.service.state" ;;
+        new_files|write_fail) rm "$PARTS/20auto-upgrades" "$PARTS/52quench-unattended-upgrades" ;;
+        extra_template) echo 'APT::Get::AllowUnauthenticated "true";' >> "$PARTS/99-template-no-auto-upgrades" ;;
+        linked_template)
+            mv "$PARTS/99-template-no-auto-upgrades" "$QUENCH_TEST_UPDATE_CASE/template"
+            ln -s "$QUENCH_TEST_UPDATE_CASE/template" "$PARTS/99-template-no-auto-upgrades" ;;
+        active_updater) echo active > "$QUENCH_TEST_UPDATE_CASE/units/apt-daily-upgrade.service.active" ;;
+        existing_timers)
+            for UNIT in apt-daily.timer apt-daily-upgrade.timer; do
+                echo enabled > "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.state"
+                echo active > "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.active"
+            done ;;
+    esac
+    cp -a "$PARTS" "$QUENCH_TEST_UPDATE_CASE/parts-before"
+    cp -a "$QUENCH_TEST_UPDATE_CASE/units" "$QUENCH_TEST_UPDATE_CASE/units-before"
+    systemd_available() { return 0; }
+    # Never probe the runner's real dpkg locks from this service fixture.
+    system_update_auto_workers_idle() {
+        local WORKER
+        for WORKER in apt-daily.service apt-daily-upgrade.service; do
+            [ "$(cat "$QUENCH_TEST_UPDATE_CASE/units/$WORKER.active")" = inactive ] || return 1
+        done
+    }
+    if [ "$1" = write_fail ]; then
+        eval "$(declare -f atomic_replace_file | sed '1s/atomic_replace_file/quench_test_real_replace/')"
+        atomic_replace_file() {
+            case "$2" in */52quench-unattended-upgrades) return 1 ;; esac
+            quench_test_real_replace "$@"
+        }
+    fi
+    confirm_change_preview() {
+        echo confirm >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        if [ "$QUENCH_TEST_AUTO_CASE" = cancel ]; then return 1; fi
+        if [ "$QUENCH_TEST_AUTO_CASE" = template_edit ]; then echo '// external' >> "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"; fi
+        return 0
+    }
+    system_update_auto_install_dependency() {
+        echo install >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        if [ "$QUENCH_TEST_AUTO_CASE" = missing_unit ]; then echo disabled > "$QUENCH_TEST_UPDATE_CASE/units/unattended-upgrades.service.state"; fi
+        [ "$QUENCH_TEST_AUTO_CASE" != install_fail ]
+    }
+    # Real APT precedence is covered by the Debian integration suite. Here use
+    # deterministic service/package failures without accessing host systemd/APT.
+    system_update_auto_candidate_check() {
+        mkdir -p "$1/parts"
+        system_update_auto_config_write "$1/parts/20auto-upgrades" "$1/parts/52quench-unattended-upgrades"
+        echo candidate >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        [ "$QUENCH_TEST_AUTO_CASE" != candidate_fail ]
+    }
+    apt-config() {
+        printf '%s\n' 'APT::Periodic::Enable "1";' 'APT::Periodic::Update-Package-Lists "1";' \
+            'APT::Periodic::Unattended-Upgrade "1";' 'Unattended-Upgrade::Automatic-Reboot "false";' \
+            'Unattended-Upgrade::Remove-Unused-Dependencies "false";' \
+            'Unattended-Upgrade::Remove-New-Unused-Dependencies "false";' \
+            'Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";' \
+            'Unattended-Upgrade::Origins-Pattern:: "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";'
+        if [ "$QUENCH_TEST_AUTO_CASE" = policy_fail ]; then echo 'APT::Periodic::Enable "0";'; fi
+        return 0
+    }
+    systemctl() {
+        local OP="$1" UNIT PROP STATE MODE=persistent START=no
+        shift
+        printf 'systemctl %s %s\n' "$OP" "$*" >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        if [ "$OP" = show ]; then
+            UNIT="$1"; PROP="$3"
+            case "$PROP" in
+                UnitFileState) cat "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.state" ;;
+                ActiveState) cat "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.active" ;;
+                LoadState)
+                    STATE=$(cat "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.state")
+                    case "$STATE" in masked*) echo masked ;; not-found) echo not-found; return 1 ;; *) echo loaded ;; esac ;;
+            esac
+            return 0
+        fi
+        for UNIT in "$@"; do
+            case "$UNIT" in
+                --runtime) MODE=runtime; continue ;;
+                --now) START=yes; continue ;;
+                --quiet) continue ;;
+            esac
+            STATE=$(cat "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.state")
+            case "$OP" in
+                is-enabled) [ "$STATE" = enabled ] || [ "$STATE" = enabled-runtime ] || return 1 ;;
+                is-active) [ "$(cat "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.active")" = active ] || return 1 ;;
+                stop) echo inactive > "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.active" ;;
+                mask) if [ "$MODE" = runtime ]; then echo masked-runtime; else echo masked; fi > "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.state" ;;
+                unmask)
+                    if [ "$QUENCH_TEST_AUTO_CASE" = unmask_fail ] && [ "$UNIT" = apt-daily-upgrade.service ]; then return 1; fi
+                    echo disabled > "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.state" ;;
+                disable) echo disabled > "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.state" ;;
+                enable)
+                    if [ "$MODE" = runtime ]; then echo enabled-runtime; else echo enabled; fi > "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.state"
+                    [ "$START" != yes ] || echo active > "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.active" ;;
+                start)
+                    if [ "$UNIT" = apt-daily-upgrade.timer ] && [ ! -e "$QUENCH_TEST_UPDATE_CASE/failure-fired" ]; then
+                        case "$QUENCH_TEST_AUTO_CASE" in
+                            timer_fail|existing_timers|external_edit|busy)
+                                : > "$QUENCH_TEST_UPDATE_CASE/failure-fired"
+                                if [ "$QUENCH_TEST_AUTO_CASE" = external_edit ]; then echo '// external change' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/52quench-unattended-upgrades"; fi
+                                if [ "$QUENCH_TEST_AUTO_CASE" = busy ]; then echo active > "$QUENCH_TEST_UPDATE_CASE/units/apt-daily-upgrade.service.active"; fi
+                                return 1 ;;
+                        esac
+                    fi
+                    echo active > "$QUENCH_TEST_UPDATE_CASE/units/$UNIT.active" ;;
+            esac
+        done
+        return 0
+    }
+    case "$1" in
+        success|runtime|unmasked|no_template|new_files|missing_unit)
+            assert_ok system_enable_auto_security_updates
+            assert_file_contains "$PARTS/20auto-upgrades" 'APT::Periodic::Enable "1";'
+            [ ! -e "$PARTS/99-template-no-auto-upgrades" ] || fail 'template still effective'
+            assert_ok system_update_auto_units_ready
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/audit" SUCCESS
+            ;;
+        *)
+            assert_fail system_enable_auto_security_updates
+            ! grep -q SUCCESS "$QUENCH_TEST_UPDATE_CASE/audit" || fail 'failure logged as success'
+            case "$1" in
+                template_edit) assert_file_contains "$PARTS/99-template-no-auto-upgrades" '// external' ;;
+                external_edit)
+                    assert_file_contains "$PARTS/52quench-unattended-upgrades" '// external change'
+                    assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/units/apt-daily.timer.active")" inactive ;;
+                busy)
+                    assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/units/apt-daily-upgrade.service.active")" active
+                    assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/units/apt-daily.timer.active")" inactive
+                    ! grep -q 'systemctl stop apt-daily-upgrade.service' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'killed APT'
+                    ;;
+                *) assert_ok diff -r "$PARTS" "$QUENCH_TEST_UPDATE_CASE/parts-before"
+                   assert_ok diff -r "$QUENCH_TEST_UPDATE_CASE/units" "$QUENCH_TEST_UPDATE_CASE/units-before" ;;
+            esac
+            ;;
+    esac
+    case "$1" in
+        cancel|extra_template|linked_template|active_updater|candidate_fail|template_edit)
+            ! grep -q '^install$' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'installed before approval/valid preflight'
+            ! grep -Eq '^systemctl (stop|start|enable|disable|mask|unmask)' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'mutated units before approval'
+            ;;
+    esac
+    assert_eq "$(grep -c '^unlock$' "$QUENCH_TEST_UPDATE_CASE/calls")" 1
+    :
+}
+for CASE in success runtime unmasked no_template new_files missing_unit write_fail cancel extra_template linked_template active_updater candidate_fail template_edit install_fail policy_fail unmask_fail timer_fail existing_timers external_edit busy; do
+    run_test "Automatic update enable transaction: $CASE" t_auto_enable "$CASE"
+done
+
+t_auto_dependency() {
+    setup_update "dependency_$1"
+    if [ "$1" != installed ]; then dpkg-query() { return 1; }; fi
+    case "$1" in refresh-fail|apply-fail) : > "$QUENCH_TEST_UPDATE_CASE/$1" ;; esac
+    case "$1" in
+        refresh-fail|apply-fail) assert_fail system_update_auto_install_dependency ;;
+        *) assert_ok system_update_auto_install_dependency ;;
+    esac
+    case "$1" in
+        installed) [ ! -s "$QUENCH_TEST_UPDATE_CASE/calls" ] || fail 'reinstalled an installed dependency' ;;
+        refresh-fail) ! grep -q ' install ' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'installed with stale indexes' ;;
+        *) assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" '--no-remove install -y unattended-upgrades' ;;
+    esac
+    :
+}
+for CASE in installed new refresh-fail apply-fail; do run_test "Automatic update dependency: $CASE" t_auto_dependency "$CASE"; done
+
+t_auto_units_verify() {
+    setup_update "auto_units_$1"
+    QUENCH_TEST_UNIT_MODE="$1"
+    systemctl() {
+        case "$1" in
+            show)
+                [ "$QUENCH_TEST_UNIT_MODE" != query_fail ] || return 1
+                if [ "$QUENCH_TEST_UNIT_MODE" = masked ] && [ "$2" = apt-daily-upgrade.service ]; then echo masked
+                else echo loaded; fi ;;
+            is-enabled) [ "$QUENCH_TEST_UNIT_MODE" != disabled ] ;;
+            is-active) [ "$QUENCH_TEST_UNIT_MODE" != inactive ] ;;
+            *) fail 'readiness check mutated unit state' ;;
+        esac
+    }
+    if [ "$1" = valid ]; then assert_ok system_update_auto_units_ready
+    else assert_fail system_update_auto_units_ready; fi
+    :
+}
+for CASE in valid masked disabled inactive query_fail; do run_test "Automatic update scheduler readiness: $CASE" t_auto_units_verify "$CASE"; done
 
 t_major_cleanup() {
     setup_update "cleanup_$1"
