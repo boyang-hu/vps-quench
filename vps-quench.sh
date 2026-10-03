@@ -15472,25 +15472,78 @@ system_update_debian_code() {
 # Conservative parser: reject unknown formats rather than silently miss a source.
 # Python is used only by this advanced module, not by startup or the UI.
 # major prints the single source file it can atomically replace; stage writes a
-# candidate outside /etc. No global search/replace across third-party sources.
+# candidate outside /etc. Only active source fields are changed, never comments,
+# disabled stanzas or third-party sources. Live writes belong to the transaction.
 system_update_sources() {
     local MODE="$1" CODE="$2" DEST="${3:-}"
     command -v python3 >/dev/null 2>&1 || { error "需要 python3 解析软件源；请先从常用软件管理安装"; return 1; }
     python3 - "$QUENCH_UPDATE_APT_DIR" "$MODE" "$CODE" "$DEST" <<'PY'
 import pathlib, re, shlex, sys
 root, mode, code, dest = pathlib.Path(sys.argv[1]), *sys.argv[2:]
+
+def official_archive(uri):
+    if re.fullmatch(r'https?://deb\.debian\.org/debian/?', uri):
+        return 'debian'
+    if re.fullmatch(r'https?://(security|deb)\.debian\.org/debian-security/?', uri):
+        return 'debian-security'
+    return None
+
+def resolve_mirror(uri):
+    if official_archive(uri):
+        return uri
+    match = re.fullmatch(r'mirror\+file:/{1,3}(etc/apt/mirrors/[A-Za-z0-9_.-]+)', uri)
+    if not match:
+        raise ValueError('无法自动迁移源地址 ' + uri + '；请核对其 Debian 13 支持，或改用 deb.debian.org 官方直接地址')
+    # Map the standard /etc/apt prefix through root so fixtures never read /etc.
+    path = root / match[1][len('etc/apt/'):]
+    if path.name in ('.', '..') or path.parent.is_symlink() or path.is_symlink() or not path.is_file():
+        raise ValueError('镜像列表必须是 /etc/apt/mirrors/ 下可读取的普通文件：' + str(path))
+    archives = set()
+    for line in path.read_text().splitlines():
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        # Metadata can restrict suite/architecture selection. Do not discard it
+        # silently while converting a list to one direct URL.
+        items = line.split()
+        archive = official_archive(items[0])
+        if not archive or len(items) != 1:
+            raise ValueError('镜像列表含非官方地址或选择条件，需人工核对：' + str(path) + '：' + line)
+        archives.add(archive)
+    if len(archives) != 1:
+        raise ValueError('镜像列表为空或混合了主仓库与安全仓库：' + str(path))
+    return 'https://deb.debian.org/' + archives.pop()
+
+def replace_field(block, name, value):
+    lines, active, found = [], False, False
+    for line in block.splitlines(keepends=True):
+        if re.match(r'^' + re.escape(name) + r':', line, re.I):
+            lines.append(name + ': ' + value + ('\n' if line.endswith('\n') else ''))
+            active, found = True, True
+        elif line.lstrip().startswith('#') or not line.strip():
+            lines.append(line)
+        elif line[:1].isspace() and active:
+            continue
+        else:
+            active = False
+            lines.append(line)
+    if not found:
+        return name + ': ' + value + '\n' + block
+    return ''.join(lines)
+
 try:
+    if mode not in ('check', 'major', 'stage') or (mode == 'stage' and code != 'bookworm'):
+        raise ValueError('不支持的源检查/迁移模式')
     paths = [root / 'sources.list'] + sorted((root / 'sources.list.d').glob('*.list')) + sorted((root / 'sources.list.d').glob('*.sources'))
-    records, originals = [], {}
+    records, chunks = [], {}
     for path in paths:
         if not path.exists():
             continue
         if not path.is_file() or path.is_symlink():
             raise ValueError('源文件必须是普通文件：' + str(path))
         text = path.read_text()
-        originals[path] = text
         if path.suffix == '.sources':
-            for paragraph in re.split(r'\n\s*\n', text):
+            chunks[path] = re.split(r'(\n[ \t]*\n)', text)
+            for index, paragraph in enumerate(chunks[path]):
                 fields, key = {}, None
                 for line in paragraph.splitlines():
                     if not line.strip() or line.lstrip().startswith('#'):
@@ -15514,9 +15567,10 @@ try:
                 for unsafe in ('trusted', 'allow-insecure', 'allow-weak', 'allow-downgrade-to-insecure'):
                     if fields.get(unsafe, 'no').lower() not in ('no', 'false', '0'):
                         raise ValueError('拒绝绕过仓库签名验证：' + str(path))
-                records.append((path, fields['uris'].split(), fields['suites'].split(), fields.get('components', '').split(), 'deb' in fields['types'].split()))
+                records.append((path, index, fields['uris'].split(), fields['suites'].split(), fields.get('components', '').split(), 'deb' in fields['types'].split()))
         else:
-            for line in text.splitlines():
+            chunks[path] = text.splitlines(keepends=True)
+            for index, line in enumerate(chunks[path]):
                 tokens = shlex.split(line, comments=True)
                 if not tokens:
                     continue
@@ -15536,22 +15590,31 @@ try:
                         raise ValueError('拒绝绕过仓库签名验证：' + str(path))
                 if len(tokens) < 2:
                     raise ValueError('不完整的源条目：' + str(path))
-                records.append((path, [tokens[0]], [tokens[1]], tokens[2:], binary))
+                records.append((path, index, [tokens[0]], [tokens[1]], tokens[2:], binary))
     if not records:
         raise ValueError('没有启用的软件源')
     base = security = False
-    for path, uris, suites, components, binary in records:
+    for path, index, uris, suites, components, binary in records:
+        try:
+            resolved = [resolve_mirror(uri) for uri in uris] if mode in ('major', 'stage') else uris
+        except ValueError as exc:
+            raise ValueError(str(exc) + '（源文件：' + str(path) + '）') from exc
         for suite in suites:
             if re.match(r'^(stable|oldstable|oldoldstable|testing|unstable|sid)(-|$)', suite):
                 raise ValueError('拒绝浮动发行版 ' + suite + '；请使用明确代号：' + str(path))
             if re.match(r'^(bullseye|bookworm|trixie|forky)(-|$)', suite) and suite not in (code, code+'-updates', code+'-security', code+'-backports'):
                 raise ValueError('检测到混合或不支持的发行版 ' + suite + '：' + str(path))
-            official = all(re.match(r'^https?://(deb\.debian\.org/debian|security\.debian\.org/debian-security|deb\.debian\.org/debian-security)/?$', uri) for uri in uris)
             if any(re.search(r'/debian(-security)?/?$', uri) for uri in uris) and suite not in (code, code+'-updates', code+'-security', code+'-backports'):
                 raise ValueError('Debian 仓库代号不属于当前发行版：' + str(path))
             if mode in ('major', 'stage'):
-                if not official or suite not in (code, code+'-updates', code+'-security') or 'main' not in components:
-                    raise ValueError('大版本向导只接管官方标准源；第三方源/backports/自定义源需先人工处理：' + str(path))
+                allowed = (code, code+'-updates', code+'-security') + ((code+'-backports',) if code == 'bookworm' else ())
+                if suite not in allowed:
+                    raise ValueError('无法自动迁移 Suites: ' + suite + '：' + str(path))
+                if 'main' not in components:
+                    raise ValueError('官方源 Components 缺少 main：' + str(path))
+                expected = 'debian-security' if suite == code+'-security' else 'debian'
+                if any(official_archive(uri) != expected for uri in resolved):
+                    raise ValueError('源地址与 Suites 不匹配：' + suite + '：' + str(path))
             elif suite not in (code, code+'-updates', code+'-security', code+'-backports'):
                 # Vendor suites such as Caddy any-version are allowed, never rewritten.
                 print('提示：保留第三方源 ' + str(path) + ' (' + suite + ')', file=sys.stderr)
@@ -15559,19 +15622,41 @@ try:
                 base = True
             if binary and 'main' in components and suite == code+'-security':
                 security = True
+        if mode == 'major' and code == 'bookworm':
+            for old, new in zip(uris, resolved):
+                if old != new:
+                    print('升级计划：镜像列表 ' + old + ' → ' + new, file=sys.stderr)
+            if 'bookworm-backports' in suites:
+                print('升级计划：停用 bookworm-backports，不启用 trixie-backports（已安装包另行检查）', file=sys.stderr)
+        if mode == 'stage':
+            block = chunks[path][index]
+            target_suites = [s.replace('bookworm', 'trixie', 1) for s in suites if s != 'bookworm-backports']
+            if path.suffix == '.sources':
+                if target_suites:
+                    block = replace_field(block, 'Suites', ' '.join(target_suites))
+                    if resolved != uris:
+                        block = replace_field(block, 'URIs', ' '.join(resolved))
+                else:
+                    block = replace_field(block, 'Enabled', 'no')
+            elif not target_suites:
+                block = '# quench: disabled bookworm-backports for release upgrade\n# ' + block
+            else:
+                line = re.fullmatch(r'(\s*deb(?:-src)?\s+(?:\[[^\]]*\]\s+)?)(\S+)(\s+)(\S+)([^\n]*)(\n?)', block)
+                if not line or line[2] != uris[0] or line[4] != suites[0]:
+                    raise ValueError('无法无损修改 list 源条目：' + str(path))
+                block = line[1] + resolved[0] + line[3] + target_suites[0] + line[5] + line[6]
+            chunks[path][index] = block
     if not base or not security:
         raise ValueError('缺少当前发行版的 main 或 security 源')
     if mode in ('major', 'stage'):
         active = set(r[0] for r in records)
         if len(active) != 1:
-            raise ValueError('大版本向导要求启用的 Debian 源集中在一个文件，避免非原子地切换多个文件')
+            raise ValueError('大版本向导要求启用的 Debian 源集中在一个文件，避免非原子地切换多个文件；请先合并：' + ', '.join(str(p) for p in sorted(active)))
         path = active.pop()
         if mode == 'major':
             print(path)
         else:
-            # Only whitespace-delimited suite tokens; never URI substrings.
-            candidate = re.sub(r'(?<!\S)bookworm(-updates|-security)?(?!\S)', lambda m: 'trixie' + (m[1] or ''), originals[path])
-            pathlib.Path(dest).write_text(candidate)
+            pathlib.Path(dest).write_text(''.join(chunks[path]))
 except (OSError, ValueError) as exc:
     print('软件源预检失败：' + str(exc), file=sys.stderr)
     sys.exit(1)
@@ -15903,10 +15988,76 @@ system_update_auto_menu() {
     esac
 }
 
-# Deliberately narrow first implementation. Complex hosts stay on the official
-# manual path instead of being force-converted by a blind suite replacement.
+# Removing a backports source must not hide installed backports packages. Keep
+# them on the manual path; never silently downgrade or uninstall them.
+system_update_backports_guard() {
+    local PACKAGES BACKPORTS
+    PACKAGES=$(dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\t${Version}\n') || {
+        error "无法读取已安装软件包，不能确认 backports 使用情况"; return 1;
+    }
+    BACKPORTS=$(printf '%s\n' "$PACKAGES" | awk '$1 == "ii" && $3 ~ /~bpo12/ {print $2 " " $3}') || return 1
+    if [ -n "$BACKPORTS" ]; then
+        error "已安装 Debian 12 backports 软件包，需先核对其 Debian 13 迁移路径："
+        printf '%s\n' "$BACKPORTS"
+        info "不会自动卸载或降级这些包；仅启用 backports 源且没有安装相关包时，向导可自动停用该源"
+        return 1
+    fi
+}
+
+# APT's !origin(Debian) also lists old official kernels removed from the index.
+# This is classification using installed metadata, not proof of provenance.
+# Only recognize an older, non-running Debian 12 kernel of the same flavour;
+# leave it installed as a fallback. Never exempt arbitrary linux-* packages.
+system_update_retired_kernel() {
+    local PACKAGE="$1" RUNNING="$2" FLAVOUR META STATUS SOURCE VERSION MAINTAINER CURRENT_VERSION ITEM
+    [[ "$RUNNING" =~ ^6\.1\.0-[0-9]+-(cloud-)?(amd64|arm64)$ ]] || return 1
+    [ "$PACKAGE" != "linux-image-$RUNNING" ] || return 1
+    FLAVOUR=${RUNNING#6.1.0-}; FLAVOUR=${FLAVOUR#*-}
+    [[ "$PACKAGE" =~ ^linux-image-6\.1\.0-[0-9]+-${FLAVOUR}$ ]] || return 1
+    for ITEM in "linux-image-$RUNNING" "$PACKAGE"; do
+        META=$(dpkg-query -W -f='${Status}\t${source:Package}\t${Version}\t${Maintainer}\n' "$ITEM") || return 1
+        IFS=$'\t' read -r STATUS SOURCE VERSION MAINTAINER <<< "$META"
+        [ "$STATUS" = 'install ok installed' ] || return 1
+        case "$SOURCE" in linux|"linux-signed-${FLAVOUR##*-}") : ;; *) return 1 ;; esac
+        [ "$MAINTAINER" = 'Debian Kernel Team <debian-kernel@lists.debian.org>' ] || return 1
+        [[ "$VERSION" =~ ^6\.1\.[0-9]+(-[0-9]+(\+deb12u[0-9]+)?|\+[0-9]+)$ ]] || return 1
+        if [ "$ITEM" = "linux-image-$RUNNING" ]; then CURRENT_VERSION="$VERSION"; fi
+    done
+    dpkg --compare-versions "$VERSION" lt "$CURRENT_VERSION"
+}
+
+system_update_foreign_guard() {
+    local FOREIGN RUNNING LINE PACKAGE BLOCKED=0 RETIRED=""
+    FOREIGN=$(LC_ALL=C apt list '?narrow(?installed,?not(?origin(Debian)))' 2>/dev/null) || {
+        error "无法检查软件包来源；请先运行 apt-cache policy 和 dpkg --audit 排查"; return 1;
+    }
+    RUNNING=$(uname -r) || return 1
+    while IFS= read -r LINE; do
+        [[ "$LINE" =~ ^[^\ /]+/ ]] || continue
+        PACKAGE=${LINE%%/*}
+        if system_update_retired_kernel "$PACKAGE" "$RUNNING"; then
+            RETIRED="${RETIRED}${LINE}"$'\n'
+        else
+            if [ "$BLOCKED" -eq 0 ]; then
+                error "以下已安装包在当前 Debian 仓库中无法确认来源（不一定是第三方包）："
+            fi
+            printf '  %s\n' "$LINE"
+            printf '  排查：apt-cache policy %s\n' "$PACKAGE"
+            BLOCKED=1
+        fi
+    done <<< "$FOREIGN"
+    if [ -n "$RETIRED" ]; then
+        warn "识别到较旧的备用内核（依据包元数据），保留它们并继续预检："
+        printf '%s' "$RETIRED"
+        info "当前运行 ${RUNNING}；不会自动清理内核，请等 Debian 13 新内核启动正常后再处理"
+    fi
+    [ "$BLOCKED" -eq 0 ]
+}
+
+# Complex hosts stay on the official manual path. Common cloud-image source
+# formats are normalized only in the reviewed candidate, not during preflight.
 system_update_major_preflight() {
-    local ARCH HELD FOREIGN PREF FREE PATH_CHECK STATUS META PACKAGE
+    local ARCH HELD PREF FREE PATH_CHECK STATUS META PACKAGE
     [ "$(system_update_debian_code)" = bookworm ] || { error "此向导只支持 Debian 12 → 13；13 的日常更新请选择 2"; return 1; }
     system_update_session_ready || return 1
     system_update_apt_preflight || return 1
@@ -15944,10 +16095,8 @@ system_update_major_preflight() {
     done
     system_update_logged env LC_ALL=C apt-get -o APT::Update::Error-Mode=any update || return 1
     system_update_apt_origins_guard bookworm || return 1
-    FOREIGN=$(LC_ALL=C apt list '?narrow(?installed,?not(?origin(Debian)))' 2>/dev/null) || return 1
-    if printf '%s\n' "$FOREIGN" | grep -qE '^[^ /]+/'; then
-        error "发现非 Debian 或仓库已不可追溯的软件包，需先人工处理：$FOREIGN"; return 1
-    fi
+    system_update_backports_guard || return 1
+    system_update_foreign_guard || return 1
     LC_ALL=C apt-get -s dist-upgrade > "$QUENCH_UPDATE_RUN/bookworm-plan.txt" 2>&1 || return 1
     if grep -Eq '^(Inst|Remv) ' "$QUENCH_UPDATE_RUN/bookworm-plan.txt"; then
         cat "$QUENCH_UPDATE_RUN/bookworm-plan.txt"
@@ -16019,16 +16168,24 @@ system_update_debian_major() (
     trap 'txn_write_end' EXIT
     system_update_run_prepare || return 1
     system_update_major_preflight || return 1
-    local ANSWER TIMER
+    local ANSWER TIMER DIFF_RC=0
+    # Freeze the exact candidate before asking. A changed live source must not
+    # be silently re-staged after the user approved a different plan.
+    cp -p "$QUENCH_UPDATE_MAJOR_SOURCE" "$QUENCH_UPDATE_RUN/source-before" || return 1
+    system_update_sources stage bookworm "$QUENCH_UPDATE_RUN/source-new" || return 1
+    cmp -s "$QUENCH_UPDATE_MAJOR_SOURCE" "$QUENCH_UPDATE_RUN/source-before" || { error "生成计划期间源文件发生变化，请重新运行向导"; return 1; }
+    info "软件源变更预览（确认后才应用；镜像列表原文件不改动）："
+    diff -u "$QUENCH_UPDATE_RUN/source-before" "$QUENCH_UPDATE_RUN/source-new" || DIFF_RC=$?
+    [ "$DIFF_RC" -le 1 ] || { error "无法展示源变更，已停止"; return 1; }
     confirm_change_preview "升级前必须由你确认" \
         "已创建可恢复的供应商磁盘快照及独立业务数据备份，控制台/救援系统确实可用" \
         "已核对 1Panel、Docker、数据库、代理及网站对 Debian 13 的兼容性" \
-        "已有维护窗口；软件包配置问题需要人工选择，Quench 不自动重启" || return 0
+        "同意以上源变更；已有维护窗口，配置冲突由你选择，Quench 不自动重启" || return 0
     read -rp "输入 UPGRADE 12 TO 13 确认开始（其他输入取消）: " ANSWER || return 0
     [ "$ANSWER" = 'UPGRADE 12 TO 13' ] || { info "已取消"; return 0; }
+    cmp -s "$QUENCH_UPDATE_MAJOR_SOURCE" "$QUENCH_UPDATE_RUN/source-before" || { error "源文件在确认期间发生变化，请重新运行向导"; return 1; }
+    system_update_backports_guard || return 1
     system_update_backup || return 1
-    cp -p "$QUENCH_UPDATE_MAJOR_SOURCE" "$QUENCH_UPDATE_RUN/source-before" || return 1
-    system_update_sources stage bookworm "$QUENCH_UPDATE_RUN/source-new" || return 1
     QUENCH_UPDATE_MAJOR_PHASE=prepared
     QUENCH_UPDATE_MAJOR_TIMERS=""
     QUENCH_UPDATE_MAJOR_STAGE=""

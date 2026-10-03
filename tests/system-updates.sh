@@ -111,6 +111,160 @@ t_major_source() {
 }
 run_test 'Major source staging does not change live files and refuses third-party takeover' t_major_source
 
+# Reproduce common Debian cloud images, including a mixed-suite deb822 stanza.
+setup_cloud_source() {
+    mkdir -p "$QUENCH_UPDATE_APT_DIR/mirrors"
+    printf '# Debian mirrors\nhttps://deb.debian.org/debian\nhttp://deb.debian.org/debian/\n' > "$QUENCH_UPDATE_APT_DIR/mirrors/debian.list"
+    echo 'https://security.debian.org/debian-security' > "$QUENCH_UPDATE_APT_DIR/mirrors/debian-security.list"
+    : > "$QUENCH_UPDATE_APT_DIR/sources.list"
+    printf '%s\n' '# bookworm stays in this comment' 'Types: deb deb-src' \
+        'URIs: mirror+file:///etc/apt/mirrors/debian.list' 'Suites: bookworm' ' bookworm-updates bookworm-backports' \
+        'Components: main contrib non-free-firmware' 'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' '' \
+        'Types: deb deb-src' 'URIs: mirror+file:/etc/apt/mirrors/debian-security.list' \
+        'Suites: bookworm-security' 'Components: main' '' \
+        'Enabled: no' 'Types: deb' 'URIs: https://example.org/debian' 'Suites: bookworm' 'Components: main' \
+        > "$QUENCH_UPDATE_APT_DIR/sources.list.d/debian.sources"
+}
+
+t_cloud_source() {
+    setup_update "cloud_$1"
+    setup_cloud_source
+    local SOURCE="$QUENCH_UPDATE_APT_DIR/sources.list.d/debian.sources"
+    case "$1" in
+        direct_backports) sed 's|mirror+file:///etc/apt/mirrors/debian.list|https://deb.debian.org/debian|' "$SOURCE" > "$QUENCH_TEST_UPDATE_CASE/new"; cp "$QUENCH_TEST_UPDATE_CASE/new" "$SOURCE" ;;
+        separate_stanza)
+            printf '\nTypes: deb deb-src\nEnabled: yes\nURIs: https://deb.debian.org/debian\nSuites: bookworm-backports\nComponents: main\n' >> "$SOURCE" ;;
+        list)
+            : > "$SOURCE"
+            SOURCE="$QUENCH_UPDATE_APT_DIR/sources.list"
+            printf '%s\n' '# bookworm stays in this comment' \
+                'deb [arch=amd64 signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] mirror+file:///etc/apt/mirrors/debian.list bookworm main contrib non-free-firmware # bookworm comment' \
+                'deb-src mirror+file:/etc/apt/mirrors/debian.list bookworm-updates main' \
+                'deb https://deb.debian.org/debian bookworm-backports main' \
+                'deb-src https://deb.debian.org/debian bookworm-backports main' \
+                'deb mirror+file:///etc/apt/mirrors/debian-security.list bookworm-security main' > "$SOURCE" ;;
+    esac
+    cp "$SOURCE" "$QUENCH_TEST_UPDATE_CASE/before"
+    assert_ok system_update_sources check bookworm
+    assert_eq "$(system_update_sources major bookworm)" "$SOURCE"
+    assert_ok system_update_sources stage bookworm "$QUENCH_TEST_UPDATE_CASE/candidate"
+    assert_ok cmp "$SOURCE" "$QUENCH_TEST_UPDATE_CASE/before"
+    assert_file_contains "$QUENCH_TEST_UPDATE_CASE/candidate" '# bookworm stays in this comment'
+    assert_file_contains "$QUENCH_TEST_UPDATE_CASE/candidate" 'trixie-updates'
+    assert_file_contains "$QUENCH_TEST_UPDATE_CASE/candidate" 'https://deb.debian.org/debian-security'
+    assert_file_contains "$QUENCH_TEST_UPDATE_CASE/candidate" 'contrib non-free-firmware'
+    assert_file_contains "$QUENCH_TEST_UPDATE_CASE/candidate" '/usr/share/keyrings/debian-archive-keyring.gpg'
+    if [ "$1" = list ]; then
+        assert_file_contains "$QUENCH_TEST_UPDATE_CASE/candidate" 'arch=amd64'
+        assert_file_contains "$QUENCH_TEST_UPDATE_CASE/candidate" '# bookworm comment'
+    else
+        assert_file_contains "$QUENCH_TEST_UPDATE_CASE/candidate" 'Types: deb deb-src'
+        assert_file_contains "$QUENCH_TEST_UPDATE_CASE/candidate" 'URIs: https://example.org/debian'
+        assert_file_contains "$QUENCH_TEST_UPDATE_CASE/candidate" 'Suites: bookworm'
+    fi
+    cp "$QUENCH_TEST_UPDATE_CASE/candidate" "$SOURCE"
+    # Disabled backports and third-party stanzas must stay disabled and unchanged.
+    assert_ok system_update_sources major trixie
+    :
+}
+for FORM in deb822 direct_backports separate_stanza list; do
+    run_test "Cloud sources stage mirror lists/backports without touching live files: $FORM" t_cloud_source "$FORM"
+done
+
+t_bad_mirror() {
+    setup_update "mirror_$1"
+    setup_cloud_source
+    case "$1" in
+        empty) : > "$QUENCH_UPDATE_APT_DIR/mirrors/debian.list" ;;
+        missing) rm "$QUENCH_UPDATE_APT_DIR/mirrors/debian.list" ;;
+        symlink)
+            mv "$QUENCH_UPDATE_APT_DIR/mirrors/debian.list" "$QUENCH_TEST_UPDATE_CASE/mirror"
+            ln -s "$QUENCH_TEST_UPDATE_CASE/mirror" "$QUENCH_UPDATE_APT_DIR/mirrors/debian.list" ;;
+        parent_symlink)
+            mv "$QUENCH_UPDATE_APT_DIR/mirrors" "$QUENCH_TEST_UPDATE_CASE/mirrors"
+            ln -s "$QUENCH_TEST_UPDATE_CASE/mirrors" "$QUENCH_UPDATE_APT_DIR/mirrors" ;;
+        third_party) echo 'https://example.org/debian' >> "$QUENCH_UPDATE_APT_DIR/mirrors/debian.list" ;;
+        mixed_archive) echo 'https://deb.debian.org/debian-security' >> "$QUENCH_UPDATE_APT_DIR/mirrors/debian.list" ;;
+        wrong_archive) echo 'https://deb.debian.org/debian-security' > "$QUENCH_UPDATE_APT_DIR/mirrors/debian.list" ;;
+        metadata) printf 'https://deb.debian.org/debian\tsuite:bookworm\n' > "$QUENCH_UPDATE_APT_DIR/mirrors/debian.list" ;;
+        remote|outside)
+            local URI='mirror+https://example.org/mirrors'
+            [ "$1" != outside ] || URI='mirror+file:///tmp/mirrors.list'
+            printf '\nTypes: deb\nURIs: %s\nSuites: bookworm\nComponents: main\n' "$URI" >> "$QUENCH_UPDATE_APT_DIR/sources.list.d/debian.sources" ;;
+    esac
+    assert_fail system_update_sources major bookworm
+    assert_fail system_update_sources stage bookworm "$QUENCH_TEST_UPDATE_CASE/candidate"
+    [ ! -e "$QUENCH_TEST_UPDATE_CASE/candidate" ] || fail 'wrote an unsafe candidate'
+    :
+}
+for BAD in empty missing symlink parent_symlink third_party mixed_archive wrong_archive metadata remote outside; do
+    run_test "Unrecognized mirror lists fail before staging: $BAD" t_bad_mirror "$BAD"
+done
+
+t_backports_packages() {
+    setup_update "backports_packages_$1"
+    QUENCH_TEST_BACKPORTS="$1"
+    dpkg-query() {
+        case "$QUENCH_TEST_BACKPORTS" in
+            installed) printf 'ii \tlinux-image-6.12.1-cloud-amd64\t6.12.1-1~bpo12+1\n' ;;
+            removed) printf 'rc \told-package\t1.0~bpo12+1\n' ;;
+            plain) printf 'ii \tcurl\t7.88.1-10+deb12u1\n' ;;
+            failed) return 2 ;;
+        esac
+    }
+    case "$1" in
+        installed|failed) assert_fail system_update_backports_guard ;;
+        *) assert_ok system_update_backports_guard ;;
+    esac
+    :
+}
+for CASE in installed removed plain failed; do run_test "Backports package guard: $CASE" t_backports_packages "$CASE"; done
+
+t_retired_kernel() {
+    setup_update "retired_$1"
+    QUENCH_TEST_KERNEL_CASE="$1"
+    uname() { echo 6.1.0-53-cloud-amd64; }
+    apt() {
+        case "$QUENCH_TEST_KERNEL_CASE" in
+            current) echo 'linux-image-6.1.0-53-cloud-amd64/now 6.1.200-1 amd64 [installed,local]' ;;
+            newer) echo 'linux-image-6.1.0-54-cloud-amd64/now 6.1.201-1 amd64 [installed,local]' ;;
+            meta) echo 'linux-image-cloud-amd64/now 6.1.170-1 amd64 [installed,local]' ;;
+            custom_name) echo 'linux-image-6.1.0-custom/now 6.1.170-1 amd64 [installed,local]' ;;
+            apt_fail) return 100 ;;
+            *) echo 'linux-image-6.1.0-45-cloud-amd64/now 6.1.170-1 amd64 [installed,local]' ;;
+        esac
+        if [ "$QUENCH_TEST_KERNEL_CASE" = mixed ]; then echo 'vendor/now 1.0 amd64 [installed,local]'; fi
+        if [ "$QUENCH_TEST_KERNEL_CASE" = missing_current ]; then echo 'linux-image-6.1.0-53-cloud-amd64/now 6.1.200-1 amd64 [installed,local]'; fi
+        return 0
+    }
+    dpkg-query() {
+        local VERSION=6.1.170-1 SOURCE=linux MAINTAINER='Debian Kernel Team <debian-kernel@lists.debian.org>' STATUS='install ok installed'
+        case "$*" in *linux-image-6.1.0-53-cloud-amd64) VERSION=6.1.200-1 ;; *linux-image-6.1.0-54-cloud-amd64) VERSION=6.1.201-1 ;; esac
+        case "$QUENCH_TEST_KERNEL_CASE" in
+            vendor) MAINTAINER='Vendor' ;;
+            custom_source) SOURCE=custom-linux ;;
+            custom_version) VERSION=6.1.170-1+custom ;;
+            removed) STATUS='deinstall ok config-files' ;;
+            query_fail) return 1 ;;
+        esac
+        printf '%s\t%s\t%s\t%s\n' "$STATUS" "$SOURCE" "$VERSION" "$MAINTAINER"
+    }
+    dpkg() {
+        [ "$QUENCH_TEST_KERNEL_CASE" != compare_fail ] || return 2
+        [ "$*" = '--compare-versions 6.1.170-1 lt 6.1.200-1' ]
+    }
+    if [ "$1" = old ]; then
+        assert_ok system_update_foreign_guard
+    else
+        assert_fail system_update_foreign_guard
+    fi
+    [ ! -s "$QUENCH_TEST_UPDATE_CASE/calls" ] || fail 'kernel classification changed packages'
+    :
+}
+for CASE in old current newer meta custom_name vendor custom_source custom_version removed query_fail compare_fail apt_fail mixed missing_current; do
+    run_test "Unindexed kernel classification preserves fallback without blanket exemptions: $CASE" t_retired_kernel "$CASE"
+done
+
 t_apt_layout() {
     setup_update layout
     assert_ok system_update_apt_layout_guard
@@ -266,17 +420,20 @@ run_test 'Major source recovery preserves concurrent external changes' t_major_e
 t_major_flow() {
     setup_update "flow_$1"
     QUENCH_TEST_MAJOR_MODE="$1"
-    system_update_major_preflight() { QUENCH_UPDATE_MAJOR_SOURCE="$QUENCH_UPDATE_APT_DIR/sources.list"; }
+    if [ "$1" = cloud_restore ]; then setup_cloud_source; fi
+    system_update_major_preflight() { QUENCH_UPDATE_MAJOR_SOURCE=$(system_update_sources major bookworm); }
     systemctl() { [ "$1" != is-active ]; }
     system_update_apt_origins_guard() { :; }
     confirm_change_preview() {
         if [ "$QUENCH_TEST_MAJOR_MODE" = cancel_after_source ] && [[ "$1" == *trixie* ]]; then return 1; fi
+        if [ "$QUENCH_TEST_MAJOR_MODE" = cancel_before_source ]; then return 1; fi
+        if [ "$QUENCH_TEST_MAJOR_MODE" = source_edited ]; then echo '# external edit' >> "$QUENCH_UPDATE_APT_DIR/sources.list"; fi
         return 0
     }
     apt-get() {
         printf 'apt-get %s\n' "$*" >> "$QUENCH_TEST_UPDATE_CASE/calls"
         if [[ " $* " == *' update '* ]]; then
-            [ "$QUENCH_TEST_MAJOR_MODE" != refresh_fail ]; return $?
+            [ "$QUENCH_TEST_MAJOR_MODE" != refresh_fail ] && [ "$QUENCH_TEST_MAJOR_MODE" != cloud_restore ]; return $?
         fi
         if [[ " $* " == *' -s '* ]]; then return 0; fi
         if [ "$QUENCH_TEST_MAJOR_MODE" = install_fail ]; then return 100; fi
@@ -284,15 +441,20 @@ t_major_flow() {
             printf '%s\n' ID=debian VERSION_ID=13 VERSION_CODENAME=trixie > "$QUENCH_UPDATE_OS_FILE"
         fi
     }
-    if [ "$1" = refresh_fail ] || [ "$1" = install_fail ]; then
+    if [ "$1" = refresh_fail ] || [ "$1" = install_fail ] || [ "$1" = cloud_restore ] || [ "$1" = source_edited ]; then
         assert_fail system_update_debian_major <<< 'UPGRADE 12 TO 13'
     else
         assert_ok system_update_debian_major <<< 'UPGRADE 12 TO 13'
     fi
     case "$1" in
-        refresh_fail|cancel_after_source)
+        refresh_fail|cancel_after_source|cancel_before_source|source_edited)
             assert_file_contains "$QUENCH_UPDATE_APT_DIR/sources.list" bookworm
             ! grep -q 'Lock::Timeout' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'installed after cancellation/failure before package phase'
+            ;;
+        cloud_restore)
+            assert_file_contains "$QUENCH_UPDATE_APT_DIR/sources.list.d/debian.sources" 'URIs: mirror+file:///etc/apt/mirrors/debian.list'
+            assert_file_contains "$QUENCH_UPDATE_APT_DIR/sources.list.d/debian.sources" 'bookworm-updates bookworm-backports'
+            assert_ok cmp "$QUENCH_UPDATE_APT_DIR/sources.list.d/debian.sources" "$(find "$QUENCH_UPDATE_STATE_DIR" -name source-before)"
             ;;
         install_fail) assert_file_contains "$QUENCH_UPDATE_APT_DIR/sources.list" trixie ;;
         success)
@@ -304,7 +466,7 @@ t_major_flow() {
     assert_eq "$(tail -1 "$QUENCH_TEST_UPDATE_CASE/calls")" unlock
     :
 }
-for PHASE in refresh_fail cancel_after_source install_fail success; do run_test "Major orchestration and EXIT recovery: $PHASE" t_major_flow "$PHASE"; done
+for PHASE in refresh_fail cancel_after_source cancel_before_source source_edited cloud_restore install_fail success; do run_test "Major orchestration and EXIT recovery: $PHASE" t_major_flow "$PHASE"; done
 
 t_disable() {
     setup_update disable
@@ -355,7 +517,7 @@ t_major_preflight() {
         active_updater) systemctl() { return 0; } ;;
         already_13) printf '%s\n' ID=debian VERSION_ID=13 VERSION_CODENAME=trixie > "$QUENCH_UPDATE_OS_FILE" ;;
     esac
-    if [ "$1" = valid ]; then assert_ok system_update_major_preflight
+    if [ "$1" = valid ] || [ "$1" = backports ]; then assert_ok system_update_major_preflight
     else assert_fail system_update_major_preflight; fi
     :
 }

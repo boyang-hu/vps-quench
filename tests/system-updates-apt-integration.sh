@@ -34,4 +34,25 @@ apt-get -o Dir::Etc::sourcelist="$QUENCH_TEST_APT_ROOT/trixie.sources" -o Dir::E
 grep -q '/dists/trixie/' "$QUENCH_TEST_APT_ROOT/uris"
 grep -q '/dists/trixie-security/' "$QUENCH_TEST_APT_ROOT/uris"
 ! grep -q bookworm "$QUENCH_TEST_APT_ROOT/uris"
+
+# Cloud-image mirror+file references and mixed backports suites must produce a
+# candidate that real APT interprets exactly as the reviewed source plan.
+mkdir -p "$QUENCH_UPDATE_APT_DIR/mirrors"
+echo 'https://deb.debian.org/debian' > "$QUENCH_UPDATE_APT_DIR/mirrors/debian.list"
+echo 'https://security.debian.org/debian-security' > "$QUENCH_UPDATE_APT_DIR/mirrors/debian-security.list"
+printf '%s\n' 'Types: deb deb-src' 'URIs: mirror+file:///etc/apt/mirrors/debian.list' \
+    'Suites: bookworm bookworm-updates bookworm-backports' 'Components: main' \
+    'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' '' \
+    'Types: deb deb-src' 'URIs: mirror+file:/etc/apt/mirrors/debian-security.list' \
+    'Suites: bookworm-security' 'Components: main' '' \
+    'Types: deb' 'URIs: https://deb.debian.org/debian' 'Suites: bookworm-backports' 'Components: main' '' \
+    'Enabled: no' 'Types: deb' 'URIs: https://example.invalid/debian' 'Suites: bookworm' 'Components: main' \
+    > "$QUENCH_UPDATE_APT_DIR/sources.list.d/debian.sources"
+system_update_sources stage bookworm "$QUENCH_TEST_APT_ROOT/cloud.sources"
+apt-get -o Dir::Etc::sourcelist="$QUENCH_TEST_APT_ROOT/cloud.sources" -o Dir::Etc::sourceparts=- \
+    -o Dir::State::lists="$QUENCH_TEST_APT_ROOT/lists" --print-uris update > "$QUENCH_TEST_APT_ROOT/cloud-uris"
+grep -q '/dists/trixie/' "$QUENCH_TEST_APT_ROOT/cloud-uris"
+grep -q '/dists/trixie-updates/' "$QUENCH_TEST_APT_ROOT/cloud-uris"
+grep -q '/dists/trixie-security/' "$QUENCH_TEST_APT_ROOT/cloud-uris"
+! grep -Eq 'bookworm|backports|example.invalid|mirror\+file' "$QUENCH_TEST_APT_ROOT/cloud-uris"
 echo "Real APT parsing and security-policy isolation passed on $CODE."
