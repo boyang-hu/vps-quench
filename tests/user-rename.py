@@ -295,6 +295,31 @@ class Tests(unittest.TestCase):
         self.e.put('/etc/systemd/system/app.service', '[Service]\nUser=alice\n')
         with self.assertRaises(RenameError): self.plan()
 
+    def test_systemd_masks_preserved_through_rename(self):
+        masks = ['/etc/systemd/system/disabled.service',
+                 '/usr/lib/systemd/system/cryptdisks-early.service']
+        for name in masks:
+            path = self.e.p(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to('/dev/null')
+        ident = self.plan()
+        self.e.apply(ident, 'root')
+        for name in masks:
+            self.assertEqual(os.readlink(self.e.p(name)), '/dev/null')
+
+    def test_systemd_unmask_during_confirmation_refused(self):
+        path = self.e.p('/etc/systemd/system/disabled.service')
+        path.symlink_to('/dev/null')
+        ident = self.plan()
+        path.unlink()
+        self.e.put('/etc/systemd/system/disabled.service', '[Service]\nUser=nobody\n')
+        with self.assertRaises(RenameError): self.e.apply(ident, 'root')
+        self.assertEqual(self.e.load(ident)['status'], 'prepared')
+
+    def test_other_special_config_still_refused(self):
+        self.e.p('/etc/systemd/system/invalid.service').symlink_to('/dev/zero')
+        with self.assertRaises(RenameError): self.plan()
+
     def test_custom_sudo_rule(self):
         self.e.put('/etc/sudoers.d/custom', 'alice ALL=(root) /bin/ls\n', 0o440)
         with self.assertRaises(RenameError): self.plan()

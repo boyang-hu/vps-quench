@@ -227,6 +227,13 @@ class Rename:
             rel = '/' + str(path.relative_to(self.root))
             if rel == skip:
                 continue
+            # A systemd mask is a unit symlink to /dev/null, not a config to
+            # read. Track it so unmasking during confirmation still invalidates
+            # the plan; other special files remain unsupported.
+            if (rel.startswith(('/etc/systemd/system/', '/usr/lib/systemd/system/')) and
+                    path.is_symlink() and path.resolve() == pathlib.Path('/dev/null')):
+                inventory[rel] = 'systemd-mask:/dev/null'
+                continue
             if not path.exists():
                 if path.is_symlink():
                     continue  # disabled/dangling systemd aliases
