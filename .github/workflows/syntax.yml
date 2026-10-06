@@ -18,7 +18,8 @@ jobs:
             tests/fail2ban-shared.sh tests/fail2ban-shared-integration.sh \
             tests/bbr-separation.sh tests/bbr-separation-integration.sh tests/lib/bbr-tc-fixture.sh \
             tests/bbr-measure.sh tests/bbr-measure-integration.sh tests/onboarding-performance.sh \
-            tests/system-updates.sh tests/system-updates-apt-integration.sh; do
+            tests/system-updates.sh tests/system-updates-apt-integration.sh tests/system-updates-tmux-integration.sh \
+            tests/user-rename-integration.sh; do
             bash -n "$script"
           done
 
@@ -64,6 +65,14 @@ jobs:
 
       - name: Test system update guards and failure paths
         run: bash tests/system-updates.sh
+
+      - name: Test user rename and temporary-account failure paths
+        run: python3 tests/user-rename.py
+
+      - name: Test real tmux upgrade handoff and reconnect
+        run: |
+          sudo apt-get update && sudo apt-get install -y tmux
+          bash tests/system-updates-tmux-integration.sh
 
       - name: Test real Linux FQ and HTB in an isolated network namespace
         run: sudo bash tests/bbr-separation-integration.sh

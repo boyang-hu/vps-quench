@@ -254,12 +254,129 @@ for line in sys.stdin:
 ' "$CODE"
 }
 
+system_update_terminal_ready() {
+    [ -t 0 ] && [ -t 1 ]
+}
+
 system_update_session_ready() {
-    [ -t 0 ] && [ -t 1 ] || { error "更新需要交互终端，不能从 cron 或无输入管道执行"; return 1; }
+    system_update_terminal_ready || { error "更新需要交互终端，不能从 cron 或无输入管道执行"; return 1; }
     if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && [ -z "${TMUX:-}${STY:-}" ]; then
         error "远程更新请先进入 tmux 或 screen，再运行 Quench，避免断线中断软件包配置"
         return 1
     fi
+}
+
+# tmux handoff stays outside the update transaction: the child must acquire its
+# own lock, and detaching the client must never fall through to a second update.
+system_update_tmux_available() {
+    command -v tmux >/dev/null 2>&1
+}
+
+system_update_tmux_install() (
+    local PM RC=0
+    PM=$(system_package_manager)
+    case "$PM" in
+        apt|dnf|yum|apk) : ;;
+        *) error "当前包管理器不支持引导安装 tmux，请先从常用软件管理安装"; return 1 ;;
+    esac
+    txn_write_begin "安装升级会话依赖 tmux" || return 1
+    trap 'txn_write_end' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    # Only bootstrap tmux and its dependencies, never a whole-system upgrade.
+    case "$PM" in
+        apt)
+            system_update_apt_health || return 1
+            apt-get -o APT::Update::Error-Mode=any update || return 1
+            apt-get -o DPkg::Lock::Timeout=60 --no-remove install -y tmux || RC=$?
+            ;;
+        dnf|yum) "$PM" install -y tmux || RC=$? ;;
+        apk) apk add --no-cache tmux || RC=$? ;;
+    esac
+    if [ "$RC" -ne 0 ] || ! system_update_tmux_available; then
+        audit_action "安装升级会话依赖 tmux" FAILED
+        error "tmux 安装未完成；本次系统升级未启动，请检查包管理器输出"
+        return 1
+    fi
+    audit_action "安装升级会话依赖 tmux" SUCCESS
+)
+
+system_update_tmux_hint() {
+    info "断线或分离后，用同一 root 身份执行：tmux -L quench attach -t quench-update"
+    ui_hint "临时离开：先按 Ctrl+B，再按 D；不要输入 exit 或杀掉会话。服务器重启后会话不会保留。"
+}
+
+system_update_tmux_launch() {
+    local MODE="$1" SCRIPT NEED_INSTALL=no
+    if [ "${QUENCH_TXN_LOCK_HELD:-0}" = 1 ] || [ "${QUENCH_TXN_WRITE_DEPTH:-0}" -gt 0 ] || safety_timer_pending; then
+        error "请先完成当前配置事务/防断联确认，再进入升级会话"
+        return 1
+    fi
+    if system_update_tmux_available && tmux -L quench has-session -t '=quench-update' 2>/dev/null; then
+        confirm_change_preview "重新连接已有升级会话" \
+            "只连接 quench-update，不重新执行刚才选择的操作，不中断其他客户端" || return 0
+        system_update_tmux_hint
+        tmux -L quench attach-session -t '=quench-update'
+        return $?
+    fi
+    # A pipe or /dev/fd is already consumed by Bash: don't reread it, silently
+    # fetch different code, or resume an older locally installed version.
+    SCRIPT=$(self_resolve_script_source "$0") || {
+        error "当前从管道/临时流运行，无法在 tmux 中重新打开同一份脚本"
+        ui_hint "请先在主菜单 m → 1 安装到本地，再执行 v 进入更新中心；或保存脚本为文件后用 bash 运行。"
+        return 1
+    }
+    system_update_tmux_available || NEED_INSTALL=yes
+    if [ "$NEED_INSTALL" = yes ]; then
+        confirm_change_preview "安装 tmux 并进入升级会话" \
+            "安装 tmux 及其必要依赖（可能联网、运行软件包安装钩子）；不执行整机升级" \
+            "进入独立 quench-update 会话后继续所选操作，仍保留全部预检和升级确认" || return 0
+        system_update_tmux_install || return 1
+    else
+        confirm_change_preview "进入 tmux 升级会话" \
+            "进入独立 quench-update 会话后继续所选操作，仍保留全部预检和升级确认" || return 0
+    fi
+    system_update_tmux_hint
+    # Dedicated server ignores user tmux hooks/options. Multiple command args
+    # are exec'd directly, not interpolated into a shell command string. -A
+    # attaches instead of executing again if another launcher wins the race.
+    if ! tmux -L quench -f /dev/null new-session -A -s quench-update \
+        bash "$SCRIPT" --system-update-resume "$MODE"; then
+        error "tmux 创建或连接失败；不会在当前 SSH 会话继续升级"
+        system_update_tmux_hint
+        return 1
+    fi
+    info "已离开升级会话；这不代表升级已完成。如任务仍在运行，请重新连接查看。"
+}
+
+system_update_dispatch() {
+    local MODE="$1"
+    case "$MODE" in current|security|packages|autoremove|full|major) : ;;
+        *) error "无效的更新操作：$MODE"; return 2 ;;
+    esac
+    system_update_terminal_ready || { error "更新需要交互终端，不能从 cron 或无输入管道执行"; return 1; }
+    if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && [ -z "${TMUX:-}${STY:-}" ]; then
+        system_update_tmux_launch "$MODE"
+        return $?
+    fi
+    case "$MODE" in
+        major) system_update_debian_major ;;
+        *) system_update_action "$MODE" ;;
+    esac
+}
+
+system_update_resume() {
+    local MODE="${1:-}" RC=0
+    case "$MODE" in current|security|packages|autoremove|full|major) : ;;
+        *) error "无效的会话续接操作：$MODE"; return 2 ;;
+    esac
+    [ -n "${TMUX:-}" ] || { error "此内部入口只能在 tmux 会话中使用"; return 1; }
+    system_update_terminal_ready || { error "会话续接需要交互终端"; return 1; }
+    system_update_dispatch "$MODE" || RC=$?
+    [ "$RC" -eq 0 ] || warn "所选更新未完成，请检查上方输出；不会自动重试"
+    # Keep results visible and the session available after the selected action.
+    ui_pause
+    system_update_manager
 }
 
 system_update_apt_preflight() {
@@ -1107,15 +1224,15 @@ system_update_manager() {
         read -rp "$(ui_prompt '选择 [0-8 / f / v]: ')" CH || return 0
         case "$CH" in
             1) system_update_action check ;;
-            2) system_update_action current ;;
-            3) system_update_action security ;;
-            4) system_update_action packages ;;
+            2) system_update_dispatch current ;;
+            3) system_update_dispatch security ;;
+            4) system_update_dispatch packages ;;
             5) system_update_auto_menu ;;
             6) system_update_postcheck ;;
             7) system_update_clean_cache ;;
-            8) system_update_action autoremove ;;
-            f|F) system_update_action full ;;
-            v|V) system_update_debian_major ;;
+            8) system_update_dispatch autoremove ;;
+            f|F) system_update_dispatch full ;;
+            v|V) system_update_dispatch major ;;
             0) return 0 ;;
             *) warn "无效选项"; continue ;;
         esac

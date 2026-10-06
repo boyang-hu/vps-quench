@@ -745,4 +745,177 @@ t_eof() {
 }
 run_test 'Update menu exits safely on EOF' t_eof
 
+setup_tmux() {
+    setup_update "tmux_$1"
+    SSH_CONNECTION='192.0.2.1 12345 192.0.2.2 22'
+    SSH_TTY=/dev/pts/fixture
+    TMUX= STY=
+    QUENCH_TXN_LOCK_HELD=0 QUENCH_TXN_WRITE_DEPTH=0
+    system_update_terminal_ready() { [ ! -e "$QUENCH_TEST_UPDATE_CASE/no-tty" ]; }
+    system_update_tmux_available() { [ ! -e "$QUENCH_TEST_UPDATE_CASE/no-tmux" ]; }
+    self_resolve_script_source() {
+        [ ! -e "$QUENCH_TEST_UPDATE_CASE/stream" ] || return 1
+        printf '%s\n' "/tmp/quench path with 'quote/\$(literal).sh"
+    }
+    safety_timer_pending() { [ -e "$QUENCH_TEST_UPDATE_CASE/pending" ]; }
+    system_update_tmux_install() {
+        echo install >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        [ ! -e "$QUENCH_TEST_UPDATE_CASE/install-fail" ] || return 1
+        rm -f "$QUENCH_TEST_UPDATE_CASE/no-tmux"
+    }
+    tmux() {
+        printf 'tmux %s\n' "$*" >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        case " $* " in
+            *' has-session '*) [ -e "$QUENCH_TEST_UPDATE_CASE/existing" ]; return $? ;;
+            *' new-session '*)
+                [ "$#" = 12 ] || fail 'tmux argv was not preserved'
+                assert_eq "$9" bash
+                assert_eq "${10}" "/tmp/quench path with 'quote/\$(literal).sh"
+                assert_eq "${11}" --system-update-resume
+                ;;
+        esac
+        [ ! -e "$QUENCH_TEST_UPDATE_CASE/tmux-fail" ]
+    }
+    system_update_action() { echo "action $1" >> "$QUENCH_TEST_UPDATE_CASE/calls"; }
+    system_update_debian_major() { echo major >> "$QUENCH_TEST_UPDATE_CASE/calls"; }
+    ui_pause() { echo pause >> "$QUENCH_TEST_UPDATE_CASE/calls"; }
+}
+
+t_tmux_handoff() {
+    setup_tmux "$1"
+    case "$1" in
+        tmux) TMUX=already-inside ;;
+        screen) STY=already-inside ;;
+        local) SSH_CONNECTION= SSH_TTY= ;;
+        tty-only) SSH_CONNECTION= ;;
+        install|install-fail|cancel-install) touch "$QUENCH_TEST_UPDATE_CASE/no-tmux" ;;
+    esac
+    case "$1" in
+        no-tty|cancel|stream|install-fail|tmux-fail|pending) touch "$QUENCH_TEST_UPDATE_CASE/$1" ;;
+        cancel-install) touch "$QUENCH_TEST_UPDATE_CASE/cancel" ;;
+        held) QUENCH_TXN_LOCK_HELD=1 ;;
+        nested) QUENCH_TXN_WRITE_DEPTH=1 ;;
+        existing|existing-stream|attach-fail)
+            touch "$QUENCH_TEST_UPDATE_CASE/existing"
+            touch "$QUENCH_TEST_UPDATE_CASE/stream"
+            [ "$1" != attach-fail ] || touch "$QUENCH_TEST_UPDATE_CASE/tmux-fail"
+            ;;
+    esac
+    case "$1" in
+        no-tty|stream|install-fail|tmux-fail|attach-fail|held|nested|pending) assert_fail system_update_dispatch current ;;
+        *) assert_ok system_update_dispatch current ;;
+    esac
+    case "$1" in
+        tmux|screen|local)
+            assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/calls")" 'action current'
+            ;;
+        *) ! grep -q '^action\|^major' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'handoff fell through to a duplicate update' ;;
+    esac
+    case "$1" in
+        launch|tty-only|install|tmux-fail)
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" 'new-session -A -s quench-update'
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" '--system-update-resume current'
+            ;;
+        existing|existing-stream|attach-fail)
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" 'attach-session -t =quench-update'
+            ! grep -q 'new-session\|^install' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'existing session was recreated'
+            ;;
+        no-tty|cancel|cancel-install|stream|install-fail|held|nested|pending)
+            ! grep -q 'new-session\|attach-session' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'unsafe handoff'
+            ;;
+    esac
+    case "$1" in
+        install|install-fail) assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" install ;;
+        *) ! grep -q '^install' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'unrequested installation' ;;
+    esac
+    :
+}
+for FORM in launch tty-only tmux screen local install existing existing-stream cancel cancel-install stream no-tty install-fail tmux-fail attach-fail held nested pending; do
+    run_test "tmux update handoff: $FORM" t_tmux_handoff "$FORM"
+done
+
+t_tmux_resume() {
+    setup_tmux "resume_$1"
+    system_update_manager() { echo menu >> "$QUENCH_TEST_UPDATE_CASE/calls"; }
+    TMUX=inside
+    case "$1" in
+        outside) TMUX= ;;
+        no-tty) touch "$QUENCH_TEST_UPDATE_CASE/no-tty" ;;
+        failed) system_update_action() { echo 'failed action' >> "$QUENCH_TEST_UPDATE_CASE/calls"; return 1; } ;;
+    esac
+    case "$1" in
+        outside|no-tty)
+            assert_fail system_update_resume current
+            assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/calls")" ''
+            ;;
+        invalid)
+            assert_fail system_update_resume 'current; reboot'
+            assert_fail system_update_dispatch 'current; reboot'
+            assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/calls")" ''
+            ;;
+        failed)
+            assert_ok system_update_resume current
+            assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/calls")" $'failed action\npause\nmenu'
+            ;;
+        major)
+            assert_ok system_update_resume major
+            assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/calls")" $'major\npause\nmenu'
+            ;;
+        *)
+            assert_ok system_update_resume "$1"
+            assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/calls")" "$(printf 'action %s\npause\nmenu' "$1")"
+            ;;
+    esac
+    :
+}
+for MODE in current security packages autoremove full major invalid outside no-tty failed; do
+    run_test "tmux update resume: $MODE" t_tmux_resume "$MODE"
+done
+
+t_tmux_dependency() {
+    setup_update "tmux_dependency_$1"
+    system_update_tmux_available() { [ -e "$QUENCH_TEST_UPDATE_CASE/installed" ]; }
+    system_package_manager() { echo "${QUENCH_TEST_PM:-apt}"; }
+    apt-get() {
+        printf 'apt-get %s\n' "$*" >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        case " $* " in
+            *' update '*) [ ! -e "$QUENCH_TEST_UPDATE_CASE/refresh-fail" ]; return $? ;;
+        esac
+        [ ! -e "$QUENCH_TEST_UPDATE_CASE/apply-fail" ] || return 100
+        [ -e "$QUENCH_TEST_UPDATE_CASE/missing-binary" ] || touch "$QUENCH_TEST_UPDATE_CASE/installed"
+        return 0
+    }
+    dnf() { echo "dnf $*" >> "$QUENCH_TEST_UPDATE_CASE/calls"; touch "$QUENCH_TEST_UPDATE_CASE/installed"; }
+    yum() { echo "yum $*" >> "$QUENCH_TEST_UPDATE_CASE/calls"; touch "$QUENCH_TEST_UPDATE_CASE/installed"; }
+    apk() { echo "apk $*" >> "$QUENCH_TEST_UPDATE_CASE/calls"; touch "$QUENCH_TEST_UPDATE_CASE/installed"; }
+    QUENCH_TEST_PM=apt
+    case "$1" in
+        dnf|yum|apk|pacman) QUENCH_TEST_PM="$1" ;;
+        refresh-fail|apply-fail|broken|missing-binary) touch "$QUENCH_TEST_UPDATE_CASE/$1" ;;
+        lock-fail) txn_write_begin() { return 1; } ;;
+    esac
+    case "$1" in
+        apt|dnf|yum|apk) assert_ok system_update_tmux_install ;;
+        *) assert_fail system_update_tmux_install ;;
+    esac
+    case "$1" in
+        apt) assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" '--no-remove install -y tmux' ;;
+        dnf|yum) assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" "$1 install -y tmux" ;;
+        apk) assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" 'apk add --no-cache tmux' ;;
+        pacman|lock-fail) assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/calls")" '' ;;
+        broken|refresh-fail)
+            ! grep -q 'install -y' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'install after failed preflight'
+            ;;
+    esac
+    case "$1" in
+        pacman|lock-fail) : ;;
+        *) assert_eq "$(tail -n 1 "$QUENCH_TEST_UPDATE_CASE/calls")" unlock ;;
+    esac
+    ! grep -Eq 'dist-upgrade| upgrade| remove|pacman' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'bootstrap performed whole-system mutation'
+    :
+}
+for FORM in apt dnf yum apk pacman refresh-fail apply-fail broken missing-binary lock-fail; do
+    run_test "tmux dependency bootstrap: $FORM" t_tmux_dependency "$FORM"
+done
+
 test_summary 'System and software updates'

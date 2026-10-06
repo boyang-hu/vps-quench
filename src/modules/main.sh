@@ -367,6 +367,11 @@ case "${1:-}" in
         system_update_manager
         exit $?
         ;;
+    --system-update-resume)
+        [ "$#" -eq 2 ] || { error "内部升级会话入口需要一个操作参数"; exit 2; }
+        system_update_resume "$2"
+        exit $?
+        ;;
     --stun-test)
         stun_nat_quick
         exit $?

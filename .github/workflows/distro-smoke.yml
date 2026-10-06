@@ -14,16 +14,16 @@ jobs:
         include:
           - image: debian:12
             pm: apt
-            setup: apt-get update && apt-get install -y bash python3 python3-apt
+            setup: apt-get update && apt-get install -y bash python3 python3-apt tmux
           - image: debian:13
             pm: apt
-            setup: apt-get update && apt-get install -y bash python3 python3-apt
+            setup: apt-get update && apt-get install -y bash python3 python3-apt tmux
           - image: ubuntu:24.04
             pm: apt
             setup: apt-get update && apt-get install -y bash python3
           - image: alpine:3.20
             pm: apk
-            setup: apk add --no-cache bash python3
+            setup: apk add --no-cache bash python3 tmux
           - image: rockylinux:9
             pm: dnf
             setup: dnf install -y bash python3 diffutils
@@ -41,7 +41,7 @@ jobs:
             -e EXPECTED_PM="$EXPECTED_PM" \
             -e SETUP="$SETUP" \
             -v "$PWD:/repo" -w /repo "$IMAGE" \
-            sh -c 'sh -c "$SETUP" && bash tests/distro-smoke.sh && bash tests/bbr-measure.sh && bash tests/bbr-separation.sh && bash tests/onboarding-performance.sh && bash tests/system-updates.sh'
+            sh -c 'sh -c "$SETUP" && bash tests/distro-smoke.sh && bash tests/bbr-measure.sh && bash tests/bbr-separation.sh && bash tests/onboarding-performance.sh && bash tests/system-updates.sh && bash tests/system-updates-tmux-integration.sh'
 
       - name: Test real Debian APT parsing without upgrading packages
         if: startsWith(matrix.image, 'debian:')
@@ -50,3 +50,11 @@ jobs:
         run: |
           docker run --rm -e QUENCH_TEST_APT_CONTAINER=1 -v "$PWD:/repo" -w /repo "$IMAGE" \
             sh -c 'apt-get update && apt-get install -y bash python3 python3-apt && bash tests/system-updates-apt-integration.sh'
+
+      - name: Test real account rename in a disposable Debian container
+        if: startsWith(matrix.image, 'debian:')
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm -e QUENCH_TEST_USER_CONTAINER=1 -v "$PWD:/repo:ro" -w /repo "$IMAGE" \
+            sh -c 'apt-get update && apt-get install -y bash python3 sudo openssh-server passwd procps && bash tests/user-rename-integration.sh'

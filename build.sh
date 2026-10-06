@@ -11,6 +11,7 @@ PARTS=(
     src/lib/core.sh
     src/modules/ssh.sh
     src/modules/users.sh
+    src/modules/user-rename.sh
     src/modules/fail2ban.sh
     src/modules/bbr.sh
     src/modules/bbr-measure.sh

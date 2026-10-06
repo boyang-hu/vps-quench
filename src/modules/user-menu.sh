@@ -22,10 +22,11 @@ user_management_menu() {
         menu_pair "5" "管理用户公钥" "6" "删除用户"
         menu_pair "7" "SSH 登录策略" "8" "修改 SSH 端口"
         menu_pair "9" "SSH 状态与检查" "w" "推荐安全向导"
+        menu_item "r" "修改用户名 / 临时维护账号"
         menu_pair "0" "返回主菜单" "00" "退出脚本" "$RED" "$RED"
         menu_div
         echo ""
-        read -rp "$(ui_prompt '选择操作 [0-9 / w]: ')" CHOICE
+        read -rp "$(ui_prompt '选择操作 [0-9 / w / r]: ')" CHOICE
 
         case "$CHOICE" in
             1) user_show_list; ui_pause ;;
@@ -38,6 +39,7 @@ user_management_menu() {
             8) change_port; ui_pause ;;
             9) ssh_security_status; ui_pause ;;
             w|W) user_recommended_wizard; ui_pause ;;
+            r|R) quench_user_rename_menu ;;
             0) return ;;
             00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
             *) warn "无效选项"; sleep 1 ;;
