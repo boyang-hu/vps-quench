@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,24 +17,31 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Validate release tag
         run: |
           version=$(sed -nE 's/^APP_VERSION="(V[0-9]+\.[0-9]+(\.[0-9]+)?)".*/\1/p' vps-quench.sh | head -1)
           expected="v${version#V}"
-          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match script version $version" >&2
+          if [ "$RELEASE_TAG" != "$expected" ]; then
+            echo "Tag $RELEASE_TAG does not match script version $version" >&2
             exit 1
           fi
 
       - name: Validate scripts
         run: |
-          bash -n vps-quench.sh build-offline-package.sh tests/offline-package.sh
+          for script in vps-quench.sh build-offline-package.sh tests/offline-package.sh; do
+            bash -n "$script"
+          done
           ./build.sh --check
-          shellcheck --severity=warning -x vps-quench.sh build-offline-package.sh tests/offline-package.sh
+          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
+            --severity=info -x vps-quench.sh build-offline-package.sh tests/offline-package.sh tests/lib/harness.sh
           sha256sum -c vps-quench.sh.sha256
           tests/smoke.sh
           tests/fault-injection.sh
@@ -42,15 +55,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(sed -nE 's/^APP_VERSION="(V[0-9]+\.[0-9]+(\.[0-9]+)?)".*/\1/p' vps-quench.sh | head -1)
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" --title "Quench $version"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "Quench $version"
             while IFS= read -r asset; do
-              [ -z "$asset" ] || gh release delete-asset "$GITHUB_REF_NAME" "$asset" --yes
-            done < <(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')
-            gh release upload "$GITHUB_REF_NAME" dist/* vps-quench.sh vps-quench.sh.sha256
+              [ -z "$asset" ] || gh release delete-asset "$RELEASE_TAG" "$asset" --yes
+            done < <(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+            gh release upload "$RELEASE_TAG" dist/* vps-quench.sh vps-quench.sh.sha256
           else
-            gh release create "$GITHUB_REF_NAME" \
+            gh release create "$RELEASE_TAG" \
               dist/* vps-quench.sh vps-quench.sh.sha256 \
+              --verify-tag \
               --title "Quench $version" \
               --notes "完整脚本与离线安装包。离线包内含独立安装器和 SHA256 校验，适合下载后传入无法访问 GitHub 的 VPS。"
           fi
