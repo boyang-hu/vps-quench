@@ -65,6 +65,11 @@ setup_recommended() {
     first_run_access_ready() { return 0; }
     first_run_firewall_ready() { return 0; }
     first_run_fail2ban_ready() { return 0; }
+    first_run_firewall_mode_ready() { return 0; }
+    # Firewall selection is covered by firewall-ssh-mode.sh. Performance tests
+    # must never inspect or configure the runner's actual firewall/packages.
+    fw_detect() { fail 'performance test inspected the host firewall'; }
+    first_run_firewall_fail2ban_setup() { fail 'performance test entered firewall setup'; }
     first_run_ssh_baseline_ready() { return 0; }
     system_auto_updates_supported() { return 0; }
     system_auto_updates_enabled() { return 0; }
