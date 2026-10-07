@@ -48,6 +48,18 @@ first_run_fail2ban_ready() {
         && f2b_runtime_healthy
 }
 
+first_run_firewall_mode_ready() {
+    [ "$(fw_detect)" = ufw ] || return 0
+    [ -f "$QUENCH_SSH_FIREWALL_MODE_FILE" ] || return 1
+    local MODE PORT PORTS
+    MODE=$(fw_ssh_mode_get) || return 1
+    PORTS=$(ssh_effective_ports) || return 1
+    [ -n "$PORTS" ] || return 1
+    while IFS= read -r PORT; do
+        fw_ufw_ssh_rule_ready "$PORT" "$MODE" || return 1
+    done <<< "$PORTS"
+}
+
 first_run_ssh_baseline_ready() {
     [ "$(get_config PubkeyAuthentication)" = yes ] \
         && [ "$(get_config PermitEmptyPasswords)" = no ] \
@@ -374,6 +386,9 @@ first_run_firewall_fail2ban_setup() {
                 fw_install "$TYPE" || return 1
             else
                 info "$TYPE 已运行，SSH 端口规则验证通过"
+                if [ "$TYPE" = ufw ]; then
+                    fw_ssh_mode_setup || return 1
+                fi
             fi
             ;;
         none)
@@ -475,7 +490,7 @@ first_run_recommended_flow() {
     first_run_access_ready \
         || first_run_offer_step "配置用户与 SSH 安全接管" y first_run_access_setup \
         || { warn "用户与 SSH 步骤未完成，可稍后继续"; return 1; }
-    first_run_firewall_ready && first_run_fail2ban_ready \
+    first_run_firewall_ready && first_run_fail2ban_ready && first_run_firewall_mode_ready \
         || first_run_offer_step "配置防火墙与 Fail2ban" y first_run_firewall_fail2ban_setup \
         || { warn "防火墙与 Fail2ban 步骤未完成，可稍后继续"; return 1; }
     first_run_ssh_baseline_ready \

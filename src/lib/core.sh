@@ -1248,7 +1248,7 @@ firewall_port_ready() {
 
 firewall_allow_port() {
     local PORT="$1"
-    local UFW_ACTIVE=false FIREWALLD_ACTIVE=false IPTABLES_ACTIVE=false FAILED=false FIREWALLD_ZONE=""
+    local UFW_ACTIVE=false FIREWALLD_ACTIVE=false IPTABLES_ACTIVE=false FAILED=false FIREWALLD_ZONE="" SSH_FW_MODE
 
     command -v ufw &>/dev/null && LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active" && UFW_ACTIVE=true
     command -v firewall-cmd &>/dev/null && svc_is_active firewalld && FIREWALLD_ACTIVE=true
@@ -1281,15 +1281,12 @@ firewall_allow_port() {
     fi
 
     if [ "$UFW_ACTIVE" = true ]; then
-        # 新 SSH 端口尚未监听，可安全把宽泛 ALLOW 转成 LIMIT；来源限定规则不受影响。
-        ufw --force delete allow "${PORT}/tcp" >/dev/null 2>&1 || true
-        if ufw limit "${PORT}"/tcp 2>/dev/null \
-            && ufw_port_rule_present "$PORT" LIMIT broad \
-            && ! ufw_port_rule_present "$PORT" ALLOW broad \
-            && ! ufw_port_rule_present "$PORT" 'DENY|REJECT' broad; then
-            info "ufw 已限速放行 ${PORT}/tcp ✓"
+        SSH_FW_MODE=$(fw_ssh_mode_get) || return 1
+        if fw_ufw_set_ssh_port "$PORT" "$SSH_FW_MODE" \
+            && fw_ufw_ssh_rule_ready "$PORT" "$SSH_FW_MODE"; then
+            info "ufw 已放行 ${PORT}/tcp（$(fw_ssh_mode_label)）✓"
         else
-            error "ufw 未形成唯一有效的 ${PORT}/tcp 宽泛 LIMIT 规则"
+            error "ufw 的 ${PORT}/tcp 规则未通过 $SSH_FW_MODE 模式验证"
             FAILED=true
         fi
     fi

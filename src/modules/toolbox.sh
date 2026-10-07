@@ -7,7 +7,7 @@ config_backup_allowed_roots() {
     for p in \
         etc/hostname etc/hosts \
         etc/ssh/sshd_config etc/ssh/sshd_config.d root/.ssh/authorized_keys \
-        etc/fail2ban etc/ufw etc/firewalld etc/nftables.conf etc/nftables.d/quench-nft-forward.nft etc/quench/nft-forward \
+        etc/fail2ban etc/ufw etc/firewalld etc/nftables.conf etc/nftables.d/quench-nft-forward.nft etc/quench/nft-forward etc/quench/ssh-firewall-mode \
         etc/sysctl.conf etc/sysctl.d/98-vps-quench-network-security.conf etc/sysctl.d/98-quench-nft-forward.conf etc/sysctl.d/99-quench-bbr.conf etc/sysctl.d/99-quench-ipv6.conf \
         etc/systemd/system/quench-nft-forward.service etc/systemd/system/quench-nft-target-refresh.service etc/systemd/system/quench-nft-target-refresh.timer \
         etc/init.d/quench-nft-forward usr/local/libexec/quench-nft-forward-apply var/lib/quench/nft-forward \

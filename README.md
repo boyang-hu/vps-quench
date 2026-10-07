@@ -347,10 +347,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 | 添加 / 删除端口 | 支持端口段，按编号循环删除 |
 | 拉黑 / 放行 IP | 校验 IPv4/IPv6/CIDR；可仅放行 SSH、指定端口或全部服务 |
 | 快速放行 Web | 显式确认后放行 SSH + 80 + 443 |
-| 安装 / 修复 | UFW 明确拒绝默认入站并限速放行 SSH；80/443 默认不开放 |
+| 安装 / 修复 | UFW 明确拒绝默认入站，按所选模式放行 SSH；80/443 默认不开放 |
+| SSH 防火墙模式 | 默认 `LIMIT` 连接限速；安装或计划安装 1Panel 时可选面板兼容 `ALLOW`；支持已部署机器迁移 |
 | 安全卸载 | 默认保留配置，不 flush iptables/nftables；完全清理需输入 `PURGE` |
 
 **安全保护：** UFW 会在启用前放行当前 SSH 端口；firewalld 会用 `firewall-offline-cmd` 在首次启动前写入 SSH 永久规则。所有可能影响连接的操作保留 180 秒自动回滚，并提醒检查云安全组和 Docker 端口绕过。
+
+**1Panel 兼容：** UFW 安装 / 修复和首次开荒的防火墙步骤会提供 SSH 模式选择。计划安装 1Panel 时选「面板兼容」；已部署机器可进入「防火墙管理 → UFW → p：SSH 防火墙模式 / 1Panel 兼容迁移」。Quench 会原地把当前 SSH 端口的宽泛 `LIMIT` 改为 `ALLOW`，核对 UFW 启用的 IPv4/IPv6 规则，并保存选择到 `/etc/quench/ssh-firewall-mode`。修改 SSH 端口、修复 UFW 和快速放行 Web 时都会沿用；模式文件与 UFW 配置一同备份、回滚。
+
+迁移后请保持旧连接，新开 SSH 连接验证并确认取消自动回滚，再到 1Panel 防火墙页面重新「同步」并刷新。新版 1Panel 不能完整接管 UFW `LIMIT`，可能把实际规则和面板期望记录分开显示并导致同步失败。兼容模式不修改 1Panel 数据库，也不关闭 Fail2ban 或改变 SSH 认证策略，但会取消 UFW 的 SSH 连接频率限制；Fail2ban 按认证失败封禁，与这层限制并不等价。切回 `LIMIT` 可能再次遇到面板同步冲突。
 
 ---
 
@@ -653,6 +658,7 @@ Docker 发布端口可能绕过 UFW 的常规 `INPUT` 规则。诊断入口会�
 | `/var/lib/quench/mirrors` | APT/DNF 软件源事务快照、最近恢复点和当前源状态（仅 root 可读） |
 | `/var/lib/quench/ip` | IPv6 持久化配置与逐接口运行时状态快照（仅 root 可读） |
 | `/var/lib/quench/ssh-port-migration.state` | 尚未完成的 SSH 双端口迁移状态（600） |
+| `/etc/quench/ssh-firewall-mode` | UFW 的 SSH 规则模式：`limit` / `panel`；参与配置备份与自动回滚（600） |
 | `/var/log/quench-audit.log` | 脚本操作审计日志（600） |
 | `/etc/sudoers.d/90-quench-admins` | Quench 管理员组授权（440，写入前经 `visudo` 校验） |
 | `/etc/sudoers.d/91-quench-nopasswd-<用户名>` | 按用户管理的免密 sudo 授权（440，写入后执行无密码提权验证） |
@@ -709,6 +715,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 ./build.sh --check  # 检查发行文件是否与模块源码一致
 tests/smoke.sh
 tests/fault-injection.sh
+bash tests/firewall-ssh-mode.sh  # SSH 面板兼容迁移、双栈验证及失败恢复
 ```
 
 GitHub Actions 还会在 Debian 12/13、Ubuntu、Alpine、Rocky Linux 容器中加载生成脚本并执行冒烟测试，并在 Linux network namespace 中实际验证 TCP/UDP 线路转发。`bash tests/system-updates.sh` 覆盖更新预检、取消、失败审计、跨版本源恢复和禁止错误降级；Debian 容器另运行真实 APT 配置解析测试，不在 CI runner 上升级系统。容器测试不等价于整台 VPS 的引导/跨版本演练。

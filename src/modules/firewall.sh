@@ -2,10 +2,144 @@
 #  防火墙模块
 # ══════════════════════════════════════════════════════════
 
+QUENCH_SSH_FIREWALL_MODE_FILE="${QUENCH_SSH_FIREWALL_MODE_FILE:-/etc/quench/ssh-firewall-mode}"
+QUENCH_UFW_DEFAULTS_FILE="${QUENCH_UFW_DEFAULTS_FILE:-/etc/default/ufw}"
+
+fw_ssh_mode_get() {
+    local MODE=limit
+    if [ -e "$QUENCH_SSH_FIREWALL_MODE_FILE" ]; then
+        MODE=$(cat "$QUENCH_SSH_FIREWALL_MODE_FILE") || return 1
+    fi
+    case "$MODE" in
+        limit|panel) printf '%s\n' "$MODE" ;;
+        *) error "SSH 防火墙模式配置无效，请在防火墙菜单重新选择"; return 1 ;;
+    esac
+}
+
+fw_ssh_mode_save() {
+    local MODE="$1" TMP
+    case "$MODE" in limit|panel) ;; *) return 1 ;; esac
+    [ ! -d "$QUENCH_SSH_FIREWALL_MODE_FILE" ] || return 1
+    mkdir -p "$(dirname "$QUENCH_SSH_FIREWALL_MODE_FILE")" || return 1
+    TMP=$(quench_mktemp "${QUENCH_SSH_FIREWALL_MODE_FILE}.tmp.XXXXXX") || return 1
+    if ! { printf '%s\n' "$MODE" > "$TMP" && chmod 600 "$TMP" && mv -f "$TMP" "$QUENCH_SSH_FIREWALL_MODE_FILE"; }; then
+        rm -f "$TMP"
+        return 1
+    fi
+}
+
+fw_ssh_mode_label() {
+    case "$(fw_ssh_mode_get)" in
+        limit) printf '连接限速（LIMIT）\n' ;;
+        panel) printf '面板兼容（ALLOW）\n' ;;
+        *) printf '配置无效\n' ;;
+    esac
+}
+
+fw_ssh_mode_choose() {
+    local CURRENT CH DEFAULT=1
+    CURRENT=$(fw_ssh_mode_get) || CURRENT=limit
+    [ "$CURRENT" != panel ] || DEFAULT=2
+    menu_item "1" "连接限速：UFW LIMIT（默认）"
+    menu_item "2" "面板兼容：普通 ALLOW（已安装或计划安装 1Panel）"
+    echo "  面板兼容模式取消 UFW 的 SSH 连接频率限制；SSH 认证策略和 Fail2ban 配置保持不变。"
+    echo "  Fail2ban 按认证失败封禁，与 UFW 连接限速并不等价。"
+    read -rp "  SSH 防火墙模式 [1/2，默认 ${DEFAULT}，0 返回]: " CH || return 1
+    case "${CH:-$DEFAULT}" in
+        1) QUENCH_SSH_FIREWALL_CHOICE=limit ;;
+        2) QUENCH_SSH_FIREWALL_CHOICE=panel ;;
+        *) return 1 ;;
+    esac
+}
+
+# 不执行配置文件；缺少 IPV6=no 时按双栈核对，避免只放行 IPv4 就宣布成功。
+fw_ufw_ipv6_enabled() {
+    local VALUE
+    VALUE=$(awk -F= '
+        $1 ~ /^[[:space:]]*IPV6[[:space:]]*$/ {
+            value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"\047]/, "", value)
+        }
+        END {print value}
+    ' "$QUENCH_UFW_DEFAULTS_FILE" 2>/dev/null) || return 0
+    [ "$VALUE" != no ]
+}
+
+fw_ufw_ssh_rule_ready() {
+    local PORT="$1" MODE="$2" ACTION STATUS V6=no
+    case "$MODE" in limit) ACTION=LIMIT ;; panel) ACTION=ALLOW ;; *) return 1 ;; esac
+    STATUS=$(LC_ALL=C ufw status 2>/dev/null) || return 1
+    fw_ufw_ipv6_enabled && V6=yes
+    printf '%s\n' "$STATUS" | awk -v spec="$PORT/tcp" -v action="$ACTION" -v v6="$V6" '
+        $1 == spec {
+            family=4; pos=2
+            if ($pos == "(v6)") {family=6; pos++}
+            actual=$pos; pos++
+            if ($pos == "IN") pos++
+            if ($pos != "Anywhere") next
+            # 不把网卡限定、OUT 或来源限定规则当成全局 SSH 放行。
+            if (actual == action) found[family]=1
+            else if (actual ~ /^(ALLOW|LIMIT|DENY|REJECT)$/) conflict=1
+        }
+        END {exit !(found[4] && (v6 != "yes" || found[6]) && !conflict)}
+    '
+}
+
+fw_ufw_set_ssh_port() {
+    local PORT="$1" MODE="$2" ACTION
+    [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || return 1
+    case "$MODE" in limit) ACTION=limit ;; panel) ACTION=allow ;; *) return 1 ;; esac
+    # 已匹配时不重复写入，保留 1Panel 自己的规则备注 / UUID。
+    if fw_ufw_ssh_rule_ready "$PORT" "$MODE"; then return 0; fi
+    if ufw_port_rule_present "$PORT" 'DENY|REJECT' broad; then
+        error "SSH $PORT/tcp 存在宽泛拒绝规则，请先检查规则冲突"
+        return 1
+    fi
+    # 普通 allow/limit 会原地替换同条件的另一动作；prepend/insert 会跳过它。
+    # 不先删除当前规则，避免迁移现有 SSH 端口时出现放行空窗。
+    ufw "$ACTION" "$PORT/tcp" >/dev/null 2>&1
+}
+
+fw_ssh_mode_apply() {
+    local MODE="$1" PORT PORTS
+    case "$MODE" in limit|panel) ;; *) return 1 ;; esac
+    [ "$(fw_detect)" = ufw ] && [ "$(fw_running ufw)" = active ] \
+        || { error "请先通过安装 / 修复启用 UFW，再迁移 SSH 规则"; return 1; }
+    safety_arm ssh_firewall_mode || return 1
+    if ! PORTS=$(ssh_effective_ports) || [ -z "$PORTS" ]; then
+        safety_rollback_after_failure
+        error "无法确定 SSH 端口，未迁移规则"
+        return 1
+    fi
+    while IFS= read -r PORT; do
+        if ! fw_ufw_set_ssh_port "$PORT" "$MODE" || ! fw_ufw_ssh_rule_ready "$PORT" "$MODE"; then
+            safety_rollback_after_failure
+            error "SSH $PORT/tcp 规则迁移或双栈验证失败，已请求恢复原配置"
+            return 1
+        fi
+    done <<< "$PORTS"
+    if ! fw_ssh_mode_save "$MODE"; then
+        safety_rollback_after_failure
+        error "SSH 防火墙模式保存失败，已请求恢复原配置"
+        return 1
+    fi
+    info "SSH 防火墙模式已应用：$(fw_ssh_mode_label)"
+    safety_confirm || return 1
+    if [ "$MODE" = panel ] && ! safety_timer_pending; then
+        info "如已安装 1Panel，请在其防火墙页面重新同步并刷新，以核对面板记录"
+    fi
+}
+
+fw_ssh_mode_setup() {
+    print_header "SSH 防火墙模式 / 1Panel 兼容迁移"
+    echo "  当前模式：$(fw_ssh_mode_label)"
+    fw_ssh_mode_choose || return 1
+    fw_ssh_mode_apply "$QUENCH_SSH_FIREWALL_CHOICE"
+}
+
 fw_running() {
     local TYPE="$1"
     case "$TYPE" in
-        ufw) LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active' && echo active || echo inactive ;;
+        ufw) LC_ALL=C ufw status 2>/dev/null | grep -F 'Status: active' >/dev/null && echo active || echo inactive ;;
         firewalld) svc_is_active firewalld && echo active || echo inactive ;;
         conflict) echo conflict ;;
         *) echo none ;;
@@ -113,13 +247,14 @@ fw_warn_environment() {
 }
 
 fw_ufw_allow_ssh() {
-    local PORT PORTS COUNT=0
+    local PORT PORTS MODE COUNT=0
+    MODE=$(fw_ssh_mode_get) || return 1
     PORTS=$(ssh_effective_ports)
     [ -n "$PORTS" ] || { error "无法确定 SSH 端口，拒绝启用 UFW"; return 1; }
     while IFS= read -r PORT; do
         [ -n "$PORT" ] || continue
-        ufw limit "${PORT}/tcp" >/dev/null 2>&1 \
-            || { error "ufw 无法限速放行 SSH ${PORT}/tcp"; return 1; }
+        fw_ufw_set_ssh_port "$PORT" "$MODE" \
+            || { error "ufw 无法按 $MODE 模式放行 SSH ${PORT}/tcp"; return 1; }
         COUNT=$((COUNT + 1))
     done <<< "$PORTS"
     [ "$COUNT" -gt 0 ]
@@ -159,8 +294,12 @@ fw_allow_web_ports() {
 }
 
 fw_install() {
-    local TYPE="$1" WEB_CONFIRM=n MODE=offline ZONE PORT
+    local TYPE="$1" WEB_CONFIRM=n MODE=offline ZONE PORT SSH_MODE
     print_header "安装并配置防火墙"
+    if [ "$TYPE" = ufw ]; then
+        fw_ssh_mode_choose || return 1
+        SSH_MODE="$QUENCH_SSH_FIREWALL_CHOICE"
+    fi
     fw_warn_environment
     echo -e "  ${BOLD}必须放行：${NC}SSH $(ssh_effective_ports_csv)/tcp"
     read -rp "  这台机器是否对外提供 HTTP/HTTPS？(y/N): " WEB_CONFIRM || WEB_CONFIRM=n
@@ -170,6 +309,8 @@ fw_install() {
     safety_arm "${TYPE}_install" || return 1
     case "$TYPE" in
         ufw)
+            fw_ssh_mode_save "$SSH_MODE" \
+                || { safety_rollback_after_failure; error "无法保存 SSH 防火墙模式"; return 1; }
             # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
             ufw default deny incoming >/dev/null 2>&1 \
                 && ufw default allow outgoing >/dev/null 2>&1 \
@@ -184,8 +325,8 @@ fw_install() {
             ufw --force enable >/dev/null 2>&1 && [ "$(fw_running ufw)" = active ] \
                 || { safety_rollback_after_failure; error "UFW 启用失败"; return 1; }
             while IFS= read -r PORT; do
-                LC_ALL=C ufw status 2>/dev/null | grep -Eq "${PORT}/tcp.*LIMIT" \
-                    || { error "UFW 启用后未找到 SSH ${PORT}/tcp 限速规则"; return 1; }
+                fw_ufw_ssh_rule_ready "$PORT" "$SSH_MODE" \
+                    || { safety_rollback_after_failure; error "UFW 启用后 SSH ${PORT}/tcp 规则验证失败"; return 1; }
             done < <(ssh_effective_ports)
             ;;
         firewalld)
@@ -318,13 +459,18 @@ ufw_allow_ip() {
 }
 
 ufw_quick_allow() {
-    local CONFIRM
+    local CONFIRM PORT MODE
     print_header "快速放行 Web 服务 — UFW"
     echo -e "  将保证 SSH $(ssh_effective_ports_csv)/tcp，并放行 80/tcp、443/tcp"
     read -rp "  确认？(y/N): " CONFIRM
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || return
+    MODE=$(fw_ssh_mode_get) || return 1
+    fw_ufw_allow_ssh || return 1
+    while IFS= read -r PORT; do
+        fw_ufw_ssh_rule_ready "$PORT" "$MODE" || return 1
+    done < <(ssh_effective_ports)
     # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
-    fw_ufw_allow_ssh && fw_allow_web_ports ufw \
+    fw_allow_web_ports ufw \
         && info "SSH / HTTP / HTTPS 已放行 ✓" || error "放行失败"
 }
 
@@ -463,15 +609,17 @@ ufw_menu() {
         STATUS=$(fw_running ufw); [ "$STATUS" = active ] && ST_COLOR="$GREEN" || ST_COLOR="$RED"
         print_header "防火墙管理 — UFW"
         echo -e "  服务状态: ${ST_COLOR}${BOLD}${STATUS}${NC}"
+        echo "  SSH 模式: $(fw_ssh_mode_label)"
         # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
         [ "$STATUS" = active ] && menu_item "1" "关闭防火墙" "$YELLOW" || menu_item "1" "开启防火墙"
         menu_pair "2" "查看规则" "3" "添加端口"
         menu_pair "4" "删除端口" "5" "拉黑 IP"
         menu_pair "6" "放行来源 IP" "7" "删除 IP 规则"
         menu_item "8" "快速放行 SSH + Web"
+        menu_item "p" "SSH 防火墙模式 / 1Panel 兼容迁移"
         menu_pair "u" "安装 / 修复" "9" "安全卸载 UFW" "$CYAN" "$YELLOW"
         menu_pair "0" "返回主菜单" "00" "退出脚本" "$RED" "$RED"
-        read -rp "$(ui_prompt '选择操作 [0-9 / u]: ')" CH
+        read -rp "$(ui_prompt '选择操作 [0-9 / p / u]: ')" CH
         case "$CH" in 1|3|4|5|6|7|8) safety_arm ufw || continue ;; esac
         case "$CH" in
             1)
@@ -488,6 +636,7 @@ ufw_menu() {
             6) ufw_allow_ip || OK=false ;;
             7) ufw_del_ip || OK=false ;;
             8) ufw_quick_allow || OK=false ;;
+            p|P) fw_ssh_mode_setup; OK=false ;;
             u|U) fw_install ufw; OK=false ;;
             9) fw_uninstall ufw; return ;;
             0) return ;;

@@ -17,6 +17,9 @@ QUENCH_TXN_DIR="$TMP/transactions"
 QUENCH_TXN_LOCK_FILE="$TMP/quench-config.lock"
 # shellcheck source=/dev/null
 source "$ROOT/vps-quench.sh"
+QUENCH_SSH_FIREWALL_MODE_FILE="$TMP/ssh-firewall-mode"
+QUENCH_UFW_DEFAULTS_FILE="$TMP/ufw-defaults"
+printf 'IPV6=no\n' > "$QUENCH_UFW_DEFAULTS_FILE"
 # shellcheck source=lib/harness.sh
 source "$ROOT/tests/lib/harness.sh"
 
@@ -352,7 +355,7 @@ t_fi_009() {
         printf '%s\n' "$*" >> "$UFW_LOG"
         [ "$1 $2" != "limit 2222/tcp" ]
     }
-    fw_install ufw >/dev/null 2>&1 && { echo "UFW install succeeded after SSH allow failure" >&2; exit 1; }
+    fw_install ufw <<< $'1\nn' >/dev/null 2>&1 && { echo "UFW install succeeded after SSH allow failure" >&2; exit 1; }
     ! grep -q -- '--force enable' "$UFW_LOG" || { echo "UFW was enabled without its SSH rule" >&2; sed 's/^/  /' "$UFW_LOG" >&2; exit 1; }
     :
 }
@@ -450,6 +453,7 @@ run_test "firewalld SSH rules must target the zone bound to the active interface
 # UFW installation must set explicit defaults, limit SSH, and keep web ports closed by default.
 t_fi_015() {
     UFW_LOG="$TMP/ufw-minimal.log"
+    UFW_LIMIT=false
     print_header() { :; }
     info() { :; }
     warn() { :; }
@@ -463,11 +467,15 @@ t_fi_015() {
     ufw() {
         printf '%s\n' "$*" >> "$UFW_LOG"
         case "$*" in
-            status) printf 'Status: active\n2222/tcp LIMIT IN Anywhere\n' ;;
+            status)
+                printf 'Status: active\n'
+                [ "$UFW_LIMIT" != true ] || printf '2222/tcp LIMIT IN Anywhere\n'
+                ;;
+            'limit 2222/tcp') UFW_LIMIT=true ;;
         esac
         return 0
     }
-    fw_install ufw </dev/null >/dev/null 2>&1 || { echo "Minimal UFW installation failed" >&2; exit 1; }
+    fw_install ufw <<< $'1\nn' >/dev/null 2>&1 || { echo "Minimal UFW installation failed" >&2; exit 1; }
     grep -qx 'default deny incoming' "$UFW_LOG" || { echo "UFW incoming default was not denied" >&2; exit 1; }
     grep -qx 'default allow outgoing' "$UFW_LOG" || { echo "UFW outgoing default was not allowed" >&2; exit 1; }
     grep -qx 'logging low' "$UFW_LOG" || { echo "UFW low logging was not enabled" >&2; exit 1; }
