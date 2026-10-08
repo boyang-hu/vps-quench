@@ -992,7 +992,7 @@ nft_rule_preflight() {
         local_port=$(nft_local_listener_conflicts "$p" "$ls" "$le" || true)
         if [ -n "$local_port" ]; then
             warn "本机已有 $p 服务监听端口 ${local_port}；转发会截获外部访问"
-            read -rp "  仍然继续？(y/N，默认N): " answer
+            ui_read_yes_no answer "  仍然继续？(y/N，默认N): " n || return 1
             echo "$answer" | grep -qiE '^y(es)?$' || return 1
         fi
     done < <(nft_protocols "$proto")
@@ -1101,7 +1101,7 @@ nft_add_rule_locked() {
         "$ts" "$te" "$map_mode" "$snat" "$acl" yes "$comment"
     [ "$snat" = preserve ] && warn "保留源 IP 模式要求落地机回程经过本线路机"
     warn "还需在云厂商安全组放行线路机监听端口；Quench 无法自动修改云防火墙"
-    read -rp "  确认添加？(Y/n，默认Y): " confirm
+    ui_read_yes_no confirm "  确认添加？(Y/n，默认Y): " y || return 1
     [ -z "$confirm" ] && confirm=y
     echo "$confirm" | grep -qiE '^y(es)?$' \
         || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; warn "已取消"; return; }
@@ -1222,7 +1222,7 @@ nft_edit_rule_locked() {
     [ "$enabled" = no ] || nft_rule_preflight "$family" "$proto" "$lip" "$ls" "$le" "$tip" "$ts" || return 1
     record="$rid|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment"
     echo ""; IFS='|' read -r -a fields <<< "$record"; nft_rule_summary "${fields[@]}"
-    read -rp "  确认修改？(Y/n，默认Y): " confirm
+    ui_read_yes_no confirm "  确认修改？(Y/n，默认Y): " y || return 1
     [ -z "$confirm" ] && confirm=y
     echo "$confirm" | grep -qiE '^y(es)?$' || return
 
@@ -1264,7 +1264,7 @@ nft_delete_rule_locked() {
     echo ""
     IFS='|' read -r -a fields <<< "$NFT_FOUND_RULE"
     nft_rule_summary "${fields[@]}"
-    read -rp "  确认删除？(y/N，默认N): " confirm
+    ui_read_yes_no confirm "  确认删除？(y/N，默认N): " n || return 1
     echo "$confirm" | grep -qiE '^y(es)?$' || return
     nft_lock_acquire || return 1
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)

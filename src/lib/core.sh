@@ -71,6 +71,31 @@ info()  { echo -e "  ${GREEN}✓${NC}  $1"; }
 warn()  { echo -e "  ${YELLOW}!${NC}  $1"; }
 error() { echo -e "  ${RED}×${NC}  $1"; }
 
+# 统一的二选一输入：返回 0 表示得到合法答案（目标变量为 y / n），
+# 返回 1 表示 EOF / 读取失败；不能把读取失败当作按 Enter 接受默认值。
+# 不启动、延长或取消任何回滚计时器，最终是否保留变更仍由原调用方验证。
+ui_read_yes_no() {
+    local QUENCH_YN_TARGET="$1" QUENCH_YN_PROMPT="$2" QUENCH_YN_DEFAULT="${3:-n}" QUENCH_YN_REPLY
+    [[ "$QUENCH_YN_TARGET" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
+    case "$QUENCH_YN_TARGET" in QUENCH_YN_*) return 1 ;; esac
+    printf -v "$QUENCH_YN_TARGET" '%s' ''
+    case "$QUENCH_YN_DEFAULT" in y|n) ;; *) error "确认提示的默认值必须是 y 或 n" >&2; return 1 ;; esac
+    while true; do
+        if ! IFS= read -r -p "$QUENCH_YN_PROMPT" QUENCH_YN_REPLY; then
+            warn "输入已结束或中断，本次确认未完成；不会自动接受默认值。" >&2
+            return 1
+        fi
+        # 与普通 read 一样接受首尾空白，但不接受 yy / y n / 任意前缀。
+        QUENCH_YN_REPLY="${QUENCH_YN_REPLY#"${QUENCH_YN_REPLY%%[![:space:]]*}"}"
+        QUENCH_YN_REPLY="${QUENCH_YN_REPLY%"${QUENCH_YN_REPLY##*[![:space:]]}"}"
+        case "${QUENCH_YN_REPLY:-$QUENCH_YN_DEFAULT}" in
+            [yY]|[yY][eE][sS]) printf -v "$QUENCH_YN_TARGET" '%s' y; return 0 ;;
+            [nN]|[nN][oO]) printf -v "$QUENCH_YN_TARGET" '%s' n; return 0 ;;
+            *) error "输入无效，请输入 y 或 n（也支持 yes / no），或按 Enter 使用提示中的默认值。" >&2 ;;
+        esac
+    done
+}
+
 audit_action() {
     local ACTION="$1" RESULT="${2:-INFO}" SOURCE_IP="local"
     [ -n "${SSH_CONNECTION:-}" ] && SOURCE_IP=$(echo "$SSH_CONNECTION" | awk '{print $1}')
@@ -397,7 +422,12 @@ safety_script_prologue() {
 SELF=$SCRIPT_Q
 MARKER="\$SELF.restoring"
 FAILED="\$SELF.failed"
+LOG="\$SELF.log"
+ROLLBACK_STEP="初始化恢复"
 ROLLBACK_SLEEP_PID=""
+rollback_note() { printf '%s %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" "\$*"; }
+rollback_step() { ROLLBACK_STEP="\$*"; rollback_note "STEP: \$*"; }
+rollback_fail() { RC=1; rollback_note "FAILED: \${*:-\$ROLLBACK_STEP}"; }
 rollback_cancel_wait() {
     [ -z "\$ROLLBACK_SLEEP_PID" ] || kill "\$ROLLBACK_SLEEP_PID" 2>/dev/null || true
     exit 0
@@ -405,7 +435,14 @@ rollback_cancel_wait() {
 rollback_finish() {
     trap - EXIT
     rm -f "\$MARKER"
-    if [ "\$1" -eq 0 ]; then rm -f "\$SELF"; else : > "\$FAILED"; fi
+    if [ "\$1" -eq 0 ]; then
+        rollback_note "RESULT: SUCCESS"
+        rm -f "\$SELF" "\$FAILED"
+    else
+        rollback_note "RESULT: FAILED (last step: \$ROLLBACK_STEP)"
+        : > "\$FAILED"
+    fi
+    logger -t quench "回滚结束：\${SELF}，退出码 \${1}，日志：\$LOG" >/dev/null 2>&1 || true
     exit "\$1"
 }
 trap rollback_cancel_wait TERM INT
@@ -416,8 +453,15 @@ if [ "\${1:-}" != --now ]; then
 fi
 trap '' TERM INT
 : > "\$MARKER"
-rm -f "\$FAILED"
 trap 'rollback_finish 1' EXIT
+# 自动和手动执行都由脚本自己记录；外层重定向不再吞掉恢复现场。
+if (umask 077; : >> "\$LOG") && chmod 600 "\$LOG"; then
+    exec >> "\$LOG" 2>&1
+else
+    printf '无法写入回滚日志：%s；继续恢复，错误输出保留到终端 / 服务日志。\n' "\$LOG" >&2
+fi
+rm -f "\$FAILED"
+rollback_note "BEGIN: \$SELF"
 EOF
 }
 
@@ -1269,7 +1313,7 @@ firewall_allow_port() {
 
     echo ""
     warn "检测到活跃防火墙，是否自动放行新端口 ${PORT}/tcp？"
-    read -rp "  自动放行？(Y/n，默认Y): " FW_CONFIRM
+    ui_read_yes_no FW_CONFIRM "  自动放行？(Y/n，默认Y): " y || return 1
     FW_CONFIRM="${FW_CONFIRM:-y}"
     if ! echo "$FW_CONFIRM" | grep -qiE '^y(es)?$'; then
         if firewall_port_ready "$PORT"; then

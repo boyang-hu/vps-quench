@@ -105,7 +105,7 @@ delete_key_locked() {
     warn "即将删除以下公钥："
     echo -e "  ${RED}$(echo "$TARGET_LINE" | awk '{print $1, $3}')${NC}"
     echo ""
-    read -rp "  确认删除？(Y/n，默认Y): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认删除？(Y/n，默认Y): " y || return 1
     [ -z "${CONFIRM}" ] && CONFIRM="y"
     if ! echo "${CONFIRM}" | grep -qiE '^y(es)?$'; then warn "已取消"; return; fi
 
@@ -198,7 +198,11 @@ generate_key_locked() {
     menu_div
     echo ""
 
-    read -rp "  是否将公钥添加到本服务器？(Y/n，默认Y): " ADD_CONFIRM
+    ui_read_yes_no ADD_CONFIRM "  是否将公钥添加到本服务器？(Y/n，默认Y): " y || {
+        rm -rf "$TMP_DIR"
+        umask "$OLD_UMASK"
+        return 1
+    }
     [ -z "${ADD_CONFIRM}" ] && ADD_CONFIRM="y"
     if echo "${ADD_CONFIRM}" | grep -qiE '^y(es)?$'; then
         mkdir -p "$(dirname "$AUTH_FILE")"; chmod 700 "$(dirname "$AUTH_FILE")"
@@ -503,7 +507,7 @@ ssh_port_finalize_locked() {
         ssh_sync_fail2ban_ports "$OLD_PORT,$NEW_PORT" || true
         return 1
     fi
-    read -rp "  关闭旧端口 $OLD_PORT 的防火墙放行？(Y/n): " CLOSE_OLD
+    ui_read_yes_no CLOSE_OLD "  关闭旧端口 $OLD_PORT 的防火墙放行？(Y/n): " y || return 1
     CLOSE_OLD="${CLOSE_OLD:-y}"
     if echo "$CLOSE_OLD" | grep -qiE '^y(es)?$' && ! ssh_firewall_close_port "$OLD_PORT"; then
         error "旧端口防火墙规则未完全清理，迁移状态已保留以便重试"
@@ -537,7 +541,7 @@ ssh_port_rollback_locked() {
         ssh_restore_last_backup || true
         return 1
     fi
-    read -rp "  清理新端口 $NEW_PORT 的防火墙放行？(y/N): " CLOSE_NEW
+    ui_read_yes_no CLOSE_NEW "  清理新端口 $NEW_PORT 的防火墙放行？(y/N): " n || return 1
     if echo "$CLOSE_NEW" | grep -qiE '^y(es)?$' && ! ssh_firewall_close_port "$NEW_PORT"; then
         error "新端口防火墙规则未完全清理，迁移状态已保留以便重试"
         return 1
@@ -576,7 +580,7 @@ change_port_locked() {
     [ "$INPUT_PORT" != "$CURRENT_PORT" ] || { warn "端口没有变化"; return; }
     ssh_port_listening "$INPUT_PORT" && { error "端口 $INPUT_PORT 已被其他服务监听"; return 1; }
     warn "请先在云厂商安全组放行 TCP ${INPUT_PORT}；旧端口 ${CURRENT_PORT} 暂时不会关闭。"
-    read -rp "  已放行并继续？(y/N): " CHOICE
+    ui_read_yes_no CHOICE "  已放行并继续？(y/N): " n || return 1
     echo "$CHOICE" | grep -qiE '^y(es)?$' || return
     firewall_allow_port "$INPUT_PORT" || return 1
     if ! ssh_apply_ports "SSH 双端口迁移 $CURRENT_PORT + $INPUT_PORT" "$CURRENT_PORT" "$INPUT_PORT"; then
@@ -611,7 +615,7 @@ change_port_locked() {
     fi
     info "SSH 现同时监听 $CURRENT_PORT 和 $INPUT_PORT ✓"
     echo -e "  请保持当前连接，并新开终端测试：${BOLD}ssh -p $INPUT_PORT 用户名@服务器IP${NC}"
-    read -rp "  已测试成功，现在完成切换？(y/N): " TEST_NOW
+    ui_read_yes_no TEST_NOW "  已测试成功，现在完成切换？(y/N): " n || return 1
     echo "$TEST_NOW" | grep -qiE '^y(es)?$' && ssh_port_finalize
 }
 

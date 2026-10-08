@@ -71,6 +71,31 @@ info()  { echo -e "  ${GREEN}✓${NC}  $1"; }
 warn()  { echo -e "  ${YELLOW}!${NC}  $1"; }
 error() { echo -e "  ${RED}×${NC}  $1"; }
 
+# 统一的二选一输入：返回 0 表示得到合法答案（目标变量为 y / n），
+# 返回 1 表示 EOF / 读取失败；不能把读取失败当作按 Enter 接受默认值。
+# 不启动、延长或取消任何回滚计时器，最终是否保留变更仍由原调用方验证。
+ui_read_yes_no() {
+    local QUENCH_YN_TARGET="$1" QUENCH_YN_PROMPT="$2" QUENCH_YN_DEFAULT="${3:-n}" QUENCH_YN_REPLY
+    [[ "$QUENCH_YN_TARGET" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
+    case "$QUENCH_YN_TARGET" in QUENCH_YN_*) return 1 ;; esac
+    printf -v "$QUENCH_YN_TARGET" '%s' ''
+    case "$QUENCH_YN_DEFAULT" in y|n) ;; *) error "确认提示的默认值必须是 y 或 n" >&2; return 1 ;; esac
+    while true; do
+        if ! IFS= read -r -p "$QUENCH_YN_PROMPT" QUENCH_YN_REPLY; then
+            warn "输入已结束或中断，本次确认未完成；不会自动接受默认值。" >&2
+            return 1
+        fi
+        # 与普通 read 一样接受首尾空白，但不接受 yy / y n / 任意前缀。
+        QUENCH_YN_REPLY="${QUENCH_YN_REPLY#"${QUENCH_YN_REPLY%%[![:space:]]*}"}"
+        QUENCH_YN_REPLY="${QUENCH_YN_REPLY%"${QUENCH_YN_REPLY##*[![:space:]]}"}"
+        case "${QUENCH_YN_REPLY:-$QUENCH_YN_DEFAULT}" in
+            [yY]|[yY][eE][sS]) printf -v "$QUENCH_YN_TARGET" '%s' y; return 0 ;;
+            [nN]|[nN][oO]) printf -v "$QUENCH_YN_TARGET" '%s' n; return 0 ;;
+            *) error "输入无效，请输入 y 或 n（也支持 yes / no），或按 Enter 使用提示中的默认值。" >&2 ;;
+        esac
+    done
+}
+
 audit_action() {
     local ACTION="$1" RESULT="${2:-INFO}" SOURCE_IP="local"
     [ -n "${SSH_CONNECTION:-}" ] && SOURCE_IP=$(echo "$SSH_CONNECTION" | awk '{print $1}')
@@ -397,7 +422,12 @@ safety_script_prologue() {
 SELF=$SCRIPT_Q
 MARKER="\$SELF.restoring"
 FAILED="\$SELF.failed"
+LOG="\$SELF.log"
+ROLLBACK_STEP="初始化恢复"
 ROLLBACK_SLEEP_PID=""
+rollback_note() { printf '%s %s\n' "\$(date '+%Y-%m-%d %H:%M:%S')" "\$*"; }
+rollback_step() { ROLLBACK_STEP="\$*"; rollback_note "STEP: \$*"; }
+rollback_fail() { RC=1; rollback_note "FAILED: \${*:-\$ROLLBACK_STEP}"; }
 rollback_cancel_wait() {
     [ -z "\$ROLLBACK_SLEEP_PID" ] || kill "\$ROLLBACK_SLEEP_PID" 2>/dev/null || true
     exit 0
@@ -405,7 +435,14 @@ rollback_cancel_wait() {
 rollback_finish() {
     trap - EXIT
     rm -f "\$MARKER"
-    if [ "\$1" -eq 0 ]; then rm -f "\$SELF"; else : > "\$FAILED"; fi
+    if [ "\$1" -eq 0 ]; then
+        rollback_note "RESULT: SUCCESS"
+        rm -f "\$SELF" "\$FAILED"
+    else
+        rollback_note "RESULT: FAILED (last step: \$ROLLBACK_STEP)"
+        : > "\$FAILED"
+    fi
+    logger -t quench "回滚结束：\${SELF}，退出码 \${1}，日志：\$LOG" >/dev/null 2>&1 || true
     exit "\$1"
 }
 trap rollback_cancel_wait TERM INT
@@ -416,8 +453,15 @@ if [ "\${1:-}" != --now ]; then
 fi
 trap '' TERM INT
 : > "\$MARKER"
-rm -f "\$FAILED"
 trap 'rollback_finish 1' EXIT
+# 自动和手动执行都由脚本自己记录；外层重定向不再吞掉恢复现场。
+if (umask 077; : >> "\$LOG") && chmod 600 "\$LOG"; then
+    exec >> "\$LOG" 2>&1
+else
+    printf '无法写入回滚日志：%s；继续恢复，错误输出保留到终端 / 服务日志。\n' "\$LOG" >&2
+fi
+rm -f "\$FAILED"
+rollback_note "BEGIN: \$SELF"
 EOF
 }
 
@@ -1269,7 +1313,7 @@ firewall_allow_port() {
 
     echo ""
     warn "检测到活跃防火墙，是否自动放行新端口 ${PORT}/tcp？"
-    read -rp "  自动放行？(Y/n，默认Y): " FW_CONFIRM
+    ui_read_yes_no FW_CONFIRM "  自动放行？(Y/n，默认Y): " y || return 1
     FW_CONFIRM="${FW_CONFIRM:-y}"
     if ! echo "$FW_CONFIRM" | grep -qiE '^y(es)?$'; then
         if firewall_port_ready "$PORT"; then
@@ -1424,7 +1468,7 @@ delete_key_locked() {
     warn "即将删除以下公钥："
     echo -e "  ${RED}$(echo "$TARGET_LINE" | awk '{print $1, $3}')${NC}"
     echo ""
-    read -rp "  确认删除？(Y/n，默认Y): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认删除？(Y/n，默认Y): " y || return 1
     [ -z "${CONFIRM}" ] && CONFIRM="y"
     if ! echo "${CONFIRM}" | grep -qiE '^y(es)?$'; then warn "已取消"; return; fi
 
@@ -1517,7 +1561,11 @@ generate_key_locked() {
     menu_div
     echo ""
 
-    read -rp "  是否将公钥添加到本服务器？(Y/n，默认Y): " ADD_CONFIRM
+    ui_read_yes_no ADD_CONFIRM "  是否将公钥添加到本服务器？(Y/n，默认Y): " y || {
+        rm -rf "$TMP_DIR"
+        umask "$OLD_UMASK"
+        return 1
+    }
     [ -z "${ADD_CONFIRM}" ] && ADD_CONFIRM="y"
     if echo "${ADD_CONFIRM}" | grep -qiE '^y(es)?$'; then
         mkdir -p "$(dirname "$AUTH_FILE")"; chmod 700 "$(dirname "$AUTH_FILE")"
@@ -1822,7 +1870,7 @@ ssh_port_finalize_locked() {
         ssh_sync_fail2ban_ports "$OLD_PORT,$NEW_PORT" || true
         return 1
     fi
-    read -rp "  关闭旧端口 $OLD_PORT 的防火墙放行？(Y/n): " CLOSE_OLD
+    ui_read_yes_no CLOSE_OLD "  关闭旧端口 $OLD_PORT 的防火墙放行？(Y/n): " y || return 1
     CLOSE_OLD="${CLOSE_OLD:-y}"
     if echo "$CLOSE_OLD" | grep -qiE '^y(es)?$' && ! ssh_firewall_close_port "$OLD_PORT"; then
         error "旧端口防火墙规则未完全清理，迁移状态已保留以便重试"
@@ -1856,7 +1904,7 @@ ssh_port_rollback_locked() {
         ssh_restore_last_backup || true
         return 1
     fi
-    read -rp "  清理新端口 $NEW_PORT 的防火墙放行？(y/N): " CLOSE_NEW
+    ui_read_yes_no CLOSE_NEW "  清理新端口 $NEW_PORT 的防火墙放行？(y/N): " n || return 1
     if echo "$CLOSE_NEW" | grep -qiE '^y(es)?$' && ! ssh_firewall_close_port "$NEW_PORT"; then
         error "新端口防火墙规则未完全清理，迁移状态已保留以便重试"
         return 1
@@ -1895,7 +1943,7 @@ change_port_locked() {
     [ "$INPUT_PORT" != "$CURRENT_PORT" ] || { warn "端口没有变化"; return; }
     ssh_port_listening "$INPUT_PORT" && { error "端口 $INPUT_PORT 已被其他服务监听"; return 1; }
     warn "请先在云厂商安全组放行 TCP ${INPUT_PORT}；旧端口 ${CURRENT_PORT} 暂时不会关闭。"
-    read -rp "  已放行并继续？(y/N): " CHOICE
+    ui_read_yes_no CHOICE "  已放行并继续？(y/N): " n || return 1
     echo "$CHOICE" | grep -qiE '^y(es)?$' || return
     firewall_allow_port "$INPUT_PORT" || return 1
     if ! ssh_apply_ports "SSH 双端口迁移 $CURRENT_PORT + $INPUT_PORT" "$CURRENT_PORT" "$INPUT_PORT"; then
@@ -1930,7 +1978,7 @@ change_port_locked() {
     fi
     info "SSH 现同时监听 $CURRENT_PORT 和 $INPUT_PORT ✓"
     echo -e "  请保持当前连接，并新开终端测试：${BOLD}ssh -p $INPUT_PORT 用户名@服务器IP${NC}"
-    read -rp "  已测试成功，现在完成切换？(y/N): " TEST_NOW
+    ui_read_yes_no TEST_NOW "  已测试成功，现在完成切换？(y/N): " n || return 1
     echo "$TEST_NOW" | grep -qiE '^y(es)?$' && ssh_port_finalize
 }
 
@@ -2511,9 +2559,9 @@ user_create_locked() {
         warn "用户已创建，但管理员授权失败"
         return 1
     fi
-    read -rp "  现在设置密码？(y/N): " SET_PASSWORD
+    ui_read_yes_no SET_PASSWORD "  现在设置密码？(y/N): " n || return 1
     echo "$SET_PASSWORD" | grep -qiE '^y(es)?$' && user_set_password "$USERNAME"
-    read -rp "  现在添加 SSH 公钥？(Y/n): " ADD_KEY
+    ui_read_yes_no ADD_KEY "  现在添加 SSH 公钥？(Y/n): " y || return 1
     ADD_KEY="${ADD_KEY:-y}"
     if echo "$ADD_KEY" | grep -qiE '^y(es)?$'; then
         local AUTH_FILE
@@ -2559,7 +2607,7 @@ user_admin_manage_locked() {
                 fi
                 ;;
             2)
-                read -rp "  关闭 $USERNAME 的 Quench 免密 sudo？(Y/n): " CONFIRM
+                ui_read_yes_no CONFIRM "  关闭 $USERNAME 的 Quench 免密 sudo？(Y/n): " y || return 1
                 CONFIRM="${CONFIRM:-y}"
                 echo "$CONFIRM" | grep -qiE '^y(es)?$' && user_nopasswd_disable "$USERNAME"
                 ;;
@@ -2644,7 +2692,7 @@ user_delete_locked() {
     pgrep -u "$USERNAME" >/dev/null 2>&1 && warn "该用户仍有运行中的进程，删除可能失败"
     read -rp "  输入用户名 $USERNAME 确认删除: " TOKEN
     [ "$TOKEN" = "$USERNAME" ] || { warn "确认不匹配，已取消"; return; }
-    read -rp "  同时删除家目录 $(user_home "$USERNAME")？(y/N): " REMOVE_HOME
+    ui_read_yes_no REMOVE_HOME "  同时删除家目录 $(user_home "$USERNAME")？(y/N): " n || return 1
     if command -v userdel >/dev/null 2>&1; then
         if echo "$REMOVE_HOME" | grep -qiE '^y(es)?$'; then userdel -r "$USERNAME"; else userdel "$USERNAME"; fi
     elif command -v deluser >/dev/null 2>&1; then
@@ -2698,7 +2746,7 @@ user_recommended_wizard() {
     echo "  4. 可选迁移 SSH 端口"
     echo "  5. 禁止 root SSH 和密码认证"
     echo ""
-    read -rp "  开始向导？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  开始向导？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || return
     CREATED_USER=""
     user_create yes || return
@@ -2707,7 +2755,7 @@ user_recommended_wizard() {
     warn "请保持当前窗口，并在另一个终端以 $ADMIN 登录后执行 sudo -v"
     read -rp "  测试成功后输入管理员用户名 $ADMIN: " CONFIRM
     [ "$CONFIRM" = "$ADMIN" ] || { warn "未确认，未修改 SSH 策略"; return; }
-    read -rp "  是否迁移 SSH 端口？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  是否迁移 SSH 端口？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' && change_port
     ssh_apply_recommended_policy "$ADMIN"
 }
@@ -3440,7 +3488,7 @@ quench_rename_change() (
             [ "$OLD" != "$ACTOR" ] || { error "请先创建临时维护账号并切换登录；不能给当前登录账号改名"; return 1; }
             read -rp "新用户名（回车取消）: " NEW || return 0
             [ -n "$NEW" ] || return 0
-            read -rp "同时将标准家目录 /home/$OLD 改为 /home/${NEW}？(Y/n): " MOVE || return 0
+            ui_read_yes_no MOVE "同时将标准家目录 /home/$OLD 改为 /home/${NEW}？(Y/n): " y || return 0
             case "$MOVE" in ''|y|Y) MOVE=yes ;; n|N) MOVE=no ;; *) error "无效选择"; return 1 ;; esac
             PLAN=$(quench_rename_engine plan "$OLD" "$NEW" "$MOVE" "$ACTOR") || return 1
             printf '%s\n' "$PLAN"
@@ -4201,7 +4249,7 @@ f2b_edit_config_locked() {
         fi
         return 1
     fi
-    read -rp "  验证通过，是否重启 Fail2ban？(Y/n): " RESTART
+    ui_read_yes_no RESTART "  验证通过，是否重启 Fail2ban？(Y/n): " y || return 1
     RESTART="${RESTART:-y}"
     if echo "$RESTART" | grep -qiE '^y(es)?$'; then
         if ! restart_fail2ban || ! f2b_shared_effective_check yes; then
@@ -4226,7 +4274,7 @@ f2b_uninstall() {
     print_header "卸载 Fail2ban"
     local CONFIRM
     warn "卸载会停止动态封禁；默认保留所有配置，方便恢复"
-    read -rp "  确认卸载？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认卸载？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     stop_fail2ban >/dev/null 2>&1 || true
     svc_disable fail2ban >/dev/null 2>&1 || true
@@ -4736,7 +4784,7 @@ bbr_restore_sysctl_locked() {
         0) rm -f "$LIST_FILE"; return ;;
         00) rm -f "$LIST_FILE"; safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         d|D)
-            read -rp "  确认清除全部 ${TOTAL} 个备份？(Y/n，默认Y): " C
+            ui_read_yes_no C "  确认清除全部 ${TOTAL} 个备份？(Y/n，默认Y): " y || return 1
             [ -z "$C" ] && C="y"
             if echo "$C" | grep -qiE '^y(es)?$'; then
                 rm -f "${SYSCTL_FILE}.bak."*
@@ -4784,7 +4832,7 @@ bbr_restore_initial_baseline_locked() {
     echo -e "  将恢复首次运行本模块前保存的 sysctl，并移除本工具的持久化配置。"
     echo -e "  ${YELLOW}注意：这会覆盖其他工具后来对同名 sysctl 的修改。${NC}"
     local ANSWER FAILED=0
-    read -rp "  确认继续？(y/N，默认N): " ANSWER
+    ui_read_yes_no ANSWER "  确认继续？(y/N，默认N): " n || return 1
     [ -n "$ANSWER" ] || ANSWER=n
     echo "$ANSWER" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
 
@@ -4801,12 +4849,12 @@ bbr_restore_initial_baseline_locked() {
     fi
 
     if [ -s "$TC_STATE_FILE" ] || [ -e "$TC_HELPER" ] || [ -e "$SERVICE_TC" ] || [ -e "$SERVICE_TC_INIT" ]; then
-        read -rp "  同时取消本工具的 tc 出口整形？(Y/n，默认Y): " ANSWER
+        ui_read_yes_no ANSWER "  同时取消本工具的 tc 出口整形？(Y/n，默认Y): " y || return 1
         [ -n "$ANSWER" ] || ANSWER=y
         echo "$ANSWER" | grep -qiE '^y(es)?$' && bbr_remove_tc || true
     fi
     if [ -s "$CWND_STATE_FILE" ] || [ -e "$CWND_HELPER" ] || [ -e "$SERVICE_CWND" ] || [ -e "$SERVICE_CWND_INIT" ]; then
-        read -rp "  同时恢复 initcwnd/initrwnd 内核默认？(Y/n，默认Y): " ANSWER
+        ui_read_yes_no ANSWER "  同时恢复 initcwnd/initrwnd 内核默认？(Y/n，默认Y): " y || return 1
         [ -n "$ANSWER" ] || ANSWER=y
         echo "$ANSWER" | grep -qiE '^y(es)?$' && bbr_remove_initcwnd || true
     fi
@@ -4884,7 +4932,7 @@ bbr_apply_sysctl_locked() {
             if [ "$STALE_MODE" = baseline ]; then
                 DORST="y"
             else
-                read -rp "  是否恢复这些残留参数到首次调优前基线？(y/N，默认N): " DORST
+                ui_read_yes_no DORST "  是否恢复这些残留参数到首次调优前基线？(y/N，默认N): " n || return 1
                 [ -z "$DORST" ] && DORST="n"
             fi
             if echo "$DORST" | grep -qiE '^y(es)?$'; then
@@ -6079,7 +6127,7 @@ bbr_check_limitnofile() {
             echo ""
             warn "检测到代理服务 ${svc}.service 的 LimitNOFILE=${CUR} 偏低"
             echo -e "  ${DIM}fs.file-max 已抬高，但单进程 fd 上限受 systemd LimitNOFILE 限制${NC}"
-            read -rp "  是否为 ${svc} 写入 LimitNOFILE=1048576 的 drop-in？(y/N，默认N): " DOLN
+            ui_read_yes_no DOLN "  是否为 ${svc} 写入 LimitNOFILE=1048576 的 drop-in？(y/N，默认N): " n || return 1
             [ -z "$DOLN" ] && DOLN="n"
             if echo "$DOLN" | grep -qiE '^y(es)?$'; then
                 local DROPDIR="/etc/systemd/system/${svc}.service.d"
@@ -6095,7 +6143,7 @@ bbr_check_limitnofile() {
 
 bbr_kernel_forwarding_confirm() {
     local ANSWER
-    read -rp "  是否启用内核 IPv4/IPv6 转发？仅路由或 NAT 需要 (y/N，默认N): " ANSWER
+    ui_read_yes_no ANSWER "  是否启用内核 IPv4/IPv6 转发？仅路由或 NAT 需要 (y/N，默认N): " n || return 1
     [ -z "$ANSWER" ] && ANSWER="n"
     echo "$ANSWER" | grep -qiE '^y(es)?$'
 }
@@ -6130,7 +6178,7 @@ bbr_confirm_apply() {
 
     # 先提示备份（默认Y）
     if [ -f "$SYSCTL_FILE" ]; then
-        read -rp "  备份当前 sysctl 配置？(Y/n，默认Y): " DO_BAK
+        ui_read_yes_no DO_BAK "  备份当前 sysctl 配置？(Y/n，默认Y): " y || return 1
         [ -z "$DO_BAK" ] && DO_BAK="y"
         if echo "$DO_BAK" | grep -qiE '^y(es)?$' && ! bbr_backup_sysctl; then
             error "无法安全备份，已取消应用"
@@ -6138,7 +6186,7 @@ bbr_confirm_apply() {
         fi
         echo ""
     fi
-    read -rp "  确认应用以上配置？(Y/n，默认Y): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认应用以上配置？(Y/n，默认Y): " y || return 1
     [ -z "${CONFIRM}" ] && CONFIRM="y"
     if ! echo "${CONFIRM}" | grep -qiE '^y(es)?$'; then warn "已取消"; return; fi
 
@@ -6421,7 +6469,7 @@ bbr_menu_manual() {
     BUFFER_CAP=$(bbr_buffer_cap_bytes "$MEM_MB" "$PROFILE") || return 1
     if [ "$RMEM" -gt "$BUFFER_CAP" ]; then
         warn "缓冲区 ${BUF_LBL}MB 超过 ${SCENE_LABEL} 的建议内存预算，高并发时可能造成内存压力"
-        read -rp "  是否继续？(y/N，默认N): " GO
+        ui_read_yes_no GO "  是否继续？(y/N，默认N): " n || return 1
         [ -z "$GO" ] && GO="n"
         echo "$GO" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     fi
@@ -6990,7 +7038,7 @@ bbr_calibration_run() {
         bbr_calibration_write_result NO_KNEE "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$BEST_RECEIVER" || true
         bbr_calibration_finish || return 1
         if [ -s "$TC_STATE_FILE" ]; then
-            read -rp "  当前存在 Quench HTB 限速，是否取消？(y/N，默认N): " ANSWER
+            ui_read_yes_no ANSWER "  当前存在 Quench HTB 限速，是否取消？(y/N，默认N): " n || return 1
             [ -n "$ANSWER" ] || ANSWER=n
             echo "$ANSWER" | grep -qiE '^y(es)?$' && bbr_tc_remove_selected "$BBR_CAL_DEV"
         fi
@@ -7107,7 +7155,7 @@ bbr_calibration_run() {
     echo ""
     info "实测干净上限 ${KNEE}Mbps，下一档 ${BROKE_AT}Mbps 出现重传跳变"
     echo -e "  建议退让 ${BOLD}${MARGIN}Mbps${NC} → HTB ${GREEN}${BOLD}${RECOMMEND}Mbps${NC}"
-    read -rp "  是否应用建议整形值？(Y/n，默认Y): " ANSWER
+    ui_read_yes_no ANSWER "  是否应用建议整形值？(Y/n，默认Y): " y || return 1
     [ -n "$ANSWER" ] || ANSWER=y
     echo "$ANSWER" | grep -qiE '^y(es)?$' || { warn "已保留测量结果，未修改持久化整形"; return; }
     bbr_tc_apply_selected_rate "$BBR_CAL_DEV" "$RECOMMEND"
@@ -7117,7 +7165,7 @@ bbr_menu_calibration() {
     print_header "线路实测与 policer 拐点校准"
     [ "$(id -u)" -eq 0 ] || { error "线路校准需要 root 权限"; return 1; }
     if ! command -v iperf3 >/dev/null 2>&1; then
-        read -rp "  需要安装 iperf3，是否安装？(Y/n，默认Y): " INSTALL
+        ui_read_yes_no INSTALL "  需要安装 iperf3，是否安装？(Y/n，默认Y): " y || return 1
         [ -n "$INSTALL" ] || INSTALL=y
         echo "$INSTALL" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
         pkg_install iperf3 || { error "iperf3 安装失败，请手动安装后重试"; return 1; }
@@ -7150,7 +7198,7 @@ bbr_menu_calibration() {
     warn "校准会短暂替换出口 qdisc，并主动发送高带宽 TCP 流量"
     echo -e "  最坏流量估算：${YELLOW}${BOLD}约 ${ESTIMATE} GB${NC}  ${DIM}实际通常更低，按接口计数器复核${NC}"
     echo -e "  对端：${BOLD}${PEER}:${PORT}${NC} · IPv${FAMILY} · 标称 ${NOMINAL}Mbps · ${DURATION}s/档"
-    read -rp "  确认开始？(y/N，默认N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认开始？(y/N，默认N): " n || return 1
     [ -n "$CONFIRM" ] || CONFIRM=n
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     bbr_calibration_run "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$DURATION"
@@ -7363,7 +7411,7 @@ bbr_menu_tc() {
         00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         *) warn "无效选项"; return ;;
     esac
-    read -rp "  确认应用到 ${DEV}？(Y/n，默认Y): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认应用到 ${DEV}？(Y/n，默认Y): " y || return 1
     [ -n "$CONFIRM" ] || CONFIRM=y
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     bbr_tc_apply_selected_rate "$DEV" "$RATE"
@@ -7673,7 +7721,7 @@ bbr_menu_initcwnd_locked() {
         FAMILIES=6
     fi
 
-    read -rp "  同时设置高级 initrwnd？(y/N，默认N): " ANSWER
+    ui_read_yes_no ANSWER "  同时设置高级 initrwnd？(y/N，默认N): " n || return 1
     [ -n "$ANSWER" ] || ANSWER=n
     if echo "$ANSWER" | grep -qiE '^y(es)?$'; then
         read -rp "  initrwnd 值（回车与 initcwnd 相同）: " RWND
@@ -7907,7 +7955,7 @@ bbr_check_kernel() {
     # Alpine 上安装/切换内核包通常需要重启，交给用户确认后再动系统包。
     if command -v apk &>/dev/null; then
         warn "tcp_bbr 模块未加载。Alpine 可能需要安装/切换内核包并重启。"
-        read -rp "  尝试安装 linux-lts 或 linux-virt？(y/N，默认N): " APK_KERNEL
+        ui_read_yes_no APK_KERNEL "  尝试安装 linux-lts 或 linux-virt？(y/N，默认N): " n || return 1
         [ -z "$APK_KERNEL" ] && APK_KERNEL="n"
         if echo "$APK_KERNEL" | grep -qiE '^y(es)?$'; then
             apk add --no-cache linux-lts 2>/dev/null || apk add --no-cache linux-virt 2>/dev/null || true
@@ -8076,8 +8124,8 @@ bbr_measure_uint() {
 
 bbr_measure_yes() {
     local ANSWER
-    read -rp "  $1 " ANSWER || return 1
-    case "${ANSWER:-${2:-n}}" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+    ui_read_yes_no ANSWER "  $1 " "${2:-n}" || return 1
+    [ "$ANSWER" = y ]
 }
 
 bbr_measure_dependencies() {
@@ -8562,7 +8610,31 @@ fw_ufw_set_ssh_port() {
     fi
     # 普通 allow/limit 会原地替换同条件的另一动作；prepend/insert 会跳过它。
     # 不先删除当前规则，避免迁移现有 SSH 端口时出现放行空窗。
-    ufw "$ACTION" "$PORT/tcp" >/dev/null 2>&1
+    fw_ufw_run "$ACTION" "$PORT/tcp"
+}
+
+# 保留原始错误与具体命令。不能把 default / logging / allow 的失败合成一句
+# “基础策略失败”，更不能为了隐藏日志错误而跳过原始命令的退出状态。
+fw_ufw_run() {
+    local OUTPUT RC=0
+    OUTPUT=$(quench_mktemp) || { error "无法创建 UFW 输出临时文件，未执行命令"; return 1; }
+    LC_ALL=C ufw "$@" > "$OUTPUT" 2>&1 || RC=$?
+    if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ]; then
+        (
+            umask 077
+            {
+                printf '\n%s ufw %s (exit %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$RC"
+                cat "$OUTPUT"
+            } >> "$SAFETY_SCRIPT.apply.log"
+        ) || warn "无法保存 UFW 操作日志"
+    fi
+    if [ "$RC" -ne 0 ]; then
+        error "UFW 命令失败：ufw $*（退出码 ${RC}）"
+        tail -n 30 "$OUTPUT"
+        [ -z "${SAFETY_SCRIPT:-}" ] || warn "操作日志：$SAFETY_SCRIPT.apply.log"
+    fi
+    rm -f "$OUTPUT"
+    return "$RC"
 }
 
 fw_ssh_mode_apply() {
@@ -8749,7 +8821,7 @@ fw_allow_web_ports() {
     local TYPE="$1" MODE="${2:-online}" ZONE="${3:-public}" PORT
     for PORT in 80 443; do
         case "$TYPE:$MODE" in
-            ufw:*) ufw allow "${PORT}/tcp" >/dev/null 2>&1 || return 1 ;;
+            ufw:*) fw_ufw_run allow "${PORT}/tcp" || return 1 ;;
             firewalld:offline) firewall-offline-cmd --zone="$ZONE" --add-port="${PORT}/tcp" >/dev/null 2>&1 || return 1 ;;
             firewalld:online) firewall-cmd --permanent --zone="$ZONE" --add-port="${PORT}/tcp" >/dev/null 2>&1 || return 1 ;;
         esac
@@ -8768,7 +8840,7 @@ fw_install() {
     fi
     fw_warn_environment
     echo -e "  ${BOLD}必须放行：${NC}SSH $(ssh_effective_ports_csv)/tcp"
-    read -rp "  这台机器是否对外提供 HTTP/HTTPS？(y/N): " WEB_CONFIRM || WEB_CONFIRM=n
+    ui_read_yes_no WEB_CONFIRM "  这台机器是否对外提供 HTTP/HTTPS？(y/N): " n || return 1
     echo "$WEB_CONFIRM" | grep -qiE '^y(es)?$' && WEB_CONFIRM=y || WEB_CONFIRM=n
 
     pkg_install "$TYPE" || { error "安装 $TYPE 失败"; return 1; }
@@ -8777,18 +8849,21 @@ fw_install() {
         ufw)
             fw_ssh_mode_save "$SSH_MODE" \
                 || { safety_rollback_after_failure; error "无法保存 SSH 防火墙模式"; return 1; }
-            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
-            ufw default deny incoming >/dev/null 2>&1 \
-                && ufw default allow outgoing >/dev/null 2>&1 \
-                && ufw logging low >/dev/null 2>&1 \
-                && fw_ufw_allow_ssh \
-                || { safety_rollback_after_failure; error "UFW 基础策略写入失败，未启用"; return 1; }
+            # SSH 先放行；安装 / 修复可能面对的是已启用的 UFW，不能先改默认拒绝。
+            if ! fw_ufw_allow_ssh \
+                || ! fw_ufw_run default deny incoming \
+                || ! fw_ufw_run default allow outgoing \
+                || ! fw_ufw_run logging low; then
+                error "UFW 基础配置失败，停止后续启用步骤并请求恢复；原始错误见上方"
+                safety_rollback_after_failure
+                return 1
+            fi
             if [ "$WEB_CONFIRM" = y ] && ! fw_allow_web_ports ufw; then
                 safety_rollback_after_failure
                 error "HTTP/HTTPS 放行失败，未启用 UFW"
                 return 1
             fi
-            ufw --force enable >/dev/null 2>&1 && [ "$(fw_running ufw)" = active ] \
+            fw_ufw_run --force enable && [ "$(fw_running ufw)" = active ] \
                 || { safety_rollback_after_failure; error "UFW 启用失败"; return 1; }
             while IFS= read -r PORT; do
                 fw_ufw_ssh_rule_ready "$PORT" "$SSH_MODE" \
@@ -8928,7 +9003,7 @@ ufw_quick_allow() {
     local CONFIRM PORT MODE
     print_header "快速放行 Web 服务 — UFW"
     echo -e "  将保证 SSH $(ssh_effective_ports_csv)/tcp，并放行 80/tcp、443/tcp"
-    read -rp "  确认？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || return
     MODE=$(fw_ssh_mode_get) || return 1
     fw_ufw_allow_ssh || return 1
@@ -9038,7 +9113,7 @@ fwd_quick_allow() {
     local CONFIRM ZONE
     print_header "快速放行 Web 服务 — firewalld"
     echo -e "  将保证 SSH $(ssh_effective_ports_csv)/tcp，并放行 80/tcp、443/tcp"
-    read -rp "  确认？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || return
     ZONE=$(fw_firewalld_zone)
     # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
@@ -9051,7 +9126,7 @@ fw_uninstall() {
     print_header "卸载 $TYPE"
     warn "卸载会停止该防火墙，主机将交由云安全组或其他防火墙保护"
     warn "默认保留配置；不会 flush iptables/nftables，也不会删除其他管理器的规则"
-    read -rp "  确认卸载？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认卸载？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     case "$TYPE" in
         ufw) ufw --force disable >/dev/null 2>&1 || true; CONFIG_DIR=/etc/ufw ;;
@@ -13650,7 +13725,7 @@ ts_ntp_repair() {
                 systemctl restart systemd-timesyncd >/dev/null 2>&1 || { error "systemd-timesyncd 启动失败"; return 1; }
                 BACKEND=timesyncd
             else
-                read -rp "  未找到可用时间服务，是否安装 chrony？(Y/n，默认Y): " ANSWER
+                ui_read_yes_no ANSWER "  未找到可用时间服务，是否安装 chrony？(Y/n，默认Y): " y || return 1
                 ANSWER=${ANSWER:-y}
                 echo "$ANSWER" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
                 pkg_install chrony || { error "chrony 安装失败"; return 1; }
@@ -13699,7 +13774,7 @@ ts_set_timezone() {
     ts_timezone_syntax_valid "$ZONE" || { error "时区名称格式无效"; return 1; }
     if ! ts_timezone_valid "$ZONE"; then
         warn "系统缺少时区 ${ZONE}，可能尚未安装 tzdata"
-        read -rp "  是否安装 tzdata 后重试？(Y/n，默认Y): " ANSWER
+        ui_read_yes_no ANSWER "  是否安装 tzdata 后重试？(Y/n，默认Y): " y || return 1
         ANSWER=${ANSWER:-y}
         echo "$ANSWER" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
         pkg_install tzdata || { error "tzdata 安装失败"; return 1; }
@@ -13910,7 +13985,7 @@ ts_sync_https() {
     esac
     echo ""
     warn "直接调整系统时间可能影响日志、数据库、证书验证和正在运行的定时任务"
-    read -rp "  确认按 HTTPS 共识设置系统时间？(y/N，默认N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认按 HTTPS 共识设置系统时间？(y/N，默认N): " n || return 1
     echo "${CONFIRM:-n}" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     PAUSE_TOKEN=$(ts_pause_backend "$BACKEND") || { error "无法暂停当前时间同步后端"; return 1; }
     if ! date -u -s "$TARGET_UTC" >/dev/null 2>&1; then
@@ -14926,7 +15001,7 @@ config_backup_allowed_roots() {
     for p in \
         etc/hostname etc/hosts \
         etc/ssh/sshd_config etc/ssh/sshd_config.d root/.ssh/authorized_keys \
-        etc/fail2ban etc/ufw etc/firewalld etc/nftables.conf etc/nftables.d/quench-nft-forward.nft etc/quench/nft-forward etc/quench/ssh-firewall-mode \
+        etc/fail2ban etc/ufw etc/default/ufw etc/firewalld etc/nftables.conf etc/nftables.d/quench-nft-forward.nft etc/quench/nft-forward etc/quench/ssh-firewall-mode \
         etc/sysctl.conf etc/sysctl.d/98-vps-quench-network-security.conf etc/sysctl.d/98-quench-nft-forward.conf etc/sysctl.d/99-quench-bbr.conf etc/sysctl.d/99-quench-ipv6.conf \
         etc/systemd/system/quench-nft-forward.service etc/systemd/system/quench-nft-target-refresh.service etc/systemd/system/quench-nft-target-refresh.timer \
         etc/init.d/quench-nft-forward usr/local/libexec/quench-nft-forward-apply var/lib/quench/nft-forward \
@@ -14937,6 +15012,18 @@ config_backup_allowed_roots() {
         var/spool/cron/crontabs/root var/spool/cron/root etc/crontabs/root; do
         printf '%s\n' "$p"
     done
+}
+
+# 快照仍保留完整配置，但局部事务只恢复它真正修改的路径。
+# 特别是 SSH 登录策略不能覆盖公钥 / DNS / 防火墙；UFW 默认策略在 /etc/default/ufw。
+safety_scope_roots() {
+    case "$1" in
+        ssh_login) printf '%s\n' "${SSHD_CONFIG#/}" ;;
+        ufw|ufw_install|ssh_firewall_mode)
+            printf '%s\n' etc/ufw "${QUENCH_UFW_DEFAULTS_FILE#/}" "${QUENCH_SSH_FIREWALL_MODE_FILE#/}"
+            ;;
+        *) config_backup_allowed_roots ;;
+    esac
 }
 
 config_path_allowed() {
@@ -15191,7 +15278,8 @@ cancel_safety_timer() {
     fi
     if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ] && [ -f "${SAFETY_SCRIPT}.failed" ]; then
         error "自动回滚已执行但未成功，配置可能处于中间状态；回滚脚本与事务记录已保留：$SAFETY_SCRIPT"
-        error "请在回滚中心手动重新执行，或人工核对配置"
+        safety_rollback_failure_details "$SAFETY_SCRIPT"
+        error "请先核对失败步骤与当前配置，不要反复执行整套回滚"
         audit_action "自动回滚执行失败，等待人工处理" FAILED
         return 1
     fi
@@ -15231,6 +15319,27 @@ cancel_safety_timer() {
     txn_lock_release
 }
 
+# 旧脚本没有内建日志时也保存其未被内部重定向的错误；不改写旧脚本的恢复范围。
+safety_execute_rollback() (
+    local SCRIPT="$1"
+    if (umask 077; : >> "$SCRIPT.log") && chmod 600 "$SCRIPT.log"; then
+        bash "$SCRIPT" --now >> "$SCRIPT.log" 2>&1
+    else
+        warn "无法写入回滚日志，继续恢复并直接显示输出：$SCRIPT.log"
+        bash "$SCRIPT" --now
+    fi
+)
+
+safety_rollback_failure_details() {
+    local SCRIPT="$1"
+    if [ -f "$SCRIPT.log" ] && [ -s "$SCRIPT.log" ]; then
+        error "回滚日志：$SCRIPT.log（末尾 20 行）"
+        tail -n 20 "$SCRIPT.log"
+    else
+        warn "未记录到详细错误：旧版回滚脚本可能隐藏了输出，或日志无法写入；请保留脚本和快照"
+    fi
+}
+
 # 立即执行回滚。顺序很重要，之前是反的：先删记录、放锁，再跑脚本，
 # 而且不管跑没跑成都把脚本删掉——一旦回滚失败，恢复材料全没了，
 # 上层还照着 safety_rollback_after_failure 的话术说“事务记录已保留”。
@@ -15247,11 +15356,11 @@ safety_rollback_now() {
         audit_action "立即回滚前停止计时器失败" FAILED
         return 1
     fi
-    if ! bash "$SCRIPT" --now >/dev/null 2>&1; then
-        RC=$?
-        [ "$RC" -ne 0 ] || RC=1
+    safety_execute_rollback "$SCRIPT" || RC=$?
+    if [ "$RC" -ne 0 ]; then
         audit_action "立即执行防断联回滚失败" FAILED
         error "自动回滚执行失败，回滚脚本与事务记录已保留：$SCRIPT"
+        safety_rollback_failure_details "$SCRIPT"
         error "锁也保持持有，请立即检查当前 SSH 与网络配置"
         return "$RC"
     fi
@@ -15270,7 +15379,7 @@ confirm_change_preview() {
     echo -e "  ${BOLD}变更预览：$TITLE${NC}"
     while [ "$#" -gt 0 ]; do echo -e "  ${YELLOW}•${NC} $1"; shift; done
     menu_div
-    read -rp "  确认应用以上变更？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认应用以上变更？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$'
 }
 
@@ -15285,7 +15394,7 @@ confirm_file_diff() {
         warn "系统没有 diff，无法显示逐行差异"
     fi
     menu_div
-    read -rp "  确认应用以上配置？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认应用以上配置？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$'
 }
 
@@ -15441,7 +15550,8 @@ txn_pending_records() {
 # 机器可读状态：
 #   mine    = 本进程自己的记录（由 safety_confirm / cancel / rollback_now 处理）
 #   running = 另一个 Quench 会话仍活着
-#   armed   = 原会话已消失，但回滚脚本还在，计时器随时可能触发
+#   restoring / failed = 有恢复阶段 / 失败标记；不等于仍在倒计时
+#   armed   = 原会话已消失、没有阶段标记，脚本还在，计时器可能触发
 #   stale   = 回滚脚本已不存在，记录只剩残骸
 txn_record_state() {
     local FILE="$1" SCRIPT QPID
@@ -15451,6 +15561,10 @@ txn_record_state() {
         echo mine
     elif [ -n "$QPID" ] && kill -0 "$QPID" 2>/dev/null; then
         echo running
+    elif [ -n "$SCRIPT" ] && [ -f "$SCRIPT.restoring" ]; then
+        echo restoring
+    elif [ -n "$SCRIPT" ] && [ -f "$SCRIPT.failed" ]; then
+        echo failed
     elif [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ]; then
         echo armed
     else
@@ -15462,6 +15576,8 @@ txn_record_state_label() {
     case "$1" in
         mine)    echo "本次会话进行中" ;;
         running) echo "另一个 Quench 会话仍在运行" ;;
+        restoring) echo "恢复中或曾被中断（恢复标记未清除）" ;;
+        failed)  echo "回滚已失败，材料保留，请检查日志" ;;
         armed)   echo "回滚脚本仍在，可能仍会触发" ;;
         *)       echo "已失效（回滚脚本已消失）" ;;
     esac
@@ -15470,7 +15586,7 @@ txn_record_state_label() {
 # 开始新事务前核对磁盘上的遗留记录。锁只是进程内的 flock，会话断开即释放，
 # 但那一笔的 systemd 计时器仍在跑。若不核对就放行，新配置写完确认之后，
 # 旧回滚到期会把它覆盖回自己那份旧快照——这是最危险的一种交叉。
-# 只清理 stale（回滚脚本已消失）的记录；running / armed 一律阻断。
+# 只清理 stale；恢复中 / 失败记录也必须阻断新变更，不能当作已完成。
 txn_reconcile_stale() {
     local REC STATE LABEL BLOCKED=0
     while IFS= read -r REC; do
@@ -15490,6 +15606,11 @@ txn_reconcile_stale() {
                 error "它的自动回滚仍武装着，此时改配置会被它覆盖回旧快照"
                 error "请先在「回滚中心 → 检查未完成的变更」中处置"
                 ;;
+            failed|restoring)
+                BLOCKED=1
+                error "遗留变更 ${LABEL:-未知}：$(txn_record_state_label "$STATE")"
+                error "请先在「回滚中心 → 检查未完成的变更」中核对，不会自动删除恢复材料"
+                ;;
         esac
     done < <(txn_pending_records)
     [ "$BLOCKED" = 0 ]
@@ -15508,16 +15629,28 @@ txn_review_menu() {
             ui_pause
             return 0
         fi
-        ui_hint "这些记录来自没有正常收尾的会话（崩溃、断线或被强制结束）"
-        ui_hint "Quench 不会自动删除回滚脚本：它们可能仍会按时正常触发"
+        ui_hint "这些记录表示未确认、失败或中断的配置变更，请先核对状态与日志"
+        ui_hint "未结束的计时器仍可能触发；失败记录与恢复材料不会被自动删除"
         echo ""
         INDEX=1
         for FILE in "${FILES[@]}"; do
             LABEL=$(txn_record_field "$FILE" LABEL)
             STARTED=$(txn_record_field "$FILE" STARTED)
-            STATE=$(txn_record_state_label "$(txn_record_state "$FILE")")
+            STATE=$(txn_record_state "$FILE")
+            SCRIPT=$(txn_record_field "$FILE" SCRIPT)
+            case "$STATE" in
+                mine|running)
+                    STATE=$(txn_record_state_label "$STATE")
+                    if [ -f "$SCRIPT.restoring" ]; then
+                        STATE="${STATE}；$(txn_record_state_label restoring)"
+                    elif [ -f "$SCRIPT.failed" ]; then
+                        STATE="${STATE}；$(txn_record_state_label failed)"
+                    fi ;;
+                *) STATE=$(txn_record_state_label "$STATE") ;;
+            esac
             echo -e "  ${GREEN}[$INDEX]${NC} ${BOLD}${LABEL:-未知}${NC}"
             echo -e "      ${DIM}开始：${NC}${STARTED:-未知}   ${DIM}状态：${NC}${STATE}"
+            [ ! -f "$SCRIPT.log" ] || echo "      日志：$SCRIPT.log"
             INDEX=$((INDEX + 1))
         done
         echo ""; menu_div
@@ -15575,13 +15708,14 @@ txn_review_menu() {
                     ui_pause
                     continue
                 fi
-                if bash "$SCRIPT" --now >/dev/null 2>&1; then
+                if safety_execute_rollback "$SCRIPT"; then
                     rm -f "$FILE"
                     audit_action "手动执行遗留回滚 $(basename "$FILE")" SUCCESS
                     info "回滚已执行 ✓"
                 else
                     audit_action "手动执行遗留回滚 $(basename "$FILE")" FAILED
                     error "回滚执行失败，请立即人工检查当前配置"
+                    safety_rollback_failure_details "$SCRIPT"
                 fi
                 [ "$HAD_LOCK" = 1 ] || txn_lock_release
                 ui_pause
@@ -15590,6 +15724,8 @@ txn_review_menu() {
                 REMOVED=0
                 for FILE in "${FILES[@]}"; do
                     SCRIPT=$(txn_record_field "$FILE" SCRIPT)
+                    # 即使脚本被外部移走，阶段标记仍代表未解决的失败，不能静默清理。
+                    [ ! -f "$SCRIPT.failed" ] && [ ! -f "$SCRIPT.restoring" ] || continue
                     if [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ]; then
                         continue
                     fi
@@ -15658,11 +15794,16 @@ safety_arm() {
 
 safety_arm_locked() {
     local LABEL="$1" SNAP SCRIPT UFW_STATE="inactive" FIREWALLD_STATE="inactive"
+    local SCOPE=full UFW_STATUS
     local DELAY="${SAFETY_DELAY_SECONDS:-180}" RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     local RESOLV_IMMUTABLE="inactive" PATH_VALUE TARGET ROOTS_Q="" ROOT_ITEM ROOT_ITEM_Q
     local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q PROLOGUE
     local SYSCTL_RUNTIME="" DNS_BACKEND="static" DNS_IFACE="" DNS_EXPECTED="" DNS_FN="" DNS_IFACE_Q RESOLV_FILE_Q
     shift
+    case "$LABEL" in
+        ssh_login) SCOPE=ssh_login ;;
+        ufw|ufw_install|ssh_firewall_mode) SCOPE=ufw ;;
+    esac
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
@@ -15687,7 +15828,7 @@ safety_arm_locked() {
     done
     # DNS 运行态：记下快照时的后端和实际生效的上游。回滚只恢复文件是不够的，
     # 后端不重新读取（resolvconf -u / 重启 resolved）实际 DNS 还是新值；恢复后按同一套逻辑核对。
-    if [ "$RESTORE_ROOT" = / ]; then
+    if [ "$RESTORE_ROOT" = / ] && [ "$SCOPE" = full ]; then
         DNS_BACKEND=$(dns_backend_detect 2>/dev/null || true)
         case "$DNS_BACKEND" in ''|*[!A-Za-z-]*) DNS_BACKEND=static ;; esac
         DNS_IFACE=$(dns_nm_default_iface 2>/dev/null || true)
@@ -15700,14 +15841,24 @@ safety_arm_locked() {
         [ -n "$ROOT_ITEM" ] || continue
         printf -v ROOT_ITEM_Q '%q' "$ROOT_ITEM"
         ROOTS_Q="$ROOTS_Q $ROOT_ITEM_Q"
-    done < <(config_backup_allowed_roots)
+    done < <(safety_scope_roots "$LABEL")
     SNAP=$(config_backup_create "safety_${LABEL}" true) || return 1
-    if [ "$RESTORE_ROOT" = / ] && command -v lsattr >/dev/null 2>&1 \
+    if [ "$SCOPE" = full ] && [ "$RESTORE_ROOT" = / ] && command -v lsattr >/dev/null 2>&1 \
         && lsattr -d /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q i; then
         RESOLV_IMMUTABLE="active"
     fi
-    command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active' && UFW_STATE="active"
-    svc_is_active firewalld && FIREWALLD_STATE="active"
+    if [ "$SCOPE" = ufw ]; then
+        # 读取失败不能被当成 inactive，否则回滚会错误地关闭一个原本活跃的防火墙。
+        UFW_STATUS=$(LC_ALL=C ufw status) || { error "无法读取 UFW 当前状态，拒绝开始变更"; return 1; }
+        case "$UFW_STATUS" in
+            *'Status: active'*) UFW_STATE=active ;;
+            *'Status: inactive'*) UFW_STATE=inactive ;;
+            *) error "无法识别 UFW 当前状态，拒绝开始变更"; return 1 ;;
+        esac
+    elif [ "$SCOPE" = full ]; then
+        command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active' && UFW_STATE="active"
+        svc_is_active firewalld && FIREWALLD_STATE="active"
+    fi
     SCRIPT="$QUENCH_DATA_DIR/rollback_$$_$(date +%s)_${RANDOM}.sh"
     mkdir -p "$QUENCH_DATA_DIR"
     if [ "$RESTORE_ROOT" = / ]; then TARGET=/etc/resolv.conf; else TARGET="${RESTORE_ROOT%/}/etc/resolv.conf"; fi
@@ -15722,108 +15873,145 @@ safety_arm_locked() {
     cat > "$SCRIPT" <<ROLLBACK_EOF
 $PROLOGUE
 $DNS_FN
-chattr -i $RESOLV_Q >/dev/null 2>&1 || true
+quench_rollback_ssh() {
+    rollback_step "SSH 配置语法检查"
+    if ! command -v sshd >/dev/null 2>&1; then
+        rollback_fail "找不到 sshd，无法验证 SSH 恢复"
+    elif sshd -t; then
+        rollback_step "重启 SSH 服务"
+        systemctl restart ssh || systemctl restart sshd \\
+            || service ssh restart || service sshd restart || rollback_fail
+    else
+        rollback_fail
+    fi
+}
+quench_rollback_ufw() {
+    rollback_step "恢复 UFW 运行状态：$UFW_STATE"
+    if [ '$UFW_STATE' = active ]; then
+        ufw --force enable || rollback_fail
+    else
+        ufw --force disable || rollback_fail
+    fi
+    rollback_step "验证 UFW 运行状态：$UFW_STATE"
+    UFW_STATUS=\$(LC_ALL=C ufw status) || { rollback_fail; return; }
+    printf '%s\n' "\$UFW_STATUS" | grep -qx 'Status: $UFW_STATE' || rollback_fail
+}
+if [ '$SCOPE' = full ]; then chattr -i $RESOLV_Q >/dev/null 2>&1 || true; fi
 # 精确恢复，与配置导入同一语义。原来是 tar -xzf 直接解压合并：快照之后新增的文件
 # （例如导入带来的 sshd_config.d/99-deny.conf）会留下，回滚后的状态并不等于快照。
 # 快照里有的根整个替换，快照里没有的允许根删除（快照时它就不存在）；目录先在同一
 # 文件系统复制好再切换，复制失败原目录不动。
 RC=0
+rollback_step "创建解包目录"
 STAGE=\$(mktemp -d "\${TMPDIR:-/tmp}/quench-rollback.XXXXXX") || exit 1
-tar -xzf $SNAP_Q -C "\$STAGE" >/dev/null 2>&1 || { rm -rf "\$STAGE"; exit 1; }
+rollback_step "解包配置快照"
+tar -xzf $SNAP_Q -C "\$STAGE" || { rollback_fail; rm -rf "\$STAGE"; exit 1; }
 for ROOT in $ROOTS_Q; do
     SRC="\$STAGE/\$ROOT"
     DEST="${RESTORE_ROOT%/}/\$ROOT"
+    rollback_step "恢复文件：\$DEST"
     if [ -e "\$SRC" ] || [ -L "\$SRC" ]; then
-        mkdir -p "\$(dirname "\$DEST")" || { RC=1; continue; }
-        rm -rf "\$DEST.quench-new" "\$DEST.quench-old"
+        mkdir -p "\$(dirname "\$DEST")" || { rollback_fail; continue; }
+        rm -rf "\$DEST.quench-new" "\$DEST.quench-old" || { rollback_fail; continue; }
         if [ -d "\$SRC" ] && [ ! -L "\$SRC" ]; then
             # 目录不能 rename 覆盖，只能两步：复制好 -> 挪走旧的 -> 换上新的
-            cp -a "\$SRC" "\$DEST.quench-new" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }
-            if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then mv "\$DEST" "\$DEST.quench-old" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }; fi
-            if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old"
-            else [ ! -e "\$DEST.quench-old" ] || mv "\$DEST.quench-old" "\$DEST"; rm -rf "\$DEST.quench-new"; RC=1
+            cp -a "\$SRC" "\$DEST.quench-new" || { rm -rf "\$DEST.quench-new"; rollback_fail; continue; }
+            if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then mv "\$DEST" "\$DEST.quench-old" || { rm -rf "\$DEST.quench-new"; rollback_fail; continue; }; fi
+            if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old" || rollback_fail
+            else [ ! -e "\$DEST.quench-old" ] || mv "\$DEST.quench-old" "\$DEST"; rm -rf "\$DEST.quench-new"; rollback_fail
             fi
         else
             # 普通文件：同目录一次 rename 直接覆盖，主路径任何时刻都存在。
             # 目标当前是目录（导入把文件换成了目录）时 rename 会把文件挪进目录里，
             # 只能像目录那样两步切换。
-            cp -a "\$SRC" "\$DEST.quench-new" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
+            cp -a "\$SRC" "\$DEST.quench-new" || { rm -f "\$DEST.quench-new"; rollback_fail; continue; }
             if [ -d "\$DEST" ] && [ ! -L "\$DEST" ]; then
-                mv "\$DEST" "\$DEST.quench-old" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
-                if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old"
-                else mv "\$DEST.quench-old" "\$DEST"; rm -f "\$DEST.quench-new"; RC=1
+                mv "\$DEST" "\$DEST.quench-old" || { rm -f "\$DEST.quench-new"; rollback_fail; continue; }
+                if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old" || rollback_fail
+                else mv "\$DEST.quench-old" "\$DEST"; rm -f "\$DEST.quench-new"; rollback_fail
                 fi
             else
-                mv -f "\$DEST.quench-new" "\$DEST" || { rm -f "\$DEST.quench-new"; RC=1; }
+                mv -f "\$DEST.quench-new" "\$DEST" || { rm -f "\$DEST.quench-new"; rollback_fail; }
             fi
         fi
     else
         # 快照里没有 = 快照时不存在；删不掉就没有恢复到快照状态，必须计入
-        rm -rf "\$DEST" || RC=1
-        if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then RC=1; fi
+        if [ '$SCOPE' = ssh_login ]; then
+            rollback_fail "快照缺少 SSH 主配置，拒绝删除现有配置：\$DEST"
+        else
+            rm -rf "\$DEST" || rollback_fail
+            if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then rollback_fail; fi
+        fi
     fi
 done
 rm -rf "\$STAGE"
 if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
 if [ $ROOT_Q != / ]; then rollback_finish "\$RC"; fi
+# 局部事务不刷新任何无关组件；文件未恢复成功时，不加载可能不完整的配置。
+case '$SCOPE' in
+    ssh_login)
+        if [ "\$RC" -eq 0 ]; then quench_rollback_ssh; fi
+        rollback_finish "\$RC" ;;
+    ufw)
+        if [ "\$RC" -eq 0 ]; then quench_rollback_ufw; fi
+        rollback_finish "\$RC" ;;
+esac
 # RC 汇总必要步骤的结果（延续上面文件恢复的结果）。原来这些全是 || true，任何一步
 # 失败都被吞掉，脚本照样记录成功并删掉自己，调用方据此认为回滚已完成。
 # 只统计该组件确实存在时的失败；组件本来就没装不算失败。
 if command -v sysctl >/dev/null 2>&1; then
-    sysctl --system >/dev/null 2>&1 || RC=1
+    rollback_step "加载 sysctl 配置"
+    sysctl --system || rollback_fail
     # 逐项恢复事务开始前采集的运行值并回读核对（列表为空时什么都不做）
     while IFS='|' read -r KEY VALUE; do
         [ -n "\$KEY" ] || continue
-        sysctl -w "\$KEY=\$VALUE" >/dev/null 2>&1 || RC=1
-        [ "\$(sysctl -n "\$KEY" 2>/dev/null)" = "\$VALUE" ] || RC=1
+        rollback_step "恢复并验证 sysctl：\$KEY"
+        sysctl -w "\$KEY=\$VALUE" || rollback_fail
+        [ "\$(sysctl -n "\$KEY")" = "\$VALUE" ] || rollback_fail
     done <<'SYSCTL_RUNTIME_EOF'
 $SYSCTL_RUNTIME
 SYSCTL_RUNTIME_EOF
 fi
 if command -v sshd >/dev/null 2>&1; then
-    if sshd -t >/dev/null 2>&1; then
-        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null \
-            || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || RC=1
-    else
-        RC=1
-    fi
+    quench_rollback_ssh
 fi
 # DNS：按快照时的后端刷新运行态（失败计入 RC），再核对实际生效的上游——
 # 与 DNS 模块同一条判定：快照时的上游至少有一个仍在生效列表里。
+rollback_step "刷新 DNS 后端：$DNS_BACKEND"
 case "$DNS_BACKEND" in
-    resolvconf) resolvconf -u >/dev/null 2>&1 || RC=1 ;;
+    resolvconf) resolvconf -u || rollback_fail ;;
     systemd-resolved)
-        systemctl restart systemd-resolved >/dev/null 2>&1 || RC=1
+        systemctl restart systemd-resolved || rollback_fail
         resolvectl flush-caches >/dev/null 2>&1 || true
         ;;
-    NetworkManager) systemctl restart NetworkManager >/dev/null 2>&1 || RC=1 ;;
+    NetworkManager) systemctl restart NetworkManager || rollback_fail ;;
 esac
 if [ -n "$DNS_EXPECTED" ]; then
+    rollback_step "验证 DNS 上游"
     DNS_EFFECTIVE=\$(quench_dns_effective "$DNS_BACKEND" $DNS_IFACE_Q $RESOLV_FILE_Q)
     DNS_OK=0
     for S in $DNS_EXPECTED; do printf '%s\n' "\$DNS_EFFECTIVE" | grep -Fxq "\$S" && DNS_OK=1; done
-    [ "\$DNS_OK" -eq 1 ] || RC=1
+    [ "\$DNS_OK" -eq 1 ] || rollback_fail "DNS 上游不匹配：期望至少一个 [$DNS_EXPECTED]，实际 [\$DNS_EFFECTIVE]"
 fi
 if command -v ufw >/dev/null 2>&1; then
-    if [ '$UFW_STATE' = active ]; then
-        ufw --force enable >/dev/null 2>&1 || RC=1
-    else
-        ufw --force disable >/dev/null 2>&1 || RC=1
-    fi
+    quench_rollback_ufw
 fi
 if command -v firewall-cmd >/dev/null 2>&1; then
+    rollback_step "恢复 firewalld 运行状态：$FIREWALLD_STATE"
     if [ '$FIREWALLD_STATE' = active ]; then
-        systemctl start firewalld >/dev/null 2>&1 || RC=1
+        systemctl start firewalld || rollback_fail
     else
-        systemctl stop firewalld >/dev/null 2>&1 || RC=1
+        systemctl stop firewalld || rollback_fail
     fi
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 if command -v nft >/dev/null 2>&1 && [ -f /etc/nftables.conf ]; then
-    nft -f /etc/nftables.conf >/dev/null 2>&1 || RC=1
+    rollback_step "加载 nftables 配置"
+    nft -f /etc/nftables.conf || rollback_fail
 fi
 if [ -x /usr/local/libexec/quench-nft-forward-apply ]; then
-    /usr/local/libexec/quench-nft-forward-apply >/dev/null 2>&1 || RC=1
+    rollback_step "恢复 Quench NFT 转发"
+    /usr/local/libexec/quench-nft-forward-apply || rollback_fail
 fi
 if [ "\$RC" -eq 0 ]; then
     logger -t quench "未确认连接，已自动恢复 $LABEL_Q 配置"
@@ -15882,7 +16070,11 @@ safety_confirm() {
     }
     echo ""
     warn "请保持当前连接，并用新终端确认 SSH 和网络正常。"
-    read -rp "  确认连接正常，取消自动回滚？(y/N): " OK
+    ui_hint "输入有误会重新询问，但自动回滚倒计时不会暂停或延长。"
+    ui_read_yes_no OK "  确认连接正常，取消自动回滚？(y/N): " n || {
+        warn "未确认连接，自动回滚保护不会取消；请保持旧连接并检查配置状态。"
+        return 1
+    }
     if echo "$OK" | grep -qiE '^y(es)?$'; then
         # 等待输入期间倒计时可能已经到期并回滚：必须在取消前重新核对，
         # 否则这里会对一个已经不存在的计时器说“已取消”。
@@ -17792,7 +17984,7 @@ first_run_print_status() {
 first_run_preflight() {
     print_header "首次开荒 · 环境、DNS 与时间预检"
     local OS_INFO KERNEL VIRT IFACE ROUTE_STATE=warning DNS_STATE=warning TIME_STATE=warning
-    local TIME_BACKEND ANSWER
+    local TIME_BACKEND ANSWER=""
     OS_INFO=$(detect_os 2>/dev/null || echo unknown)
     KERNEL=$(uname -r 2>/dev/null || echo unknown)
     VIRT=$(systemd-detect-virt 2>/dev/null || true)
@@ -17820,7 +18012,7 @@ first_run_preflight() {
         return 0
     fi
     warn "当前 DNS 无法解析 github.com；继续安装软件前建议先修复"
-    read -rp "  是否进入 DNS 管理进行修复？(Y/n，默认Y): " ANSWER
+    ui_read_yes_no ANSWER "  是否进入 DNS 管理进行修复？(Y/n，默认Y): " y || return 1
     ANSWER=${ANSWER:-y}
     if echo "$ANSWER" | grep -qiE '^y(es)?$'; then
         dns_menu
@@ -17980,7 +18172,7 @@ first_run_access_setup() {
     warn "请先在另一个终端用 $ADMIN 的密钥登录，并成功执行 sudo -v"
     read -rp "  测试成功后输入管理员用户名 $ADMIN: " CONFIRM
     [ "$CONFIRM" = "$ADMIN" ] || { warn "未确认，SSH 策略未修改"; return 1; }
-    read -rp "  是否先迁移 SSH 端口？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  是否先迁移 SSH 端口？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' && change_port
     ssh_apply_recommended_policy "$ADMIN" || return 1
     first_run_access_ready
@@ -18063,7 +18255,7 @@ first_run_final_audit() {
 
 first_run_offer_step() {
     local LABEL="$1" DEFAULT="$2" FUNCTION="$3" ANSWER
-    read -rp "  ${LABEL}？($([ "$DEFAULT" = y ] && echo 'Y/n，默认Y' || echo 'y/N，默认N')): " ANSWER
+    ui_read_yes_no ANSWER "  ${LABEL}？($([ "$DEFAULT" = y ] && echo 'Y/n，默认Y' || echo 'y/N，默认N')): " "$DEFAULT" || return 1
     ANSWER=${ANSWER:-$DEFAULT}
     echo "$ANSWER" | grep -qiE '^y(es)?$' || { info "已跳过：$LABEL"; return 0; }
     "$FUNCTION"
@@ -18102,7 +18294,7 @@ first_run_recommended_flow() {
     echo ""
     ui_hint "每一步都会单独确认；已完成项目按实时状态跳过，可随时退出后重新进入"
     local ANSWER BACKUP PERF_RC=0
-    read -rp "  开始推荐流程？(y/N): " ANSWER
+    ui_read_yes_no ANSWER "  开始推荐流程？(y/N): " n || return 1
     echo "$ANSWER" | grep -qiE '^y(es)?$' || return 0
 
     first_run_preflight || { warn "预检未通过，推荐流程已停止"; return 1; }
@@ -19160,7 +19352,7 @@ self_uninstall() {
     print_header "卸载 Quench 启动器"
     warn "将删除本地脚本 $LOCAL_SCRIPT 以及 Quench 管理的 v/V 软链接"
     ui_hint "不会删除 /var/lib/quench 中的备份、审计记录或已应用的系统配置"
-    read -rp "  确认卸载？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认卸载？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || { warn "已取消"; return 0; }
     if [ -e "$LOCAL_SCRIPT" ] && ! rm -f "$LOCAL_SCRIPT"; then error "无法删除 $LOCAL_SCRIPT"; return 1; fi
     self_remove_shortcut v
@@ -20210,7 +20402,7 @@ nft_rule_preflight() {
         local_port=$(nft_local_listener_conflicts "$p" "$ls" "$le" || true)
         if [ -n "$local_port" ]; then
             warn "本机已有 $p 服务监听端口 ${local_port}；转发会截获外部访问"
-            read -rp "  仍然继续？(y/N，默认N): " answer
+            ui_read_yes_no answer "  仍然继续？(y/N，默认N): " n || return 1
             echo "$answer" | grep -qiE '^y(es)?$' || return 1
         fi
     done < <(nft_protocols "$proto")
@@ -20319,7 +20511,7 @@ nft_add_rule_locked() {
         "$ts" "$te" "$map_mode" "$snat" "$acl" yes "$comment"
     [ "$snat" = preserve ] && warn "保留源 IP 模式要求落地机回程经过本线路机"
     warn "还需在云厂商安全组放行线路机监听端口；Quench 无法自动修改云防火墙"
-    read -rp "  确认添加？(Y/n，默认Y): " confirm
+    ui_read_yes_no confirm "  确认添加？(Y/n，默认Y): " y || return 1
     [ -z "$confirm" ] && confirm=y
     echo "$confirm" | grep -qiE '^y(es)?$' \
         || { rm -f "${NFT_PROMPT_ACCESS_TMP:-}"; warn "已取消"; return; }
@@ -20440,7 +20632,7 @@ nft_edit_rule_locked() {
     [ "$enabled" = no ] || nft_rule_preflight "$family" "$proto" "$lip" "$ls" "$le" "$tip" "$ts" || return 1
     record="$rid|$family|$proto|$lip|$ls|$le|$ttype|$thost|$tip|$ts|$te|$mode|$snat|$acl|$enabled|$comment"
     echo ""; IFS='|' read -r -a fields <<< "$record"; nft_rule_summary "${fields[@]}"
-    read -rp "  确认修改？(Y/n，默认Y): " confirm
+    ui_read_yes_no confirm "  确认修改？(Y/n，默认Y): " y || return 1
     [ -z "$confirm" ] && confirm=y
     echo "$confirm" | grep -qiE '^y(es)?$' || return
 
@@ -20482,7 +20674,7 @@ nft_delete_rule_locked() {
     echo ""
     IFS='|' read -r -a fields <<< "$NFT_FOUND_RULE"
     nft_rule_summary "${fields[@]}"
-    read -rp "  确认删除？(y/N，默认N): " confirm
+    ui_read_yes_no confirm "  确认删除？(y/N，默认N): " n || return 1
     echo "$confirm" | grep -qiE '^y(es)?$' || return
     nft_lock_acquire || return 1
     rules_backup=$(quench_mktemp); access_backup=$(quench_mktemp)

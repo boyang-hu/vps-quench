@@ -19,7 +19,7 @@ jobs:
             tests/bbr-separation.sh tests/bbr-separation-integration.sh tests/lib/bbr-tc-fixture.sh \
             tests/bbr-measure.sh tests/bbr-measure-integration.sh tests/onboarding-performance.sh \
             tests/system-updates.sh tests/system-updates-apt-integration.sh tests/system-updates-tmux-integration.sh \
-            tests/user-rename-integration.sh; do
+            tests/user-rename-integration.sh tests/confirm-input.sh; do
             bash -n "$script"
           done
 
@@ -37,13 +37,17 @@ jobs:
           docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 --version
           docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
             --severity=info -x \
-            vps-quench.sh build-offline-package.sh tests/offline-package.sh tests/lib/harness.sh
+            vps-quench.sh build-offline-package.sh tests/offline-package.sh tests/lib/harness.sh tests/confirm-input.sh
 
       - name: Verify release checksum
         run: sha256sum -c vps-quench.sh.sha256
 
       - name: Run smoke tests
         run: tests/smoke.sh
+
+      - name: Test confirmation input retries and rollback deadlines
+        timeout-minutes: 2
+        run: bash tests/confirm-input.sh
 
       - name: Run fault injection tests
         timeout-minutes: 10

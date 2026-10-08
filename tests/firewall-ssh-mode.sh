@@ -30,6 +30,10 @@ setup_firewall() {
     # delete/insert/prepend: migration must not introduce an SSH allowance gap.
     ufw() {
         printf '%s\n' "$*" >> "$LOG"
+        if [ "$*" = "${QUENCH_TEST_UFW_FAIL_COMMAND:-}" ]; then
+            echo 'injected UFW backend error' >&2
+            return 17
+        fi
         case "$1" in
             status)
                 if [ "$FAILURE" = status ] && grep -q '^allow ' "$LOG"; then return 1; fi
@@ -202,12 +206,56 @@ t_install() {
     assert_file_contains "$LOG" 'allow 22345/tcp'
     assert_fail grep -Eq '^limit |allow (80|443)/tcp' "$LOG"
     assert_ok config_path_allowed /etc/quench/ssh-firewall-mode
-    local ALLOW_LINE ENABLE_LINE
+    local ALLOW_LINE ENABLE_LINE DEFAULT_LINE
     ALLOW_LINE=$(awk '/^allow 22345/{print NR}' "$LOG")
     ENABLE_LINE=$(awk '/^--force enable/{print NR}' "$LOG")
+    DEFAULT_LINE=$(awk '/^default deny incoming/{print NR}' "$LOG")
     assert_ok test "$ALLOW_LINE" -lt "$ENABLE_LINE"
+    assert_ok test "$ALLOW_LINE" -lt "$DEFAULT_LINE"
 }
 run_test 'Fresh installation selects panel mode and allows SSH before enabling UFW' t_install
+
+t_install_input_retry() {
+    setup_firewall
+    FIXTURE_UFW_ACTIVE=false
+    : > "$QUENCH_TEST_UFW_RULES"
+    assert_ok fw_install ufw <<< $'2\nyy\nYeS'
+    assert_file_contains "$LOG" 'allow 80/tcp'
+    assert_file_contains "$LOG" 'allow 443/tcp'
+    assert_file_contains "$LOG" confirm
+}
+run_test 'UFW Web-port question retries a typo instead of silently skipping Web rules' t_install_input_retry
+
+t_install_input_eof() {
+    setup_firewall
+    FIXTURE_UFW_ACTIVE=false
+    assert_fail fw_install ufw <<< 2
+    assert_fail grep -qx arm "$LOG"
+    assert_fail grep -q '^--force enable' "$LOG"
+}
+run_test 'EOF at the UFW Web-port question stops before arming or enabling' t_install_input_eof
+
+t_install_error() {
+    setup_firewall
+    FIXTURE_UFW_ACTIVE=false
+    : > "$QUENCH_TEST_UFW_RULES"
+    SAFETY_SCRIPT="$CASE_DIR/rollback.sh"; : > "$SAFETY_SCRIPT"
+    QUENCH_TEST_UFW_FAIL_COMMAND="$1"
+    local OUTPUT RC=0
+    OUTPUT=$(fw_install ufw <<< $'2\ny' 2>&1) || RC=$?
+    assert_ne "$RC" 0
+    assert_contains "$OUTPUT" "UFW 命令失败：ufw $1"
+    assert_contains "$OUTPUT" 'injected UFW backend error'
+    assert_file_contains "$SAFETY_SCRIPT.apply.log" "$1 (exit 17)"
+    assert_file_contains "$SAFETY_SCRIPT.apply.log" 'injected UFW backend error'
+    assert_eq "$(ls -l "$SAFETY_SCRIPT.apply.log" | awk '{print substr($1,1,10)}')" '-rw-------'
+    assert_file_contains "$LOG" rollback
+    assert_fail grep -qx confirm "$LOG"
+    if [ "$1" != '--force enable' ]; then assert_fail grep -q '^--force enable' "$LOG"; fi
+}
+for UFW_COMMAND in 'allow 22345/tcp' 'default deny incoming' 'default allow outgoing' 'logging low' 'allow 80/tcp' '--force enable'; do
+    run_test "UFW install exposes command and original error before rollback: $UFW_COMMAND" t_install_error "$UFW_COMMAND"
+done
 
 t_onboarding() {
     setup_firewall

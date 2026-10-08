@@ -694,7 +694,7 @@ f2b_edit_config_locked() {
         fi
         return 1
     fi
-    read -rp "  验证通过，是否重启 Fail2ban？(Y/n): " RESTART
+    ui_read_yes_no RESTART "  验证通过，是否重启 Fail2ban？(Y/n): " y || return 1
     RESTART="${RESTART:-y}"
     if echo "$RESTART" | grep -qiE '^y(es)?$'; then
         if ! restart_fail2ban || ! f2b_shared_effective_check yes; then
@@ -719,7 +719,7 @@ f2b_uninstall() {
     print_header "卸载 Fail2ban"
     local CONFIRM
     warn "卸载会停止动态封禁；默认保留所有配置，方便恢复"
-    read -rp "  确认卸载？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认卸载？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     stop_fail2ban >/dev/null 2>&1 || true
     svc_disable fail2ban >/dev/null 2>&1 || true

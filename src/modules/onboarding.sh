@@ -168,7 +168,7 @@ first_run_print_status() {
 first_run_preflight() {
     print_header "首次开荒 · 环境、DNS 与时间预检"
     local OS_INFO KERNEL VIRT IFACE ROUTE_STATE=warning DNS_STATE=warning TIME_STATE=warning
-    local TIME_BACKEND ANSWER
+    local TIME_BACKEND ANSWER=""
     OS_INFO=$(detect_os 2>/dev/null || echo unknown)
     KERNEL=$(uname -r 2>/dev/null || echo unknown)
     VIRT=$(systemd-detect-virt 2>/dev/null || true)
@@ -196,7 +196,7 @@ first_run_preflight() {
         return 0
     fi
     warn "当前 DNS 无法解析 github.com；继续安装软件前建议先修复"
-    read -rp "  是否进入 DNS 管理进行修复？(Y/n，默认Y): " ANSWER
+    ui_read_yes_no ANSWER "  是否进入 DNS 管理进行修复？(Y/n，默认Y): " y || return 1
     ANSWER=${ANSWER:-y}
     if echo "$ANSWER" | grep -qiE '^y(es)?$'; then
         dns_menu
@@ -356,7 +356,7 @@ first_run_access_setup() {
     warn "请先在另一个终端用 $ADMIN 的密钥登录，并成功执行 sudo -v"
     read -rp "  测试成功后输入管理员用户名 $ADMIN: " CONFIRM
     [ "$CONFIRM" = "$ADMIN" ] || { warn "未确认，SSH 策略未修改"; return 1; }
-    read -rp "  是否先迁移 SSH 端口？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  是否先迁移 SSH 端口？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' && change_port
     ssh_apply_recommended_policy "$ADMIN" || return 1
     first_run_access_ready
@@ -439,7 +439,7 @@ first_run_final_audit() {
 
 first_run_offer_step() {
     local LABEL="$1" DEFAULT="$2" FUNCTION="$3" ANSWER
-    read -rp "  ${LABEL}？($([ "$DEFAULT" = y ] && echo 'Y/n，默认Y' || echo 'y/N，默认N')): " ANSWER
+    ui_read_yes_no ANSWER "  ${LABEL}？($([ "$DEFAULT" = y ] && echo 'Y/n，默认Y' || echo 'y/N，默认N')): " "$DEFAULT" || return 1
     ANSWER=${ANSWER:-$DEFAULT}
     echo "$ANSWER" | grep -qiE '^y(es)?$' || { info "已跳过：$LABEL"; return 0; }
     "$FUNCTION"
@@ -478,7 +478,7 @@ first_run_recommended_flow() {
     echo ""
     ui_hint "每一步都会单独确认；已完成项目按实时状态跳过，可随时退出后重新进入"
     local ANSWER BACKUP PERF_RC=0
-    read -rp "  开始推荐流程？(y/N): " ANSWER
+    ui_read_yes_no ANSWER "  开始推荐流程？(y/N): " n || return 1
     echo "$ANSWER" | grep -qiE '^y(es)?$' || return 0
 
     first_run_preflight || { warn "预检未通过，推荐流程已停止"; return 1; }

@@ -11,8 +11,8 @@ bbr_measure_uint() {
 
 bbr_measure_yes() {
     local ANSWER
-    read -rp "  $1 " ANSWER || return 1
-    case "${ANSWER:-${2:-n}}" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+    ui_read_yes_no ANSWER "  $1 " "${2:-n}" || return 1
+    [ "$ANSWER" = y ]
 }
 
 bbr_measure_dependencies() {

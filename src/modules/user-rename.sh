@@ -727,7 +727,7 @@ quench_rename_change() (
             [ "$OLD" != "$ACTOR" ] || { error "请先创建临时维护账号并切换登录；不能给当前登录账号改名"; return 1; }
             read -rp "新用户名（回车取消）: " NEW || return 0
             [ -n "$NEW" ] || return 0
-            read -rp "同时将标准家目录 /home/$OLD 改为 /home/${NEW}？(Y/n): " MOVE || return 0
+            ui_read_yes_no MOVE "同时将标准家目录 /home/$OLD 改为 /home/${NEW}？(Y/n): " y || return 0
             case "$MOVE" in ''|y|Y) MOVE=yes ;; n|N) MOVE=no ;; *) error "无效选择"; return 1 ;; esac
             PLAN=$(quench_rename_engine plan "$OLD" "$NEW" "$MOVE" "$ACTOR") || return 1
             printf '%s\n' "$PLAN"

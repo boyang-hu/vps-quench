@@ -96,7 +96,31 @@ fw_ufw_set_ssh_port() {
     fi
     # 普通 allow/limit 会原地替换同条件的另一动作；prepend/insert 会跳过它。
     # 不先删除当前规则，避免迁移现有 SSH 端口时出现放行空窗。
-    ufw "$ACTION" "$PORT/tcp" >/dev/null 2>&1
+    fw_ufw_run "$ACTION" "$PORT/tcp"
+}
+
+# 保留原始错误与具体命令。不能把 default / logging / allow 的失败合成一句
+# “基础策略失败”，更不能为了隐藏日志错误而跳过原始命令的退出状态。
+fw_ufw_run() {
+    local OUTPUT RC=0
+    OUTPUT=$(quench_mktemp) || { error "无法创建 UFW 输出临时文件，未执行命令"; return 1; }
+    LC_ALL=C ufw "$@" > "$OUTPUT" 2>&1 || RC=$?
+    if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ]; then
+        (
+            umask 077
+            {
+                printf '\n%s ufw %s (exit %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" "$RC"
+                cat "$OUTPUT"
+            } >> "$SAFETY_SCRIPT.apply.log"
+        ) || warn "无法保存 UFW 操作日志"
+    fi
+    if [ "$RC" -ne 0 ]; then
+        error "UFW 命令失败：ufw $*（退出码 ${RC}）"
+        tail -n 30 "$OUTPUT"
+        [ -z "${SAFETY_SCRIPT:-}" ] || warn "操作日志：$SAFETY_SCRIPT.apply.log"
+    fi
+    rm -f "$OUTPUT"
+    return "$RC"
 }
 
 fw_ssh_mode_apply() {
@@ -283,7 +307,7 @@ fw_allow_web_ports() {
     local TYPE="$1" MODE="${2:-online}" ZONE="${3:-public}" PORT
     for PORT in 80 443; do
         case "$TYPE:$MODE" in
-            ufw:*) ufw allow "${PORT}/tcp" >/dev/null 2>&1 || return 1 ;;
+            ufw:*) fw_ufw_run allow "${PORT}/tcp" || return 1 ;;
             firewalld:offline) firewall-offline-cmd --zone="$ZONE" --add-port="${PORT}/tcp" >/dev/null 2>&1 || return 1 ;;
             firewalld:online) firewall-cmd --permanent --zone="$ZONE" --add-port="${PORT}/tcp" >/dev/null 2>&1 || return 1 ;;
         esac
@@ -302,7 +326,7 @@ fw_install() {
     fi
     fw_warn_environment
     echo -e "  ${BOLD}必须放行：${NC}SSH $(ssh_effective_ports_csv)/tcp"
-    read -rp "  这台机器是否对外提供 HTTP/HTTPS？(y/N): " WEB_CONFIRM || WEB_CONFIRM=n
+    ui_read_yes_no WEB_CONFIRM "  这台机器是否对外提供 HTTP/HTTPS？(y/N): " n || return 1
     echo "$WEB_CONFIRM" | grep -qiE '^y(es)?$' && WEB_CONFIRM=y || WEB_CONFIRM=n
 
     pkg_install "$TYPE" || { error "安装 $TYPE 失败"; return 1; }
@@ -311,18 +335,21 @@ fw_install() {
         ufw)
             fw_ssh_mode_save "$SSH_MODE" \
                 || { safety_rollback_after_failure; error "无法保存 SSH 防火墙模式"; return 1; }
-            # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
-            ufw default deny incoming >/dev/null 2>&1 \
-                && ufw default allow outgoing >/dev/null 2>&1 \
-                && ufw logging low >/dev/null 2>&1 \
-                && fw_ufw_allow_ssh \
-                || { safety_rollback_after_failure; error "UFW 基础策略写入失败，未启用"; return 1; }
+            # SSH 先放行；安装 / 修复可能面对的是已启用的 UFW，不能先改默认拒绝。
+            if ! fw_ufw_allow_ssh \
+                || ! fw_ufw_run default deny incoming \
+                || ! fw_ufw_run default allow outgoing \
+                || ! fw_ufw_run logging low; then
+                error "UFW 基础配置失败，停止后续启用步骤并请求恢复；原始错误见上方"
+                safety_rollback_after_failure
+                return 1
+            fi
             if [ "$WEB_CONFIRM" = y ] && ! fw_allow_web_ports ufw; then
                 safety_rollback_after_failure
                 error "HTTP/HTTPS 放行失败，未启用 UFW"
                 return 1
             fi
-            ufw --force enable >/dev/null 2>&1 && [ "$(fw_running ufw)" = active ] \
+            fw_ufw_run --force enable && [ "$(fw_running ufw)" = active ] \
                 || { safety_rollback_after_failure; error "UFW 启用失败"; return 1; }
             while IFS= read -r PORT; do
                 fw_ufw_ssh_rule_ready "$PORT" "$SSH_MODE" \
@@ -462,7 +489,7 @@ ufw_quick_allow() {
     local CONFIRM PORT MODE
     print_header "快速放行 Web 服务 — UFW"
     echo -e "  将保证 SSH $(ssh_effective_ports_csv)/tcp，并放行 80/tcp、443/tcp"
-    read -rp "  确认？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || return
     MODE=$(fw_ssh_mode_get) || return 1
     fw_ufw_allow_ssh || return 1
@@ -572,7 +599,7 @@ fwd_quick_allow() {
     local CONFIRM ZONE
     print_header "快速放行 Web 服务 — firewalld"
     echo -e "  将保证 SSH $(ssh_effective_ports_csv)/tcp，并放行 80/tcp、443/tcp"
-    read -rp "  确认？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || return
     ZONE=$(fw_firewalld_zone)
     # shellcheck disable=SC2015 # 已逐条确认：|| 分支只在前面的命令失败时清理/兜底
@@ -585,7 +612,7 @@ fw_uninstall() {
     print_header "卸载 $TYPE"
     warn "卸载会停止该防火墙，主机将交由云安全组或其他防火墙保护"
     warn "默认保留配置；不会 flush iptables/nftables，也不会删除其他管理器的规则"
-    read -rp "  确认卸载？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认卸载？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     case "$TYPE" in
         ufw) ufw --force disable >/dev/null 2>&1 || true; CONFIG_DIR=/etc/ufw ;;

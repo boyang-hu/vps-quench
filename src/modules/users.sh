@@ -552,9 +552,9 @@ user_create_locked() {
         warn "用户已创建，但管理员授权失败"
         return 1
     fi
-    read -rp "  现在设置密码？(y/N): " SET_PASSWORD
+    ui_read_yes_no SET_PASSWORD "  现在设置密码？(y/N): " n || return 1
     echo "$SET_PASSWORD" | grep -qiE '^y(es)?$' && user_set_password "$USERNAME"
-    read -rp "  现在添加 SSH 公钥？(Y/n): " ADD_KEY
+    ui_read_yes_no ADD_KEY "  现在添加 SSH 公钥？(Y/n): " y || return 1
     ADD_KEY="${ADD_KEY:-y}"
     if echo "$ADD_KEY" | grep -qiE '^y(es)?$'; then
         local AUTH_FILE
@@ -600,7 +600,7 @@ user_admin_manage_locked() {
                 fi
                 ;;
             2)
-                read -rp "  关闭 $USERNAME 的 Quench 免密 sudo？(Y/n): " CONFIRM
+                ui_read_yes_no CONFIRM "  关闭 $USERNAME 的 Quench 免密 sudo？(Y/n): " y || return 1
                 CONFIRM="${CONFIRM:-y}"
                 echo "$CONFIRM" | grep -qiE '^y(es)?$' && user_nopasswd_disable "$USERNAME"
                 ;;
@@ -685,7 +685,7 @@ user_delete_locked() {
     pgrep -u "$USERNAME" >/dev/null 2>&1 && warn "该用户仍有运行中的进程，删除可能失败"
     read -rp "  输入用户名 $USERNAME 确认删除: " TOKEN
     [ "$TOKEN" = "$USERNAME" ] || { warn "确认不匹配，已取消"; return; }
-    read -rp "  同时删除家目录 $(user_home "$USERNAME")？(y/N): " REMOVE_HOME
+    ui_read_yes_no REMOVE_HOME "  同时删除家目录 $(user_home "$USERNAME")？(y/N): " n || return 1
     if command -v userdel >/dev/null 2>&1; then
         if echo "$REMOVE_HOME" | grep -qiE '^y(es)?$'; then userdel -r "$USERNAME"; else userdel "$USERNAME"; fi
     elif command -v deluser >/dev/null 2>&1; then
@@ -739,7 +739,7 @@ user_recommended_wizard() {
     echo "  4. 可选迁移 SSH 端口"
     echo "  5. 禁止 root SSH 和密码认证"
     echo ""
-    read -rp "  开始向导？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  开始向导？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || return
     CREATED_USER=""
     user_create yes || return
@@ -748,7 +748,7 @@ user_recommended_wizard() {
     warn "请保持当前窗口，并在另一个终端以 $ADMIN 登录后执行 sudo -v"
     read -rp "  测试成功后输入管理员用户名 $ADMIN: " CONFIRM
     [ "$CONFIRM" = "$ADMIN" ] || { warn "未确认，未修改 SSH 策略"; return; }
-    read -rp "  是否迁移 SSH 端口？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  是否迁移 SSH 端口？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' && change_port
     ssh_apply_recommended_policy "$ADMIN"
 }

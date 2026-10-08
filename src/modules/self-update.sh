@@ -281,7 +281,7 @@ self_uninstall() {
     print_header "卸载 Quench 启动器"
     warn "将删除本地脚本 $LOCAL_SCRIPT 以及 Quench 管理的 v/V 软链接"
     ui_hint "不会删除 /var/lib/quench 中的备份、审计记录或已应用的系统配置"
-    read -rp "  确认卸载？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认卸载？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || { warn "已取消"; return 0; }
     if [ -e "$LOCAL_SCRIPT" ] && ! rm -f "$LOCAL_SCRIPT"; then error "无法删除 $LOCAL_SCRIPT"; return 1; fi
     self_remove_shortcut v

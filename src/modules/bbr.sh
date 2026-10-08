@@ -355,7 +355,7 @@ bbr_restore_sysctl_locked() {
         0) rm -f "$LIST_FILE"; return ;;
         00) rm -f "$LIST_FILE"; safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         d|D)
-            read -rp "  确认清除全部 ${TOTAL} 个备份？(Y/n，默认Y): " C
+            ui_read_yes_no C "  确认清除全部 ${TOTAL} 个备份？(Y/n，默认Y): " y || return 1
             [ -z "$C" ] && C="y"
             if echo "$C" | grep -qiE '^y(es)?$'; then
                 rm -f "${SYSCTL_FILE}.bak."*
@@ -403,7 +403,7 @@ bbr_restore_initial_baseline_locked() {
     echo -e "  将恢复首次运行本模块前保存的 sysctl，并移除本工具的持久化配置。"
     echo -e "  ${YELLOW}注意：这会覆盖其他工具后来对同名 sysctl 的修改。${NC}"
     local ANSWER FAILED=0
-    read -rp "  确认继续？(y/N，默认N): " ANSWER
+    ui_read_yes_no ANSWER "  确认继续？(y/N，默认N): " n || return 1
     [ -n "$ANSWER" ] || ANSWER=n
     echo "$ANSWER" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
 
@@ -420,12 +420,12 @@ bbr_restore_initial_baseline_locked() {
     fi
 
     if [ -s "$TC_STATE_FILE" ] || [ -e "$TC_HELPER" ] || [ -e "$SERVICE_TC" ] || [ -e "$SERVICE_TC_INIT" ]; then
-        read -rp "  同时取消本工具的 tc 出口整形？(Y/n，默认Y): " ANSWER
+        ui_read_yes_no ANSWER "  同时取消本工具的 tc 出口整形？(Y/n，默认Y): " y || return 1
         [ -n "$ANSWER" ] || ANSWER=y
         echo "$ANSWER" | grep -qiE '^y(es)?$' && bbr_remove_tc || true
     fi
     if [ -s "$CWND_STATE_FILE" ] || [ -e "$CWND_HELPER" ] || [ -e "$SERVICE_CWND" ] || [ -e "$SERVICE_CWND_INIT" ]; then
-        read -rp "  同时恢复 initcwnd/initrwnd 内核默认？(Y/n，默认Y): " ANSWER
+        ui_read_yes_no ANSWER "  同时恢复 initcwnd/initrwnd 内核默认？(Y/n，默认Y): " y || return 1
         [ -n "$ANSWER" ] || ANSWER=y
         echo "$ANSWER" | grep -qiE '^y(es)?$' && bbr_remove_initcwnd || true
     fi
@@ -503,7 +503,7 @@ bbr_apply_sysctl_locked() {
             if [ "$STALE_MODE" = baseline ]; then
                 DORST="y"
             else
-                read -rp "  是否恢复这些残留参数到首次调优前基线？(y/N，默认N): " DORST
+                ui_read_yes_no DORST "  是否恢复这些残留参数到首次调优前基线？(y/N，默认N): " n || return 1
                 [ -z "$DORST" ] && DORST="n"
             fi
             if echo "$DORST" | grep -qiE '^y(es)?$'; then
@@ -1698,7 +1698,7 @@ bbr_check_limitnofile() {
             echo ""
             warn "检测到代理服务 ${svc}.service 的 LimitNOFILE=${CUR} 偏低"
             echo -e "  ${DIM}fs.file-max 已抬高，但单进程 fd 上限受 systemd LimitNOFILE 限制${NC}"
-            read -rp "  是否为 ${svc} 写入 LimitNOFILE=1048576 的 drop-in？(y/N，默认N): " DOLN
+            ui_read_yes_no DOLN "  是否为 ${svc} 写入 LimitNOFILE=1048576 的 drop-in？(y/N，默认N): " n || return 1
             [ -z "$DOLN" ] && DOLN="n"
             if echo "$DOLN" | grep -qiE '^y(es)?$'; then
                 local DROPDIR="/etc/systemd/system/${svc}.service.d"
@@ -1714,7 +1714,7 @@ bbr_check_limitnofile() {
 
 bbr_kernel_forwarding_confirm() {
     local ANSWER
-    read -rp "  是否启用内核 IPv4/IPv6 转发？仅路由或 NAT 需要 (y/N，默认N): " ANSWER
+    ui_read_yes_no ANSWER "  是否启用内核 IPv4/IPv6 转发？仅路由或 NAT 需要 (y/N，默认N): " n || return 1
     [ -z "$ANSWER" ] && ANSWER="n"
     echo "$ANSWER" | grep -qiE '^y(es)?$'
 }
@@ -1749,7 +1749,7 @@ bbr_confirm_apply() {
 
     # 先提示备份（默认Y）
     if [ -f "$SYSCTL_FILE" ]; then
-        read -rp "  备份当前 sysctl 配置？(Y/n，默认Y): " DO_BAK
+        ui_read_yes_no DO_BAK "  备份当前 sysctl 配置？(Y/n，默认Y): " y || return 1
         [ -z "$DO_BAK" ] && DO_BAK="y"
         if echo "$DO_BAK" | grep -qiE '^y(es)?$' && ! bbr_backup_sysctl; then
             error "无法安全备份，已取消应用"
@@ -1757,7 +1757,7 @@ bbr_confirm_apply() {
         fi
         echo ""
     fi
-    read -rp "  确认应用以上配置？(Y/n，默认Y): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认应用以上配置？(Y/n，默认Y): " y || return 1
     [ -z "${CONFIRM}" ] && CONFIRM="y"
     if ! echo "${CONFIRM}" | grep -qiE '^y(es)?$'; then warn "已取消"; return; fi
 
@@ -2040,7 +2040,7 @@ bbr_menu_manual() {
     BUFFER_CAP=$(bbr_buffer_cap_bytes "$MEM_MB" "$PROFILE") || return 1
     if [ "$RMEM" -gt "$BUFFER_CAP" ]; then
         warn "缓冲区 ${BUF_LBL}MB 超过 ${SCENE_LABEL} 的建议内存预算，高并发时可能造成内存压力"
-        read -rp "  是否继续？(y/N，默认N): " GO
+        ui_read_yes_no GO "  是否继续？(y/N，默认N): " n || return 1
         [ -z "$GO" ] && GO="n"
         echo "$GO" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     fi
@@ -2609,7 +2609,7 @@ bbr_calibration_run() {
         bbr_calibration_write_result NO_KNEE "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$BEST_RECEIVER" || true
         bbr_calibration_finish || return 1
         if [ -s "$TC_STATE_FILE" ]; then
-            read -rp "  当前存在 Quench HTB 限速，是否取消？(y/N，默认N): " ANSWER
+            ui_read_yes_no ANSWER "  当前存在 Quench HTB 限速，是否取消？(y/N，默认N): " n || return 1
             [ -n "$ANSWER" ] || ANSWER=n
             echo "$ANSWER" | grep -qiE '^y(es)?$' && bbr_tc_remove_selected "$BBR_CAL_DEV"
         fi
@@ -2726,7 +2726,7 @@ bbr_calibration_run() {
     echo ""
     info "实测干净上限 ${KNEE}Mbps，下一档 ${BROKE_AT}Mbps 出现重传跳变"
     echo -e "  建议退让 ${BOLD}${MARGIN}Mbps${NC} → HTB ${GREEN}${BOLD}${RECOMMEND}Mbps${NC}"
-    read -rp "  是否应用建议整形值？(Y/n，默认Y): " ANSWER
+    ui_read_yes_no ANSWER "  是否应用建议整形值？(Y/n，默认Y): " y || return 1
     [ -n "$ANSWER" ] || ANSWER=y
     echo "$ANSWER" | grep -qiE '^y(es)?$' || { warn "已保留测量结果，未修改持久化整形"; return; }
     bbr_tc_apply_selected_rate "$BBR_CAL_DEV" "$RECOMMEND"
@@ -2736,7 +2736,7 @@ bbr_menu_calibration() {
     print_header "线路实测与 policer 拐点校准"
     [ "$(id -u)" -eq 0 ] || { error "线路校准需要 root 权限"; return 1; }
     if ! command -v iperf3 >/dev/null 2>&1; then
-        read -rp "  需要安装 iperf3，是否安装？(Y/n，默认Y): " INSTALL
+        ui_read_yes_no INSTALL "  需要安装 iperf3，是否安装？(Y/n，默认Y): " y || return 1
         [ -n "$INSTALL" ] || INSTALL=y
         echo "$INSTALL" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
         pkg_install iperf3 || { error "iperf3 安装失败，请手动安装后重试"; return 1; }
@@ -2769,7 +2769,7 @@ bbr_menu_calibration() {
     warn "校准会短暂替换出口 qdisc，并主动发送高带宽 TCP 流量"
     echo -e "  最坏流量估算：${YELLOW}${BOLD}约 ${ESTIMATE} GB${NC}  ${DIM}实际通常更低，按接口计数器复核${NC}"
     echo -e "  对端：${BOLD}${PEER}:${PORT}${NC} · IPv${FAMILY} · 标称 ${NOMINAL}Mbps · ${DURATION}s/档"
-    read -rp "  确认开始？(y/N，默认N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认开始？(y/N，默认N): " n || return 1
     [ -n "$CONFIRM" ] || CONFIRM=n
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     bbr_calibration_run "$PEER" "$PORT" "$FAMILY" "$NOMINAL" "$DURATION"
@@ -2982,7 +2982,7 @@ bbr_menu_tc() {
         00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;
         *) warn "无效选项"; return ;;
     esac
-    read -rp "  确认应用到 ${DEV}？(Y/n，默认Y): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认应用到 ${DEV}？(Y/n，默认Y): " y || return 1
     [ -n "$CONFIRM" ] || CONFIRM=y
     echo "$CONFIRM" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     bbr_tc_apply_selected_rate "$DEV" "$RATE"
@@ -3292,7 +3292,7 @@ bbr_menu_initcwnd_locked() {
         FAMILIES=6
     fi
 
-    read -rp "  同时设置高级 initrwnd？(y/N，默认N): " ANSWER
+    ui_read_yes_no ANSWER "  同时设置高级 initrwnd？(y/N，默认N): " n || return 1
     [ -n "$ANSWER" ] || ANSWER=n
     if echo "$ANSWER" | grep -qiE '^y(es)?$'; then
         read -rp "  initrwnd 值（回车与 initcwnd 相同）: " RWND
@@ -3526,7 +3526,7 @@ bbr_check_kernel() {
     # Alpine 上安装/切换内核包通常需要重启，交给用户确认后再动系统包。
     if command -v apk &>/dev/null; then
         warn "tcp_bbr 模块未加载。Alpine 可能需要安装/切换内核包并重启。"
-        read -rp "  尝试安装 linux-lts 或 linux-virt？(y/N，默认N): " APK_KERNEL
+        ui_read_yes_no APK_KERNEL "  尝试安装 linux-lts 或 linux-virt？(y/N，默认N): " n || return 1
         [ -z "$APK_KERNEL" ] && APK_KERNEL="n"
         if echo "$APK_KERNEL" | grep -qiE '^y(es)?$'; then
             apk add --no-cache linux-lts 2>/dev/null || apk add --no-cache linux-virt 2>/dev/null || true

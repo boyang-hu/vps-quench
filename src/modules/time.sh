@@ -320,7 +320,7 @@ ts_ntp_repair() {
                 systemctl restart systemd-timesyncd >/dev/null 2>&1 || { error "systemd-timesyncd 启动失败"; return 1; }
                 BACKEND=timesyncd
             else
-                read -rp "  未找到可用时间服务，是否安装 chrony？(Y/n，默认Y): " ANSWER
+                ui_read_yes_no ANSWER "  未找到可用时间服务，是否安装 chrony？(Y/n，默认Y): " y || return 1
                 ANSWER=${ANSWER:-y}
                 echo "$ANSWER" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
                 pkg_install chrony || { error "chrony 安装失败"; return 1; }
@@ -369,7 +369,7 @@ ts_set_timezone() {
     ts_timezone_syntax_valid "$ZONE" || { error "时区名称格式无效"; return 1; }
     if ! ts_timezone_valid "$ZONE"; then
         warn "系统缺少时区 ${ZONE}，可能尚未安装 tzdata"
-        read -rp "  是否安装 tzdata 后重试？(Y/n，默认Y): " ANSWER
+        ui_read_yes_no ANSWER "  是否安装 tzdata 后重试？(Y/n，默认Y): " y || return 1
         ANSWER=${ANSWER:-y}
         echo "$ANSWER" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
         pkg_install tzdata || { error "tzdata 安装失败"; return 1; }
@@ -580,7 +580,7 @@ ts_sync_https() {
     esac
     echo ""
     warn "直接调整系统时间可能影响日志、数据库、证书验证和正在运行的定时任务"
-    read -rp "  确认按 HTTPS 共识设置系统时间？(y/N，默认N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认按 HTTPS 共识设置系统时间？(y/N，默认N): " n || return 1
     echo "${CONFIRM:-n}" | grep -qiE '^y(es)?$' || { warn "已取消"; return; }
     PAUSE_TOKEN=$(ts_pause_backend "$BACKEND") || { error "无法暂停当前时间同步后端"; return 1; }
     if ! date -u -s "$TARGET_UTC" >/dev/null 2>&1; then

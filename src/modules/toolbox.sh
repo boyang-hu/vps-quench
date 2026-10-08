@@ -7,7 +7,7 @@ config_backup_allowed_roots() {
     for p in \
         etc/hostname etc/hosts \
         etc/ssh/sshd_config etc/ssh/sshd_config.d root/.ssh/authorized_keys \
-        etc/fail2ban etc/ufw etc/firewalld etc/nftables.conf etc/nftables.d/quench-nft-forward.nft etc/quench/nft-forward etc/quench/ssh-firewall-mode \
+        etc/fail2ban etc/ufw etc/default/ufw etc/firewalld etc/nftables.conf etc/nftables.d/quench-nft-forward.nft etc/quench/nft-forward etc/quench/ssh-firewall-mode \
         etc/sysctl.conf etc/sysctl.d/98-vps-quench-network-security.conf etc/sysctl.d/98-quench-nft-forward.conf etc/sysctl.d/99-quench-bbr.conf etc/sysctl.d/99-quench-ipv6.conf \
         etc/systemd/system/quench-nft-forward.service etc/systemd/system/quench-nft-target-refresh.service etc/systemd/system/quench-nft-target-refresh.timer \
         etc/init.d/quench-nft-forward usr/local/libexec/quench-nft-forward-apply var/lib/quench/nft-forward \
@@ -18,6 +18,18 @@ config_backup_allowed_roots() {
         var/spool/cron/crontabs/root var/spool/cron/root etc/crontabs/root; do
         printf '%s\n' "$p"
     done
+}
+
+# 快照仍保留完整配置，但局部事务只恢复它真正修改的路径。
+# 特别是 SSH 登录策略不能覆盖公钥 / DNS / 防火墙；UFW 默认策略在 /etc/default/ufw。
+safety_scope_roots() {
+    case "$1" in
+        ssh_login) printf '%s\n' "${SSHD_CONFIG#/}" ;;
+        ufw|ufw_install|ssh_firewall_mode)
+            printf '%s\n' etc/ufw "${QUENCH_UFW_DEFAULTS_FILE#/}" "${QUENCH_SSH_FIREWALL_MODE_FILE#/}"
+            ;;
+        *) config_backup_allowed_roots ;;
+    esac
 }
 
 config_path_allowed() {
@@ -272,7 +284,8 @@ cancel_safety_timer() {
     fi
     if [ -n "${SAFETY_SCRIPT:-}" ] && [ -f "$SAFETY_SCRIPT" ] && [ -f "${SAFETY_SCRIPT}.failed" ]; then
         error "自动回滚已执行但未成功，配置可能处于中间状态；回滚脚本与事务记录已保留：$SAFETY_SCRIPT"
-        error "请在回滚中心手动重新执行，或人工核对配置"
+        safety_rollback_failure_details "$SAFETY_SCRIPT"
+        error "请先核对失败步骤与当前配置，不要反复执行整套回滚"
         audit_action "自动回滚执行失败，等待人工处理" FAILED
         return 1
     fi
@@ -312,6 +325,27 @@ cancel_safety_timer() {
     txn_lock_release
 }
 
+# 旧脚本没有内建日志时也保存其未被内部重定向的错误；不改写旧脚本的恢复范围。
+safety_execute_rollback() (
+    local SCRIPT="$1"
+    if (umask 077; : >> "$SCRIPT.log") && chmod 600 "$SCRIPT.log"; then
+        bash "$SCRIPT" --now >> "$SCRIPT.log" 2>&1
+    else
+        warn "无法写入回滚日志，继续恢复并直接显示输出：$SCRIPT.log"
+        bash "$SCRIPT" --now
+    fi
+)
+
+safety_rollback_failure_details() {
+    local SCRIPT="$1"
+    if [ -f "$SCRIPT.log" ] && [ -s "$SCRIPT.log" ]; then
+        error "回滚日志：$SCRIPT.log（末尾 20 行）"
+        tail -n 20 "$SCRIPT.log"
+    else
+        warn "未记录到详细错误：旧版回滚脚本可能隐藏了输出，或日志无法写入；请保留脚本和快照"
+    fi
+}
+
 # 立即执行回滚。顺序很重要，之前是反的：先删记录、放锁，再跑脚本，
 # 而且不管跑没跑成都把脚本删掉——一旦回滚失败，恢复材料全没了，
 # 上层还照着 safety_rollback_after_failure 的话术说“事务记录已保留”。
@@ -328,11 +362,11 @@ safety_rollback_now() {
         audit_action "立即回滚前停止计时器失败" FAILED
         return 1
     fi
-    if ! bash "$SCRIPT" --now >/dev/null 2>&1; then
-        RC=$?
-        [ "$RC" -ne 0 ] || RC=1
+    safety_execute_rollback "$SCRIPT" || RC=$?
+    if [ "$RC" -ne 0 ]; then
         audit_action "立即执行防断联回滚失败" FAILED
         error "自动回滚执行失败，回滚脚本与事务记录已保留：$SCRIPT"
+        safety_rollback_failure_details "$SCRIPT"
         error "锁也保持持有，请立即检查当前 SSH 与网络配置"
         return "$RC"
     fi
@@ -351,7 +385,7 @@ confirm_change_preview() {
     echo -e "  ${BOLD}变更预览：$TITLE${NC}"
     while [ "$#" -gt 0 ]; do echo -e "  ${YELLOW}•${NC} $1"; shift; done
     menu_div
-    read -rp "  确认应用以上变更？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认应用以上变更？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$'
 }
 
@@ -366,7 +400,7 @@ confirm_file_diff() {
         warn "系统没有 diff，无法显示逐行差异"
     fi
     menu_div
-    read -rp "  确认应用以上配置？(y/N): " CONFIRM
+    ui_read_yes_no CONFIRM "  确认应用以上配置？(y/N): " n || return 1
     echo "$CONFIRM" | grep -qiE '^y(es)?$'
 }
 
@@ -522,7 +556,8 @@ txn_pending_records() {
 # 机器可读状态：
 #   mine    = 本进程自己的记录（由 safety_confirm / cancel / rollback_now 处理）
 #   running = 另一个 Quench 会话仍活着
-#   armed   = 原会话已消失，但回滚脚本还在，计时器随时可能触发
+#   restoring / failed = 有恢复阶段 / 失败标记；不等于仍在倒计时
+#   armed   = 原会话已消失、没有阶段标记，脚本还在，计时器可能触发
 #   stale   = 回滚脚本已不存在，记录只剩残骸
 txn_record_state() {
     local FILE="$1" SCRIPT QPID
@@ -532,6 +567,10 @@ txn_record_state() {
         echo mine
     elif [ -n "$QPID" ] && kill -0 "$QPID" 2>/dev/null; then
         echo running
+    elif [ -n "$SCRIPT" ] && [ -f "$SCRIPT.restoring" ]; then
+        echo restoring
+    elif [ -n "$SCRIPT" ] && [ -f "$SCRIPT.failed" ]; then
+        echo failed
     elif [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ]; then
         echo armed
     else
@@ -543,6 +582,8 @@ txn_record_state_label() {
     case "$1" in
         mine)    echo "本次会话进行中" ;;
         running) echo "另一个 Quench 会话仍在运行" ;;
+        restoring) echo "恢复中或曾被中断（恢复标记未清除）" ;;
+        failed)  echo "回滚已失败，材料保留，请检查日志" ;;
         armed)   echo "回滚脚本仍在，可能仍会触发" ;;
         *)       echo "已失效（回滚脚本已消失）" ;;
     esac
@@ -551,7 +592,7 @@ txn_record_state_label() {
 # 开始新事务前核对磁盘上的遗留记录。锁只是进程内的 flock，会话断开即释放，
 # 但那一笔的 systemd 计时器仍在跑。若不核对就放行，新配置写完确认之后，
 # 旧回滚到期会把它覆盖回自己那份旧快照——这是最危险的一种交叉。
-# 只清理 stale（回滚脚本已消失）的记录；running / armed 一律阻断。
+# 只清理 stale；恢复中 / 失败记录也必须阻断新变更，不能当作已完成。
 txn_reconcile_stale() {
     local REC STATE LABEL BLOCKED=0
     while IFS= read -r REC; do
@@ -571,6 +612,11 @@ txn_reconcile_stale() {
                 error "它的自动回滚仍武装着，此时改配置会被它覆盖回旧快照"
                 error "请先在「回滚中心 → 检查未完成的变更」中处置"
                 ;;
+            failed|restoring)
+                BLOCKED=1
+                error "遗留变更 ${LABEL:-未知}：$(txn_record_state_label "$STATE")"
+                error "请先在「回滚中心 → 检查未完成的变更」中核对，不会自动删除恢复材料"
+                ;;
         esac
     done < <(txn_pending_records)
     [ "$BLOCKED" = 0 ]
@@ -589,16 +635,28 @@ txn_review_menu() {
             ui_pause
             return 0
         fi
-        ui_hint "这些记录来自没有正常收尾的会话（崩溃、断线或被强制结束）"
-        ui_hint "Quench 不会自动删除回滚脚本：它们可能仍会按时正常触发"
+        ui_hint "这些记录表示未确认、失败或中断的配置变更，请先核对状态与日志"
+        ui_hint "未结束的计时器仍可能触发；失败记录与恢复材料不会被自动删除"
         echo ""
         INDEX=1
         for FILE in "${FILES[@]}"; do
             LABEL=$(txn_record_field "$FILE" LABEL)
             STARTED=$(txn_record_field "$FILE" STARTED)
-            STATE=$(txn_record_state_label "$(txn_record_state "$FILE")")
+            STATE=$(txn_record_state "$FILE")
+            SCRIPT=$(txn_record_field "$FILE" SCRIPT)
+            case "$STATE" in
+                mine|running)
+                    STATE=$(txn_record_state_label "$STATE")
+                    if [ -f "$SCRIPT.restoring" ]; then
+                        STATE="${STATE}；$(txn_record_state_label restoring)"
+                    elif [ -f "$SCRIPT.failed" ]; then
+                        STATE="${STATE}；$(txn_record_state_label failed)"
+                    fi ;;
+                *) STATE=$(txn_record_state_label "$STATE") ;;
+            esac
             echo -e "  ${GREEN}[$INDEX]${NC} ${BOLD}${LABEL:-未知}${NC}"
             echo -e "      ${DIM}开始：${NC}${STARTED:-未知}   ${DIM}状态：${NC}${STATE}"
+            [ ! -f "$SCRIPT.log" ] || echo "      日志：$SCRIPT.log"
             INDEX=$((INDEX + 1))
         done
         echo ""; menu_div
@@ -656,13 +714,14 @@ txn_review_menu() {
                     ui_pause
                     continue
                 fi
-                if bash "$SCRIPT" --now >/dev/null 2>&1; then
+                if safety_execute_rollback "$SCRIPT"; then
                     rm -f "$FILE"
                     audit_action "手动执行遗留回滚 $(basename "$FILE")" SUCCESS
                     info "回滚已执行 ✓"
                 else
                     audit_action "手动执行遗留回滚 $(basename "$FILE")" FAILED
                     error "回滚执行失败，请立即人工检查当前配置"
+                    safety_rollback_failure_details "$SCRIPT"
                 fi
                 [ "$HAD_LOCK" = 1 ] || txn_lock_release
                 ui_pause
@@ -671,6 +730,8 @@ txn_review_menu() {
                 REMOVED=0
                 for FILE in "${FILES[@]}"; do
                     SCRIPT=$(txn_record_field "$FILE" SCRIPT)
+                    # 即使脚本被外部移走，阶段标记仍代表未解决的失败，不能静默清理。
+                    [ ! -f "$SCRIPT.failed" ] && [ ! -f "$SCRIPT.restoring" ] || continue
                     if [ -n "$SCRIPT" ] && [ -f "$SCRIPT" ]; then
                         continue
                     fi
@@ -739,11 +800,16 @@ safety_arm() {
 
 safety_arm_locked() {
     local LABEL="$1" SNAP SCRIPT UFW_STATE="inactive" FIREWALLD_STATE="inactive"
+    local SCOPE=full UFW_STATUS
     local DELAY="${SAFETY_DELAY_SECONDS:-180}" RESTORE_ROOT="${CONFIG_RESTORE_ROOT:-/}"
     local RESOLV_IMMUTABLE="inactive" PATH_VALUE TARGET ROOTS_Q="" ROOT_ITEM ROOT_ITEM_Q
     local SNAP_Q SCRIPT_Q ROOT_Q LABEL_Q RESOLV_Q PROLOGUE
     local SYSCTL_RUNTIME="" DNS_BACKEND="static" DNS_IFACE="" DNS_EXPECTED="" DNS_FN="" DNS_IFACE_Q RESOLV_FILE_Q
     shift
+    case "$LABEL" in
+        ssh_login) SCOPE=ssh_login ;;
+        ufw|ufw_install|ssh_firewall_mode) SCOPE=ufw ;;
+    esac
     [[ "$DELAY" =~ ^[0-9]+$ ]] && [ "$DELAY" -ge 1 ] || DELAY=180
     if safety_timer_pending; then
         warn "检测到上一笔未确认的网络变更，先恢复上一笔配置"
@@ -768,7 +834,7 @@ safety_arm_locked() {
     done
     # DNS 运行态：记下快照时的后端和实际生效的上游。回滚只恢复文件是不够的，
     # 后端不重新读取（resolvconf -u / 重启 resolved）实际 DNS 还是新值；恢复后按同一套逻辑核对。
-    if [ "$RESTORE_ROOT" = / ]; then
+    if [ "$RESTORE_ROOT" = / ] && [ "$SCOPE" = full ]; then
         DNS_BACKEND=$(dns_backend_detect 2>/dev/null || true)
         case "$DNS_BACKEND" in ''|*[!A-Za-z-]*) DNS_BACKEND=static ;; esac
         DNS_IFACE=$(dns_nm_default_iface 2>/dev/null || true)
@@ -781,14 +847,24 @@ safety_arm_locked() {
         [ -n "$ROOT_ITEM" ] || continue
         printf -v ROOT_ITEM_Q '%q' "$ROOT_ITEM"
         ROOTS_Q="$ROOTS_Q $ROOT_ITEM_Q"
-    done < <(config_backup_allowed_roots)
+    done < <(safety_scope_roots "$LABEL")
     SNAP=$(config_backup_create "safety_${LABEL}" true) || return 1
-    if [ "$RESTORE_ROOT" = / ] && command -v lsattr >/dev/null 2>&1 \
+    if [ "$SCOPE" = full ] && [ "$RESTORE_ROOT" = / ] && command -v lsattr >/dev/null 2>&1 \
         && lsattr -d /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q i; then
         RESOLV_IMMUTABLE="active"
     fi
-    command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active' && UFW_STATE="active"
-    svc_is_active firewalld && FIREWALLD_STATE="active"
+    if [ "$SCOPE" = ufw ]; then
+        # 读取失败不能被当成 inactive，否则回滚会错误地关闭一个原本活跃的防火墙。
+        UFW_STATUS=$(LC_ALL=C ufw status) || { error "无法读取 UFW 当前状态，拒绝开始变更"; return 1; }
+        case "$UFW_STATUS" in
+            *'Status: active'*) UFW_STATE=active ;;
+            *'Status: inactive'*) UFW_STATE=inactive ;;
+            *) error "无法识别 UFW 当前状态，拒绝开始变更"; return 1 ;;
+        esac
+    elif [ "$SCOPE" = full ]; then
+        command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active' && UFW_STATE="active"
+        svc_is_active firewalld && FIREWALLD_STATE="active"
+    fi
     SCRIPT="$QUENCH_DATA_DIR/rollback_$$_$(date +%s)_${RANDOM}.sh"
     mkdir -p "$QUENCH_DATA_DIR"
     if [ "$RESTORE_ROOT" = / ]; then TARGET=/etc/resolv.conf; else TARGET="${RESTORE_ROOT%/}/etc/resolv.conf"; fi
@@ -803,108 +879,145 @@ safety_arm_locked() {
     cat > "$SCRIPT" <<ROLLBACK_EOF
 $PROLOGUE
 $DNS_FN
-chattr -i $RESOLV_Q >/dev/null 2>&1 || true
+quench_rollback_ssh() {
+    rollback_step "SSH 配置语法检查"
+    if ! command -v sshd >/dev/null 2>&1; then
+        rollback_fail "找不到 sshd，无法验证 SSH 恢复"
+    elif sshd -t; then
+        rollback_step "重启 SSH 服务"
+        systemctl restart ssh || systemctl restart sshd \\
+            || service ssh restart || service sshd restart || rollback_fail
+    else
+        rollback_fail
+    fi
+}
+quench_rollback_ufw() {
+    rollback_step "恢复 UFW 运行状态：$UFW_STATE"
+    if [ '$UFW_STATE' = active ]; then
+        ufw --force enable || rollback_fail
+    else
+        ufw --force disable || rollback_fail
+    fi
+    rollback_step "验证 UFW 运行状态：$UFW_STATE"
+    UFW_STATUS=\$(LC_ALL=C ufw status) || { rollback_fail; return; }
+    printf '%s\n' "\$UFW_STATUS" | grep -qx 'Status: $UFW_STATE' || rollback_fail
+}
+if [ '$SCOPE' = full ]; then chattr -i $RESOLV_Q >/dev/null 2>&1 || true; fi
 # 精确恢复，与配置导入同一语义。原来是 tar -xzf 直接解压合并：快照之后新增的文件
 # （例如导入带来的 sshd_config.d/99-deny.conf）会留下，回滚后的状态并不等于快照。
 # 快照里有的根整个替换，快照里没有的允许根删除（快照时它就不存在）；目录先在同一
 # 文件系统复制好再切换，复制失败原目录不动。
 RC=0
+rollback_step "创建解包目录"
 STAGE=\$(mktemp -d "\${TMPDIR:-/tmp}/quench-rollback.XXXXXX") || exit 1
-tar -xzf $SNAP_Q -C "\$STAGE" >/dev/null 2>&1 || { rm -rf "\$STAGE"; exit 1; }
+rollback_step "解包配置快照"
+tar -xzf $SNAP_Q -C "\$STAGE" || { rollback_fail; rm -rf "\$STAGE"; exit 1; }
 for ROOT in $ROOTS_Q; do
     SRC="\$STAGE/\$ROOT"
     DEST="${RESTORE_ROOT%/}/\$ROOT"
+    rollback_step "恢复文件：\$DEST"
     if [ -e "\$SRC" ] || [ -L "\$SRC" ]; then
-        mkdir -p "\$(dirname "\$DEST")" || { RC=1; continue; }
-        rm -rf "\$DEST.quench-new" "\$DEST.quench-old"
+        mkdir -p "\$(dirname "\$DEST")" || { rollback_fail; continue; }
+        rm -rf "\$DEST.quench-new" "\$DEST.quench-old" || { rollback_fail; continue; }
         if [ -d "\$SRC" ] && [ ! -L "\$SRC" ]; then
             # 目录不能 rename 覆盖，只能两步：复制好 -> 挪走旧的 -> 换上新的
-            cp -a "\$SRC" "\$DEST.quench-new" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }
-            if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then mv "\$DEST" "\$DEST.quench-old" || { rm -rf "\$DEST.quench-new"; RC=1; continue; }; fi
-            if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old"
-            else [ ! -e "\$DEST.quench-old" ] || mv "\$DEST.quench-old" "\$DEST"; rm -rf "\$DEST.quench-new"; RC=1
+            cp -a "\$SRC" "\$DEST.quench-new" || { rm -rf "\$DEST.quench-new"; rollback_fail; continue; }
+            if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then mv "\$DEST" "\$DEST.quench-old" || { rm -rf "\$DEST.quench-new"; rollback_fail; continue; }; fi
+            if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old" || rollback_fail
+            else [ ! -e "\$DEST.quench-old" ] || mv "\$DEST.quench-old" "\$DEST"; rm -rf "\$DEST.quench-new"; rollback_fail
             fi
         else
             # 普通文件：同目录一次 rename 直接覆盖，主路径任何时刻都存在。
             # 目标当前是目录（导入把文件换成了目录）时 rename 会把文件挪进目录里，
             # 只能像目录那样两步切换。
-            cp -a "\$SRC" "\$DEST.quench-new" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
+            cp -a "\$SRC" "\$DEST.quench-new" || { rm -f "\$DEST.quench-new"; rollback_fail; continue; }
             if [ -d "\$DEST" ] && [ ! -L "\$DEST" ]; then
-                mv "\$DEST" "\$DEST.quench-old" || { rm -f "\$DEST.quench-new"; RC=1; continue; }
-                if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old"
-                else mv "\$DEST.quench-old" "\$DEST"; rm -f "\$DEST.quench-new"; RC=1
+                mv "\$DEST" "\$DEST.quench-old" || { rm -f "\$DEST.quench-new"; rollback_fail; continue; }
+                if mv "\$DEST.quench-new" "\$DEST"; then rm -rf "\$DEST.quench-old" || rollback_fail
+                else mv "\$DEST.quench-old" "\$DEST"; rm -f "\$DEST.quench-new"; rollback_fail
                 fi
             else
-                mv -f "\$DEST.quench-new" "\$DEST" || { rm -f "\$DEST.quench-new"; RC=1; }
+                mv -f "\$DEST.quench-new" "\$DEST" || { rm -f "\$DEST.quench-new"; rollback_fail; }
             fi
         fi
     else
         # 快照里没有 = 快照时不存在；删不掉就没有恢复到快照状态，必须计入
-        rm -rf "\$DEST" || RC=1
-        if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then RC=1; fi
+        if [ '$SCOPE' = ssh_login ]; then
+            rollback_fail "快照缺少 SSH 主配置，拒绝删除现有配置：\$DEST"
+        else
+            rm -rf "\$DEST" || rollback_fail
+            if [ -e "\$DEST" ] || [ -L "\$DEST" ]; then rollback_fail; fi
+        fi
     fi
 done
 rm -rf "\$STAGE"
 if [ '$RESOLV_IMMUTABLE' = active ]; then chattr +i $RESOLV_Q >/dev/null 2>&1 || true; fi
 if [ $ROOT_Q != / ]; then rollback_finish "\$RC"; fi
+# 局部事务不刷新任何无关组件；文件未恢复成功时，不加载可能不完整的配置。
+case '$SCOPE' in
+    ssh_login)
+        if [ "\$RC" -eq 0 ]; then quench_rollback_ssh; fi
+        rollback_finish "\$RC" ;;
+    ufw)
+        if [ "\$RC" -eq 0 ]; then quench_rollback_ufw; fi
+        rollback_finish "\$RC" ;;
+esac
 # RC 汇总必要步骤的结果（延续上面文件恢复的结果）。原来这些全是 || true，任何一步
 # 失败都被吞掉，脚本照样记录成功并删掉自己，调用方据此认为回滚已完成。
 # 只统计该组件确实存在时的失败；组件本来就没装不算失败。
 if command -v sysctl >/dev/null 2>&1; then
-    sysctl --system >/dev/null 2>&1 || RC=1
+    rollback_step "加载 sysctl 配置"
+    sysctl --system || rollback_fail
     # 逐项恢复事务开始前采集的运行值并回读核对（列表为空时什么都不做）
     while IFS='|' read -r KEY VALUE; do
         [ -n "\$KEY" ] || continue
-        sysctl -w "\$KEY=\$VALUE" >/dev/null 2>&1 || RC=1
-        [ "\$(sysctl -n "\$KEY" 2>/dev/null)" = "\$VALUE" ] || RC=1
+        rollback_step "恢复并验证 sysctl：\$KEY"
+        sysctl -w "\$KEY=\$VALUE" || rollback_fail
+        [ "\$(sysctl -n "\$KEY")" = "\$VALUE" ] || rollback_fail
     done <<'SYSCTL_RUNTIME_EOF'
 $SYSCTL_RUNTIME
 SYSCTL_RUNTIME_EOF
 fi
 if command -v sshd >/dev/null 2>&1; then
-    if sshd -t >/dev/null 2>&1; then
-        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null \
-            || service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || RC=1
-    else
-        RC=1
-    fi
+    quench_rollback_ssh
 fi
 # DNS：按快照时的后端刷新运行态（失败计入 RC），再核对实际生效的上游——
 # 与 DNS 模块同一条判定：快照时的上游至少有一个仍在生效列表里。
+rollback_step "刷新 DNS 后端：$DNS_BACKEND"
 case "$DNS_BACKEND" in
-    resolvconf) resolvconf -u >/dev/null 2>&1 || RC=1 ;;
+    resolvconf) resolvconf -u || rollback_fail ;;
     systemd-resolved)
-        systemctl restart systemd-resolved >/dev/null 2>&1 || RC=1
+        systemctl restart systemd-resolved || rollback_fail
         resolvectl flush-caches >/dev/null 2>&1 || true
         ;;
-    NetworkManager) systemctl restart NetworkManager >/dev/null 2>&1 || RC=1 ;;
+    NetworkManager) systemctl restart NetworkManager || rollback_fail ;;
 esac
 if [ -n "$DNS_EXPECTED" ]; then
+    rollback_step "验证 DNS 上游"
     DNS_EFFECTIVE=\$(quench_dns_effective "$DNS_BACKEND" $DNS_IFACE_Q $RESOLV_FILE_Q)
     DNS_OK=0
     for S in $DNS_EXPECTED; do printf '%s\n' "\$DNS_EFFECTIVE" | grep -Fxq "\$S" && DNS_OK=1; done
-    [ "\$DNS_OK" -eq 1 ] || RC=1
+    [ "\$DNS_OK" -eq 1 ] || rollback_fail "DNS 上游不匹配：期望至少一个 [$DNS_EXPECTED]，实际 [\$DNS_EFFECTIVE]"
 fi
 if command -v ufw >/dev/null 2>&1; then
-    if [ '$UFW_STATE' = active ]; then
-        ufw --force enable >/dev/null 2>&1 || RC=1
-    else
-        ufw --force disable >/dev/null 2>&1 || RC=1
-    fi
+    quench_rollback_ufw
 fi
 if command -v firewall-cmd >/dev/null 2>&1; then
+    rollback_step "恢复 firewalld 运行状态：$FIREWALLD_STATE"
     if [ '$FIREWALLD_STATE' = active ]; then
-        systemctl start firewalld >/dev/null 2>&1 || RC=1
+        systemctl start firewalld || rollback_fail
     else
-        systemctl stop firewalld >/dev/null 2>&1 || RC=1
+        systemctl stop firewalld || rollback_fail
     fi
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 if command -v nft >/dev/null 2>&1 && [ -f /etc/nftables.conf ]; then
-    nft -f /etc/nftables.conf >/dev/null 2>&1 || RC=1
+    rollback_step "加载 nftables 配置"
+    nft -f /etc/nftables.conf || rollback_fail
 fi
 if [ -x /usr/local/libexec/quench-nft-forward-apply ]; then
-    /usr/local/libexec/quench-nft-forward-apply >/dev/null 2>&1 || RC=1
+    rollback_step "恢复 Quench NFT 转发"
+    /usr/local/libexec/quench-nft-forward-apply || rollback_fail
 fi
 if [ "\$RC" -eq 0 ]; then
     logger -t quench "未确认连接，已自动恢复 $LABEL_Q 配置"
@@ -963,7 +1076,11 @@ safety_confirm() {
     }
     echo ""
     warn "请保持当前连接，并用新终端确认 SSH 和网络正常。"
-    read -rp "  确认连接正常，取消自动回滚？(y/N): " OK
+    ui_hint "输入有误会重新询问，但自动回滚倒计时不会暂停或延长。"
+    ui_read_yes_no OK "  确认连接正常，取消自动回滚？(y/N): " n || {
+        warn "未确认连接，自动回滚保护不会取消；请保持旧连接并检查配置状态。"
+        return 1
+    }
     if echo "$OK" | grep -qiE '^y(es)?$'; then
         # 等待输入期间倒计时可能已经到期并回滚：必须在取消前重新核对，
         # 否则这里会对一个已经不存在的计时器说“已取消”。

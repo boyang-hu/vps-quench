@@ -355,7 +355,7 @@ t_fi_009() {
     get_config() { echo 2222; }
     ufw() {
         printf '%s\n' "$*" >> "$UFW_LOG"
-        [ "$1 $2" != "limit 2222/tcp" ]
+        [ "$1 ${2:-}" != "limit 2222/tcp" ]
     }
     fw_install ufw <<< $'1\nn' >/dev/null 2>&1 && { echo "UFW install succeeded after SSH allow failure" >&2; exit 1; }
     ! grep -q -- '--force enable' "$UFW_LOG" || { echo "UFW was enabled without its SSH rule" >&2; sed 's/^/  /' "$UFW_LOG" >&2; exit 1; }
@@ -510,7 +510,8 @@ t_fi_016() {
             --zone=public) return 0 ;;
         esac
     }
-    fw_install firewalld </dev/null >/dev/null 2>&1 || { echo "Safe firewalld installation failed" >&2; exit 1; }
+    # Enter accepts the default of not opening Web ports; EOF now cancels instead.
+    fw_install firewalld <<< '' >/dev/null 2>&1 || { echo "Safe firewalld installation failed" >&2; exit 1; }
     OFFLINE_LINE=$(grep -n 'OFFLINE .*--add-port=2222/tcp' "$FWD_LOG" | cut -d: -f1)
     START_LINE=$(grep -n '^START$' "$FWD_LOG" | cut -d: -f1)
     [ -n "$OFFLINE_LINE" ] && [ -n "$START_LINE" ] && [ "$OFFLINE_LINE" -lt "$START_LINE" ] \
@@ -2144,7 +2145,7 @@ t_genrb_001() {
         || { echo "the generated script does not track a result code" >&2; exit 1; }
     grep -q 'rollback_finish "\$RC"' "$SAFETY_SCRIPT" \
         || { echo "the generated script does not exit with its result code" >&2; exit 1; }
-    grep -q 'sysctl --system >/dev/null 2>&1 || RC=1' "$SAFETY_SCRIPT" \
+    grep -q 'sysctl --system || rollback_fail' "$SAFETY_SCRIPT" \
         || { echo "the generated script still swallows a failed sysctl reload" >&2; exit 1; }
     :
 }
@@ -3139,5 +3140,198 @@ t_review_009() {
 run_test "The SSH baseline hash comes from the untouched candidate and is mandatory" t_review_009
 
 
+
+# SSH / UFW 的真实生成器与真实文件恢复；仅系统命令使用替身。
+scoped_rollback_setup() {
+    review_setup "scoped-$1"
+    export QUENCH_TEST_PROBE="$PROBE"
+    SSHD_CONFIG=/etc/ssh/sshd_config
+    QUENCH_UFW_DEFAULTS_FILE=/etc/default/ufw
+    QUENCH_SSH_FIREWALL_MODE_FILE=/etc/quench/ssh-firewall-mode
+    mkdir -p "$PROBE/shim" "$CONFIG_RESTORE_ROOT/etc/default" "$CONFIG_RESTORE_ROOT/etc/ufw" \
+        "$CONFIG_RESTORE_ROOT/etc/quench" "$CONFIG_RESTORE_ROOT/root/.ssh"
+    printf 'DEFAULT_INPUT_POLICY="ACCEPT"\n' > "$CONFIG_RESTORE_ROOT/etc/default/ufw"
+    printf 'old rules\n' > "$CONFIG_RESTORE_ROOT/etc/ufw/user.rules"
+    printf 'limit\n' > "$CONFIG_RESTORE_ROOT/etc/quench/ssh-firewall-mode"
+    printf 'inactive\n' > "$PROBE/ufw-state"
+    : > "$PROBE/commands"
+    cat > "$PROBE/shim/tool" <<'SHIM'
+#!/bin/bash
+P="$QUENCH_TEST_PROBE"; NAME="${0##*/}"
+printf '%s %s\n' "$NAME" "$*" >> "$P/commands"
+case "$NAME" in
+    sshd)
+        [ ! -f "$P/fail-sshd" ] || { echo 'injected sshd syntax error' >&2; exit 2; } ;;
+    systemctl|service)
+        case "$*" in
+            'restart ssh'|'restart sshd'|'ssh restart'|'sshd restart')
+                [ ! -f "$P/fail-restart" ] || { echo 'injected SSH restart failure' >&2; exit 3; } ;;
+            *) echo 'unexpected service call' >&2; exit 99 ;;
+        esac ;;
+    ufw)
+        case "$*" in
+            status)
+                [ ! -f "$P/fail-status" ] || { echo 'injected ufw status failure' >&2; exit 4; }
+                printf 'Status: %s\n' "$(cat "$P/ufw-state")" ;;
+            '--force enable'|'--force disable')
+                [ ! -f "$P/fail-ufw" ] || { echo 'injected ufw restore failure' >&2; exit 5; }
+                if [ "$2" = enable ]; then echo active; else echo inactive; fi > "$P/ufw-state" ;;
+            *) echo 'unexpected ufw call' >&2; exit 99 ;;
+        esac ;;
+    logger) : ;;
+    *) echo "FORBIDDEN unrelated command: $NAME" >&2; exit 99 ;;
+esac
+SHIM
+    chmod +x "$PROBE/shim/tool"
+    local N
+    for N in sshd systemctl service ufw sysctl nft chattr resolvectl resolvconf nmcli firewall-cmd logger; do
+        ln -s "$PROBE/shim/tool" "$PROBE/shim/$N"
+    done
+    export PATH="$PROBE/shim:$PATH"
+}
+
+scoped_rollback_arm() {
+    safety_arm "$1" >/dev/null 2>&1 || fail "could not arm $1"
+    SCRIPT="$SAFETY_SCRIPT"
+    # 测试根通常直接跳过运行态；此处仅去掉这一条测试保护，文件目标仍在临时根内，
+    # 所有运行态命令都有 PATH 替身，不接触宿主机 SSH / 防火墙 / sysctl。
+    sed '/^if \[ .* != \/ \]; then rollback_finish .*; fi$/d' "$SCRIPT" > "$SCRIPT.test"
+    mv "$SCRIPT.test" "$SCRIPT"
+    bash -n "$SCRIPT" || fail 'generated script syntax'
+}
+
+t_scoped_ssh() {
+    scoped_rollback_setup ssh
+    scoped_rollback_arm ssh_login
+    printf 'PasswordAuthentication no\n' > "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config"
+    printf 'keep DNS\n' > "$CONFIG_RESTORE_ROOT/etc/resolv.conf"
+    printf 'keep key\n' > "$CONFIG_RESTORE_ROOT/root/.ssh/authorized_keys"
+    printf 'keep ufw\n' > "$CONFIG_RESTORE_ROOT/etc/ufw/user.rules"
+    printf 'keep dropin\n' > "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config.d/new.conf"
+    assert_ok safety_rollback_now
+    assert_file_contains "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config" 'PasswordAuthentication yes'
+    assert_file_contains "$CONFIG_RESTORE_ROOT/etc/resolv.conf" 'keep DNS'
+    assert_file_contains "$CONFIG_RESTORE_ROOT/root/.ssh/authorized_keys" 'keep key'
+    assert_file_contains "$CONFIG_RESTORE_ROOT/etc/ufw/user.rules" 'keep ufw'
+    assert_file_contains "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config.d/new.conf" 'keep dropin'
+    assert_file_contains "$PROBE/commands" 'systemctl restart ssh'
+    assert_fail grep -E '^(sysctl|nft|ufw|chattr|resolvectl|resolvconf|nmcli|firewall-cmd) ' "$PROBE/commands"
+    assert_file_contains "$SCRIPT.log" 'RESULT: SUCCESS'
+    assert_fail test -e "$SCRIPT"
+    assert_eq "$(ls -l "$SCRIPT.log" | awk '{print substr($1,1,10)}')" '-rw-------'
+}
+run_test 'Scoped SSH rollback restores only its main config and SSH runtime' t_scoped_ssh
+
+t_scoped_ssh_failure() {
+    scoped_rollback_setup "$1"
+    scoped_rollback_arm ssh_login
+    printf 'PasswordAuthentication no\n' > "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config"
+    : > "$PROBE/$1"
+    assert_fail safety_rollback_now
+    assert_file_contains "$SCRIPT.log" "$2"
+    assert_file_contains "$SCRIPT.log" 'RESULT: FAILED'
+    assert_ok test -f "$SCRIPT.failed"
+    assert_ok test -f "$SCRIPT"
+    assert_ok test -f "$QUENCH_TXN_FILE"
+    assert_eq "$QUENCH_TXN_LOCK_HELD" 1
+    if [ "$1" = fail-sshd ]; then assert_fail grep -q restart "$PROBE/commands"; fi
+    rm -f "$PROBE/$1"
+    assert_ok safety_rollback_now
+    assert_fail test -e "$SCRIPT.failed"
+    assert_file_contains "$SCRIPT.log" 'RESULT: SUCCESS'
+}
+run_test 'Scoped SSH syntax failure keeps evidence and logs the actual error' t_scoped_ssh_failure fail-sshd 'injected sshd syntax error'
+run_test 'Scoped SSH restart failure keeps evidence and logs the actual error' t_scoped_ssh_failure fail-restart 'injected SSH restart failure'
+
+t_scoped_ufw() {
+    scoped_rollback_setup "ufw-$1"
+    umask 022
+    printf '%s\n' "$1" > "$PROBE/ufw-state"
+    scoped_rollback_arm ufw_install
+    printf 'DEFAULT_INPUT_POLICY="DROP"\n' > "$CONFIG_RESTORE_ROOT/etc/default/ufw"
+    printf 'new rules\n' > "$CONFIG_RESTORE_ROOT/etc/ufw/user.rules"
+    printf 'panel\n' > "$CONFIG_RESTORE_ROOT/etc/quench/ssh-firewall-mode"
+    printf 'keep ssh\n' > "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config"
+    printf 'keep DNS\n' > "$CONFIG_RESTORE_ROOT/etc/resolv.conf"
+    if [ "$1" = active ]; then echo inactive; else echo active; fi > "$PROBE/ufw-state"
+    rm -f "$CONFIG_RESTORE_ROOT/etc/default/ufw"
+    rmdir "$CONFIG_RESTORE_ROOT/etc/default"
+    assert_ok safety_rollback_now
+    assert_eq "$(ls -ld "$CONFIG_RESTORE_ROOT/etc/default" | awk '{print substr($1,1,10)}')" 'drwxr-xr-x'
+    assert_file_contains "$CONFIG_RESTORE_ROOT/etc/default/ufw" 'ACCEPT'
+    assert_file_contains "$CONFIG_RESTORE_ROOT/etc/ufw/user.rules" 'old rules'
+    assert_file_contains "$CONFIG_RESTORE_ROOT/etc/quench/ssh-firewall-mode" 'limit'
+    assert_file_contains "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config" 'keep ssh'
+    assert_file_contains "$CONFIG_RESTORE_ROOT/etc/resolv.conf" 'keep DNS'
+    assert_eq "$(cat "$PROBE/ufw-state")" "$1"
+    assert_fail grep -E '^(sysctl|nft|sshd|systemctl|service|chattr|resolvectl|resolvconf|nmcli|firewall-cmd) ' "$PROBE/commands"
+}
+run_test 'Scoped UFW rollback restores default policy and previously inactive state only' t_scoped_ufw inactive
+run_test 'Scoped UFW rollback restores default policy and previously active state only' t_scoped_ufw active
+
+t_scoped_failed_states() {
+    scoped_rollback_setup states
+    scoped_rollback_arm ufw_install
+    : > "$PROBE/fail-ufw"
+    assert_fail safety_rollback_now
+    assert_file_contains "$SCRIPT.log" 'injected ufw restore failure'
+    REC="$QUENCH_TXN_FILE"
+    review_menu_stubs
+    assert_eq "$(txn_record_state "$REC")" mine
+    assert_contains "$(txn_review_menu <<< 0)" '回滚已失败'
+    sed 's/^QUENCH_PID=.*/QUENCH_PID=999999/' "$REC" > "$REC.new"
+    mv "$REC.new" "$REC"
+    assert_eq "$(txn_record_state "$REC")" failed
+    assert_fail txn_reconcile_stale
+    : > "$SCRIPT.restoring"
+    assert_eq "$(txn_record_state "$REC")" restoring
+    assert_fail txn_reconcile_stale
+    # 失败脚本被外部移走也不能默默清掉仍有阶段标记的记录。
+    rm -f "$SCRIPT" "$SCRIPT.restoring"
+    assert_eq "$(txn_record_state "$REC")" failed
+    assert_fail txn_reconcile_stale
+    review_menu_stubs
+    assert_ok txn_review_menu <<< $'2\n0'
+    assert_ok test -f "$REC"
+}
+run_test 'Failed or interrupted rollback records remain visible and block new writes' t_scoped_failed_states
+
+t_scoped_status_failure() {
+    scoped_rollback_setup status
+    : > "$PROBE/fail-status"
+    assert_fail safety_arm ufw_install
+    assert_eq "$SAFETY_SCRIPT" ''
+    assert_eq "$QUENCH_TXN_LOCK_HELD" 0
+    assert_fail grep -q -- '--force' "$PROBE/commands"
+}
+run_test 'UFW status read failure cannot be mistaken for an inactive snapshot' t_scoped_status_failure
+
+t_scoped_archive_failure() {
+    scoped_rollback_setup archive
+    scoped_rollback_arm ssh_login
+    SNAP=$(txn_record_field "$QUENCH_TXN_FILE" SNAPSHOT)
+    rm -f "$SNAP"
+    assert_fail safety_rollback_now
+    assert_file_contains "$SCRIPT.log" 'FAILED: 解包配置快照'
+    assert_ok test -f "$SCRIPT.failed"
+    assert_fail grep -q restart "$PROBE/commands"
+}
+run_test 'Missing rollback snapshot logs extraction failure without restarting SSH' t_scoped_archive_failure
+
+t_scoped_log_failure() {
+    scoped_rollback_setup log_failure
+    scoped_rollback_arm ssh_login
+    printf 'PasswordAuthentication no\n' > "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config"
+    # 用目录占位，root / 非 root 下都能稳定模拟无法打开日志，不能因此跳过 SSH 恢复。
+    mkdir "$SCRIPT.log"
+    local OUTPUT RC=0
+    OUTPUT=$(safety_rollback_now 2>&1) || RC=$?
+    assert_eq "$RC" 0
+    assert_contains "$OUTPUT" '无法写入回滚日志'
+    assert_file_contains "$CONFIG_RESTORE_ROOT/etc/ssh/sshd_config" 'PasswordAuthentication yes'
+    assert_file_contains "$PROBE/commands" 'systemctl restart ssh'
+    assert_fail test -f "$SCRIPT"
+}
+run_test 'Unavailable rollback log never prevents restoring SSH' t_scoped_log_failure
 
 test_summary "Fault injection"
