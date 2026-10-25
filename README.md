@@ -1,4 +1,4 @@
-# Quench — VPS 初始化与管理工具 V0.1.7
+# Quench — VPS 初始化与管理工具 V0.1.8
 
 > 首次开荒 · 用户与 SSH · Fail2ban · Firewall · BBR/FQ · DNS · Caddy 网站入口 · 系统与服务管理
 
@@ -28,24 +28,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 适合不能访问 GitHub 的中国内地 VPS。先在一台可以访问 GitHub 的电脑或跳板机下载：
 
 ```bash
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.7/quench-offline-V0.1.7.tar.gz
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.7/quench-offline-V0.1.7.tar.gz.sha256
-sha256sum -c quench-offline-V0.1.7.tar.gz.sha256
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.8/quench-offline-V0.1.8.tar.gz
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.8/quench-offline-V0.1.8.tar.gz.sha256
+sha256sum -c quench-offline-V0.1.8.tar.gz.sha256
 ```
 
 再通过 `scp`、SFTP 或 WinSCP 将两个文件传到 VPS。Linux/macOS 示例：
 
 ```bash
-scp quench-offline-V0.1.7.tar.gz* root@你的VPS地址:/root/
+scp quench-offline-V0.1.8.tar.gz* root@你的VPS地址:/root/
 ```
 
 登录 VPS 后离线安装：
 
 ```bash
 cd /root
-sha256sum -c quench-offline-V0.1.7.tar.gz.sha256
-tar -xzf quench-offline-V0.1.7.tar.gz
-cd quench-offline-V0.1.7
+sha256sum -c quench-offline-V0.1.8.tar.gz.sha256
+tar -xzf quench-offline-V0.1.8.tar.gz
+cd quench-offline-V0.1.8
 bash install.sh
 v
 ```
@@ -115,7 +115,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
  ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.7  ·  Boyang
+  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.8  ·  Boyang
 ────────────────────────────────────────────────────────────────
   SSH · BBR · DNS · Caddy · Firewall · NFT · Docker
 
@@ -737,6 +737,7 @@ BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-me
 
 | 版本 | Quench 主要变更 |
 |------|----------------|
+| **V0.1.8** | 自动安全更新按内容识别不同厂商的禁用配置，确认后逐文件备份接管并支持失败恢复，保留复杂策略和外部修改；y/n 确认输入错误时重新询问，保持默认选项且不延长回滚计时；SSH/UFW 回滚按变更范围恢复，增加逐步骤日志、UFW 命令诊断与失败状态检查；新增 UFW SSH 的 1Panel 兼容 `ALLOW` 模式及已有规则迁移。 |
 | **V0.1.7** | 实测网络调优与独立 BBR/FQ、tc 操作，首次开荒接入性能方案选择；Fail2ban 与 1Panel 共享基础配置；系统与软件更新中心、Debian 12 → 13 受控升级、云镜像源预检及自动安全更新冲突处理；升级支持 tmux 安装与会话接续；系统概览显示发行版与内核；Debian 12/13 用户改名保留 UID/GID，提供临时维护账号、清理及失败恢复入口。 |
 | **V0.1.6** | 回滚脚本按快照时的 DNS 后端刷新运行态（resolvconf -u / 重启 systemd-resolved / 重启 NetworkManager，失败计入回滚结果），并用与 DNS 模块相同的读取逻辑核对实际生效的上游；safety_arm 新增 --sysctl-runtime=FILE，首次开荒内核安全基线把旧运行值随事务保存，延迟回滚逐项 sysctl -w 恢复并回读核对。 |
 | **V0.1.5** | 回滚中心接管遗留记录改为在事务锁内进行，并在锁内重新核对记录状态，原会话仍在运行或持锁时拒绝接管；事务记录新增 SNAPSHOT 字段，备份轮换跳过未完成事务依赖的快照；initcwnd 设置/移除接入事务锁（默认路由会被出口源地址回滚整条替换），盘点脚本识别 ip route 等运行时写入；配置导入拒绝目录与非目录之间的类型变化（校验与解包各查一次），回滚在目标已变成目录时也能把文件换回来。 |
