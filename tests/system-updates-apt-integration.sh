@@ -61,19 +61,57 @@ grep -q '/dists/trixie-security/' "$QUENCH_TEST_APT_ROOT/cloud-uris"
 mkdir -p "$QUENCH_UPDATE_APT_DIR/apt.conf.d"
 printf '%s\n' 'APT::Periodic::Enable "0";' 'APT::Periodic::Update-Package-Lists "0";' \
     'APT::Periodic::Unattended-Upgrade "0";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
-system_update_auto_template_safe "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
-system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-good" yes
-if system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-disabled" no; then
+system_update_auto_templates_scan > "$QUENCH_TEST_APT_ROOT/templates.list"
+system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-good" "$QUENCH_TEST_APT_ROOT/templates.list"
+: > "$QUENCH_TEST_APT_ROOT/no-templates.list"
+if system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-disabled" "$QUENCH_TEST_APT_ROOT/no-templates.list"; then
     echo 'Real APT ignored the late template override' >&2; exit 1
 fi
+# Match the reported cloud-image policy, a second arbitrary .conf fragment and
+# a pure disabling apt.conf. All must be removed only in the staged copy.
+printf '%s\n' 'APT::Periodic::Enable "0";' 'APT::Periodic::Update-Package-Lists "0";' \
+    'APT::Periodic::Download-Upgradeable-Packages "0";' 'APT::Periodic::Unattended-Upgrade "0";' \
+    'Unattended-Upgrade::Automatic-Reboot "false";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99zz-ppflight-no-auto-upgrades"
+echo 'APT::Periodic::Enable "0";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/98-provider.conf"
+echo 'APT::Periodic::Unattended-Upgrade "0";' > "$QUENCH_UPDATE_APT_DIR/apt.conf"
+echo 'Unattended-Upgrade::Automatic-Reboot "false";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-no-reboot"
+echo 'APT::Periodic::AutocleanInterval "0";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-no-cleanup"
+echo 'Acquire::Retries "3";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-network"
+system_update_auto_templates_scan > "$QUENCH_TEST_APT_ROOT/templates.list"
+[ "$(wc -l < "$QUENCH_TEST_APT_ROOT/templates.list" | tr -d ' ')" = 4 ]
+system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-multi" "$QUENCH_TEST_APT_ROOT/templates.list"
+grep -q 'Acquire::Retries "3";' "$QUENCH_TEST_APT_ROOT/auto-multi/effective"
+grep -q 'APT::Periodic::AutocleanInterval "0";' "$QUENCH_TEST_APT_ROOT/auto-multi/effective"
+test -f "$QUENCH_TEST_APT_ROOT/auto-multi/parts/99-no-reboot"
+grep -q '"0"' "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99zz-ppflight-no-auto-upgrades"
+grep -q '"0"' "$QUENCH_UPDATE_APT_DIR/apt.conf"
+
+# A new file that was not in the approved plan must still block the candidate.
 echo 'APT::Periodic::Enable "0";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-admin-policy"
-if system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-admin" yes; then
+if system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-admin" "$QUENCH_TEST_APT_ROOT/templates.list"; then
     echo 'Candidate validation bypassed an administrator override' >&2; exit 1
 fi
+# Mixed policies cannot be selected even when their disabling key is familiar.
+echo 'Acquire::http::Proxy "http://example.invalid:8080";' >> "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-admin-policy"
+if system_update_auto_templates_scan; then
+    echo 'Discovery took over mixed administrator settings' >&2; exit 1
+fi
 rm "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-admin-policy"
+# Exclude an edited main file from the removal list: its late override must not
+# be hidden by the staged Quench policy. The transaction also rechecks contents.
 echo 'Unattended-Upgrade::Automatic-Reboot "true";' > "$QUENCH_UPDATE_APT_DIR/apt.conf"
-if system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-main" yes; then
+system_update_auto_templates_scan > "$QUENCH_TEST_APT_ROOT/templates.list"
+if system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-main" "$QUENCH_TEST_APT_ROOT/templates.list"; then
     echo 'Candidate validation bypassed the main apt.conf' >&2; exit 1
 fi
+# Symlinked disabling fragments stay untouched and still fail real validation.
+rm "$QUENCH_UPDATE_APT_DIR/apt.conf"
+echo 'APT::Periodic::Enable "0";' > "$QUENCH_TEST_APT_ROOT/external-policy"
+ln -s "$QUENCH_TEST_APT_ROOT/external-policy" "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99zz-linked"
+system_update_auto_templates_scan > "$QUENCH_TEST_APT_ROOT/templates.list"
+if system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-linked" "$QUENCH_TEST_APT_ROOT/templates.list"; then
+    echo 'Candidate validation bypassed a symlinked disabling policy' >&2; exit 1
+fi
+test -L "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99zz-linked"
 grep -q '"0"' "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
 echo "Real APT parsing and security-policy isolation passed on $CODE."

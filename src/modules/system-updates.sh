@@ -501,29 +501,73 @@ sys.exit(1 if problems else 0)
 ' || { error "自动安全更新策略未通过验证；请核对以上具体键值及 /etc/apt/apt.conf.d、/etc/apt/apt.conf"; return 1; }
 }
 
-# Only this known, pure disabling template can be moved automatically. A file
-# with extra directives (including #include/#clear) requires manual review.
-system_update_auto_template_safe() {
-    python3 - "$1" <<'PY'
+# Discover by content, not vendor filename. Only whole, regular files containing
+# flat disabling switches (and optional no-reboot policy) can be taken over.
+# Unknown syntax, includes and mixed administrator settings stay untouched;
+# real APT candidate validation remains authoritative about effective policy.
+system_update_auto_templates_scan() {
+    python3 - "$QUENCH_UPDATE_APT_DIR" <<'PY'
 import pathlib, re, sys
-p = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[1])
+periodic = re.compile(r'APT::Periodic::(Enable|Update-Package-Lists|Download-Upgradeable-Packages|Unattended-Upgrade|AutocleanInterval)\s+"0"\s*;\s*(?://.*)?', re.I)
+no_reboot = re.compile(r'Unattended-Upgrade::Automatic-Reboot\s+"(?:false|no|0)"\s*;\s*(?://.*)?', re.I)
+required = {'enable', 'update-package-lists', 'unattended-upgrade'}
 try:
-    if p.is_symlink() or not p.is_file():
-        raise ValueError('不是普通文件')
-    count = 0
-    for line in p.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith('//'):
+    parts = root / 'apt.conf.d'
+    if root.is_symlink() or parts.is_symlink() or not parts.is_dir():
+        raise ValueError('APT 配置目录必须是普通目录：' + str(parts))
+    paths = [p for p in sorted(parts.iterdir())
+             if re.fullmatch(r'[A-Za-z0-9_.-]+', p.name) and not p.name.startswith('.')
+             and p.suffix in ('', '.conf')
+             and p.name not in ('20auto-upgrades', '52quench-unattended-upgrades')]
+    if (root / 'apt.conf').exists() or (root / 'apt.conf').is_symlink():
+        paths.append(root / 'apt.conf')
+    selected, blocked = [], []
+    for p in paths:
+        if p.is_symlink() or not p.is_file():
+            print(str(p) + '：不是普通文件，保留并交由最终 APT 策略校验', file=sys.stderr)
             continue
-        if not re.fullmatch(r'APT::Periodic::(Enable|Update-Package-Lists|Download-Upgradeable-Packages|Unattended-Upgrade|AutocleanInterval)\s+"0"\s*;\s*(?://.*)?', line, re.I):
-            raise ValueError('包含纯禁用开关以外的内容：' + line)
-        count += 1
-    if not count:
-        raise ValueError('没有可识别的禁用开关')
-except (OSError, ValueError) as exc:
-    print(str(p) + '：' + str(exc) + '；不自动移除此文件', file=sys.stderr)
+        disables_required, other = False, []
+        for number, line in enumerate(p.read_text().splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith('//'):
+                continue
+            match = periodic.fullmatch(line)
+            if match:
+                disables_required |= match[1].lower() in required
+            elif not no_reboot.fullmatch(line):
+                other.append(number)
+        # Download/cleanup disabled alone, or no-reboot alone, is not a
+        # conflicting template. Never discard it just because it looks familiar.
+        if not disables_required:
+            continue
+        if other:
+            blocked.append(str(p) + '：含禁用开关及其他配置（行 ' + ', '.join(map(str, other)) + '），需人工核对，不自动移除')
+        else:
+            selected.append(str(p.relative_to(root)))
+    if blocked:
+        raise ValueError('\n'.join(blocked))
+    for rel in selected:
+        print(rel)
+except (OSError, ValueError, UnicodeError) as exc:
+    print(str(exc), file=sys.stderr)
     sys.exit(1)
 PY
+}
+
+# Recheck both the approved set and each backed-up file. New/changed templates
+# during confirmation or dependency installation require a fresh preview.
+system_update_auto_templates_recheck() {
+    local REL FILE
+    system_update_auto_templates_scan > "$QUENCH_UPDATE_RUN/templates-recheck" || return 1
+    cmp -s "$QUENCH_UPDATE_RUN/templates.list" "$QUENCH_UPDATE_RUN/templates-recheck" \
+        || { error "禁用配置清单发生变化，请重新预览并确认"; return 1; }
+    while IFS= read -r REL; do
+        FILE="$QUENCH_UPDATE_APT_DIR/$REL"
+        if [ -L "$FILE" ] || [ ! -f "$FILE" ] || ! cmp -s "$FILE" "$QUENCH_UPDATE_RUN/templates-before/$REL"; then
+            error "禁用配置发生变化，不接管：$FILE"; return 1
+        fi
+    done < "$QUENCH_UPDATE_RUN/templates.list"
 }
 
 system_update_auto_config_write() {
@@ -543,7 +587,7 @@ EOF
 }
 
 system_update_auto_candidate_check() {
-    local DIR="$1" TEMPLATE="$2"
+    local DIR="$1" TEMPLATES="$2" REL NAME
     mkdir -p "$DIR/parts" || return 1
     cp -a "$QUENCH_UPDATE_APT_DIR/apt.conf.d/." "$DIR/parts/" || return 1
     if [ -f "$QUENCH_UPDATE_APT_DIR/apt.conf" ]; then
@@ -551,7 +595,16 @@ system_update_auto_candidate_check() {
     else : > "$DIR/main" || return 1; fi
     # Never follow target symlinks in the staged copy.
     rm -f "$DIR/parts/20auto-upgrades" "$DIR/parts/52quench-unattended-upgrades" || return 1
-    [ "$TEMPLATE" != yes ] || rm -f "$DIR/parts/99-template-no-auto-upgrades" || return 1
+    while IFS= read -r REL; do
+        case "$REL" in
+            apt.conf) : > "$DIR/main" || return 1 ;;
+            apt.conf.d/*)
+                NAME=${REL#apt.conf.d/}
+                [[ "$NAME" =~ ^[a-zA-Z0-9_-][a-zA-Z0-9_.-]*$ ]] || return 1
+                rm -f "$DIR/parts/$NAME" || return 1 ;;
+            *) return 1 ;;
+        esac
+    done < "$TEMPLATES" || return 1
     system_update_auto_config_write "$DIR/parts/20auto-upgrades" "$DIR/parts/52quench-unattended-upgrades" || return 1
     # APT_CONFIG is read before config fragments, unlike late command-line -o.
     printf 'Dir::Etc::parts "%s/parts";\nDir::Etc::main "%s/main";\n' "$DIR" "$DIR" > "$DIR/bootstrap" || return 1
@@ -630,7 +683,7 @@ PY
 # EXIT recovery uses the local QUENCH_AUTO_* transaction state of the caller.
 # Packages installed by APT are deliberately not uninstalled on failure.
 system_update_auto_enable_cleanup() {
-    local RC="$1" UNIT STATE ACTIVE I FILE FAILED=0
+    local RC="$1" UNIT STATE ACTIVE I FILE REL FAILED=0
     if [ "$RC" -eq 0 ] || [ "$QUENCH_AUTO_MUTATED" != yes ]; then return "$RC"; fi
     warn "启用未完成，尝试恢复配置和原服务状态；已安装的软件包不会卸载"
     systemctl stop apt-daily.timer apt-daily-upgrade.timer || FAILED=1
@@ -654,11 +707,14 @@ system_update_auto_enable_cleanup() {
                 error "不覆盖外部改动：$FILE"; FAILED=1
             fi
         done
-        if [ "$QUENCH_AUTO_TEMPLATE_TOUCHED" = yes ]; then
-            if [ ! -e "$QUENCH_AUTO_TEMPLATE" ] && [ ! -L "$QUENCH_AUTO_TEMPLATE" ]; then
-                atomic_restore_file "$QUENCH_UPDATE_RUN/template-before" "$QUENCH_AUTO_TEMPLATE" || FAILED=1
-            elif [ ! -L "$QUENCH_AUTO_TEMPLATE" ] && cmp -s "$QUENCH_AUTO_TEMPLATE" "$QUENCH_UPDATE_RUN/template-before"; then :
-            else error "模板被外部修改，不覆盖：$QUENCH_AUTO_TEMPLATE"; FAILED=1; fi
+        if [ -f "$QUENCH_UPDATE_RUN/templates-touched" ]; then
+            while IFS= read -r REL; do
+                FILE="$QUENCH_UPDATE_APT_DIR/$REL"
+                if [ ! -e "$FILE" ] && [ ! -L "$FILE" ]; then
+                    atomic_restore_file "$QUENCH_UPDATE_RUN/templates-before/$REL" "$FILE" || FAILED=1
+                elif [ ! -L "$FILE" ] && cmp -s "$FILE" "$QUENCH_UPDATE_RUN/templates-before/$REL"; then :
+                else error "禁用配置被外部修改，不覆盖：$FILE"; FAILED=1; fi
+            done < "$QUENCH_UPDATE_RUN/templates-touched" || FAILED=1
         fi
         while IFS=$'\t' read -r UNIT STATE ACTIVE; do
             case "$UNIT" in
@@ -699,11 +755,10 @@ system_update_auto_enable_apt() (
     umask 077
     system_update_apt_preflight || return 1
     systemd_available || { error "Debian 自动安全更新入口需要 systemd；其他调度方式请人工配置"; return 1; }
-    local QUENCH_AUTO_TEMPLATE="$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
-    local QUENCH_AUTO_MUTATED=no QUENCH_AUTO_TEMPLATE_TOUCHED=no QUENCH_AUTO_UNITS_TOUCHED=no
+    local QUENCH_AUTO_MUTATED=no QUENCH_AUTO_UNITS_TOUCHED=no
     local QUENCH_AUTO_TARGETS=("${QUENCH_APT_AUTO_UPGRADES_FILE:-$QUENCH_UPDATE_APT_DIR/apt.conf.d/20auto-upgrades}" "${QUENCH_APT_UNATTENDED_FILE:-$QUENCH_UPDATE_APT_DIR/apt.conf.d/52quench-unattended-upgrades}")
     local QUENCH_AUTO_TOUCHED=(no no) QUENCH_AUTO_CANDIDATES=()
-    local TEMPLATE=no MASKS="" UNIT STATE ACTIVE FILE I
+    local MASKS="" UNIT STATE ACTIVE FILE I REL
     # Candidate validation must use exactly the files we intend to install.
     [ "${QUENCH_AUTO_TARGETS[0]}" = "$QUENCH_UPDATE_APT_DIR/apt.conf.d/20auto-upgrades" ] \
         && [ "${QUENCH_AUTO_TARGETS[1]}" = "$QUENCH_UPDATE_APT_DIR/apt.conf.d/52quench-unattended-upgrades" ] \
@@ -713,37 +768,38 @@ system_update_auto_enable_apt() (
             error "配置不是普通文件：$FILE"; return 1
         fi
     done
-    if [ -e "$QUENCH_AUTO_TEMPLATE" ] || [ -L "$QUENCH_AUTO_TEMPLATE" ]; then
-        system_update_auto_template_safe "$QUENCH_AUTO_TEMPLATE" || return 1
-        TEMPLATE=yes
-    fi
     system_update_run_prepare || return 1
+    system_update_auto_templates_scan > "$QUENCH_UPDATE_RUN/templates.list" || return 1
     system_update_auto_units_snapshot > "$QUENCH_UPDATE_RUN/units-before" || { error "无法安全读取自动更新服务状态"; return 1; }
-    if [ "$TEMPLATE" = yes ]; then cp -p "$QUENCH_AUTO_TEMPLATE" "$QUENCH_UPDATE_RUN/template-before" || return 1; fi
+    while IFS= read -r REL; do
+        FILE="$QUENCH_UPDATE_APT_DIR/$REL"
+        [ ! -L "$FILE" ] && [ -f "$FILE" ] || return 1
+        mkdir -p "$(dirname "$QUENCH_UPDATE_RUN/templates-before/$REL")" || return 1
+        cp -p "$FILE" "$QUENCH_UPDATE_RUN/templates-before/$REL" || return 1
+    done < "$QUENCH_UPDATE_RUN/templates.list" || return 1
+    system_update_auto_templates_recheck || return 1
     while IFS=$'\t' read -r UNIT STATE ACTIVE; do
         case "$STATE" in masked|masked-runtime) MASKS="$MASKS $UNIT ($STATE)" ;; esac
     done < "$QUENCH_UPDATE_RUN/units-before"
-    # Check precedence before installing anything. Arbitrary administrator
-    # overrides are diagnosed, never renamed/deleted just to pass validation.
-    if ! system_update_auto_candidate_check "$QUENCH_UPDATE_RUN/candidate" "$TEMPLATE"; then
+    # Check precedence before installing anything. Only the reviewed pure
+    # disabling files are excluded; all other administrator policies remain.
+    if ! system_update_auto_candidate_check "$QUENCH_UPDATE_RUN/candidate" "$QUENCH_UPDATE_RUN/templates.list"; then
         info "候选策略仍被其他配置影响；以下为相关设置的位置："
         grep -RnsE 'APT::Periodic|Origins-Pattern|Allowed-Origins|Automatic-Reboot|Remove-.*Dependencies|Remove-Unused-Kernel' \
             "$QUENCH_UPDATE_APT_DIR/apt.conf.d" "$QUENCH_UPDATE_APT_DIR/apt.conf" 2>/dev/null || true
         return 1
     fi
-    [ "$TEMPLATE" != yes ] || warn "检测到纯禁用模板：${QUENCH_AUTO_TEMPLATE}（确认后备份并移出生效配置）"
+    while IFS= read -r REL; do
+        warn "检测到纯禁用配置：${QUENCH_UPDATE_APT_DIR}/${REL}（确认后移出生效配置，原件保存在 templates-before/${REL}）"
+    done < "$QUENCH_UPDATE_RUN/templates.list"
     [ -z "$MASKS" ] || warn "检测到服务/定时器屏蔽：$MASKS"
     confirm_change_preview "启用自动安全更新及处理以上冲突" \
-        "仅处理列出的纯禁用模板与屏蔽项，其他管理员配置保留；备份：$QUENCH_UPDATE_RUN" \
+        "仅处理列出的纯禁用配置与屏蔽项，其他管理员配置保留；备份：$QUENCH_UPDATE_RUN" \
         "只安装安全更新，不自动重启或清理软件包；timer 启用后可能很快执行，服务可能重启" \
         "失败时尝试恢复配置和服务状态，不卸载本次安装的软件包，不终止正在运行的 APT 任务" || return 1
     system_update_auto_units_snapshot > "$QUENCH_UPDATE_RUN/units-recheck" || return 1
     cmp -s "$QUENCH_UPDATE_RUN/units-before" "$QUENCH_UPDATE_RUN/units-recheck" || { error "确认期间服务状态变化，请重试"; return 1; }
-    if [ "$TEMPLATE" = yes ]; then
-        if [ -L "$QUENCH_AUTO_TEMPLATE" ] || ! cmp -s "$QUENCH_AUTO_TEMPLATE" "$QUENCH_UPDATE_RUN/template-before"; then
-            error "确认期间禁用模板变化，请重试"; return 1
-        fi
-    fi
+    system_update_auto_templates_recheck || return 1
     trap 'QUENCH_AUTO_RC=$?; trap - EXIT; system_update_auto_enable_cleanup "$QUENCH_AUTO_RC"; exit "$QUENCH_AUTO_RC"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
@@ -763,19 +819,21 @@ system_update_auto_enable_apt() (
         if [ -f "$FILE" ]; then cp -p "$FILE" "$QUENCH_UPDATE_RUN/before-$I" || return 1; fi
     done
     # Revalidate after package installation added its own default fragments.
-    system_update_auto_candidate_check "$QUENCH_UPDATE_RUN/recheck" "$TEMPLATE" || return 1
+    system_update_auto_templates_recheck || return 1
+    system_update_auto_candidate_check "$QUENCH_UPDATE_RUN/recheck" "$QUENCH_UPDATE_RUN/templates.list" || return 1
     for I in 0 1; do
         QUENCH_AUTO_TOUCHED[$I]=yes
         atomic_replace_file "${QUENCH_AUTO_CANDIDATES[$I]}" "${QUENCH_AUTO_TARGETS[$I]}" || return 1
     done
-    if [ "$TEMPLATE" = yes ]; then
-        if [ -L "$QUENCH_AUTO_TEMPLATE" ] || ! cmp -s "$QUENCH_AUTO_TEMPLATE" "$QUENCH_UPDATE_RUN/template-before"; then
-            error "禁用模板被修改，不移除"; return 1
+    while IFS= read -r REL; do
+        FILE="$QUENCH_UPDATE_APT_DIR/$REL"
+        if [ -L "$FILE" ] || [ ! -f "$FILE" ] || ! cmp -s "$FILE" "$QUENCH_UPDATE_RUN/templates-before/$REL"; then
+            error "禁用配置被修改，不移除：$FILE"; return 1
         fi
-        QUENCH_AUTO_TEMPLATE_TOUCHED=yes
-        rm "$QUENCH_AUTO_TEMPLATE" || return 1
-        info "禁用模板已移出 APT 配置；原文件保存在 $QUENCH_UPDATE_RUN/template-before"
-    fi
+        printf '%s\n' "$REL" >> "$QUENCH_UPDATE_RUN/templates-touched" || return 1
+        rm "$FILE" || return 1
+        info "禁用配置已移出 APT：${FILE}；备份：$QUENCH_UPDATE_RUN/templates-before/$REL"
+    done < "$QUENCH_UPDATE_RUN/templates.list" || return 1
     system_update_auto_policy_verify || return 1
     QUENCH_AUTO_UNITS_TOUCHED=yes
     while IFS=$'\t' read -r UNIT STATE ACTIVE; do

@@ -388,11 +388,109 @@ t_auto_effective() {
 }
 for POLICY in valid broad reboot global_off refresh_off remove_kernel; do run_test "Effective automatic-update policy: $POLICY" t_auto_effective "$POLICY"; done
 
+t_auto_templates_scan() {
+    setup_update "templates_scan_$1"
+    local PARTS="$QUENCH_UPDATE_APT_DIR/apt.conf.d" FILE OUT
+    mkdir -p "$PARTS"
+    FILE="$PARTS/99zz-ppflight-no-auto-upgrades"
+    printf '%s\n' '// image policy' 'APT::Periodic::Enable "0";' \
+        'APT::Periodic::Update-Package-Lists "0";' 'APT::Periodic::Download-Upgradeable-Packages "0";' \
+        'APT::Periodic::Unattended-Upgrade "0";' 'Unattended-Upgrade::Automatic-Reboot "false";' > "$FILE"
+    case "$1" in
+        vendor) : ;;
+        multiple)
+            cp "$FILE" "$PARTS/80-image.conf"
+            cp "$FILE" "$QUENCH_UPDATE_APT_DIR/apt.conf" ;;
+        comments)
+            printf '%s\n' '' '  // APT::Get::AllowUnauthenticated "true";' \
+                '  APT::Periodic::AutocleanInterval "0"; // no cleanup' >> "$FILE" ;;
+        no_reboot_only) echo 'Unattended-Upgrade::Automatic-Reboot "false";' > "$FILE" ;;
+        optional_only) printf '%s\n' 'APT::Periodic::Download-Upgradeable-Packages "0";' 'APT::Periodic::AutocleanInterval "0";' > "$FILE" ;;
+        mixed) echo 'Acquire::http::Proxy "http://example.invalid:8080";' >> "$FILE" ;;
+        hook) echo 'DPkg::Post-Invoke { "echo keep"; };' >> "$FILE" ;;
+        include) echo '#include "/etc/apt/other.conf";' >> "$FILE" ;;
+        clear) echo '#clear APT::Periodic;' >> "$FILE" ;;
+        reboot_true) echo 'Unattended-Upgrade::Automatic-Reboot "true";' >> "$FILE" ;;
+        enable_true) echo 'APT::Periodic::Enable "1";' >> "$FILE" ;;
+        nested) printf '%s\n' 'APT::Periodic { Enable "0"; };' > "$FILE" ;;
+        ignored)
+            mv "$FILE" "$FILE.disabled"
+            cp "$FILE.disabled" "$PARTS/.hidden"
+            cp "$FILE.disabled" "$PARTS/name with spaces" ;;
+        managed)
+            mv "$FILE" "$PARTS/20auto-upgrades"
+            cp "$PARTS/20auto-upgrades" "$PARTS/52quench-unattended-upgrades" ;;
+        symlink)
+            mv "$FILE" "$QUENCH_TEST_UPDATE_CASE/external"
+            ln -s "$QUENCH_TEST_UPDATE_CASE/external" "$FILE" ;;
+        linked_dir)
+            mv "$PARTS" "$QUENCH_TEST_UPDATE_CASE/parts"
+            ln -s "$QUENCH_TEST_UPDATE_CASE/parts" "$PARTS" ;;
+    esac
+    case "$1" in
+        mixed|hook|include|clear|reboot_true|enable_true|linked_dir)
+            assert_fail system_update_auto_templates_scan ;;
+        *)
+            OUT=$(system_update_auto_templates_scan) || fail 'scan failed'
+            case "$1" in
+                vendor|comments) assert_eq "$OUT" 'apt.conf.d/99zz-ppflight-no-auto-upgrades' ;;
+                multiple) assert_eq "$OUT" $'apt.conf.d/80-image.conf\napt.conf.d/99zz-ppflight-no-auto-upgrades\napt.conf' ;;
+                *) assert_eq "$OUT" '' ;;
+            esac ;;
+    esac
+    :
+}
+for CASE in vendor multiple comments no_reboot_only optional_only mixed hook include clear reboot_true enable_true nested ignored managed symlink linked_dir; do
+    run_test "Automatic update template discovery: $CASE" t_auto_templates_scan "$CASE"
+done
+
+t_auto_candidate_staging() {
+    setup_update "candidate_staging_$1"
+    local PARTS="$QUENCH_UPDATE_APT_DIR/apt.conf.d" PLAN="$QUENCH_TEST_UPDATE_CASE/templates.list" STAGE="$QUENCH_TEST_UPDATE_CASE/candidate"
+    mkdir -p "$PARTS"
+    echo 'APT::Periodic::Enable "0";' > "$PARTS/99zz-ppflight-no-auto-upgrades"
+    echo 'APT::Periodic::Unattended-Upgrade "0";' > "$QUENCH_UPDATE_APT_DIR/apt.conf"
+    echo 'Acquire::Retries "3";' > "$PARTS/99-network"
+    cp -a "$QUENCH_UPDATE_APT_DIR" "$QUENCH_TEST_UPDATE_CASE/apt-before"
+    system_update_auto_templates_scan > "$PLAN" || fail 'scan failed'
+    # Test the real staging/file operations, not APT itself. Real precedence is
+    # separately tested with apt-config in the disposable Debian CI containers.
+    apt-config() { [ -f "$APT_CONFIG" ] || return 1; echo fixture; }
+    system_update_auto_policy_verify() { echo verified >> "$QUENCH_TEST_UPDATE_CASE/calls"; }
+    case "$1" in
+        multiple) : ;;
+        empty) : > "$PLAN" ;;
+        missing) rm "$PLAN" ;;
+        traversal) echo 'apt.conf.d/../../apt.conf' > "$PLAN" ;;
+    esac
+    case "$1" in
+        missing|traversal)
+            assert_fail system_update_auto_candidate_check "$STAGE" "$PLAN"
+            ! grep -q verified "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'invalid plan reached verification' ;;
+        *)
+            assert_ok system_update_auto_candidate_check "$STAGE" "$PLAN"
+            assert_ok cmp "$STAGE/parts/99-network" "$PARTS/99-network"
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" verified
+            if [ "$1" = multiple ]; then
+                [ ! -e "$STAGE/parts/99zz-ppflight-no-auto-upgrades" ] || fail 'staged template retained'
+                [ ! -s "$STAGE/main" ] || fail 'staged main template retained'
+            else
+                assert_ok cmp "$STAGE/parts/99zz-ppflight-no-auto-upgrades" "$PARTS/99zz-ppflight-no-auto-upgrades"
+                assert_ok cmp "$STAGE/main" "$QUENCH_UPDATE_APT_DIR/apt.conf"
+            fi ;;
+    esac
+    assert_ok diff -r "$QUENCH_UPDATE_APT_DIR" "$QUENCH_TEST_UPDATE_CASE/apt-before"
+    :
+}
+for CASE in multiple empty missing traversal; do
+    run_test "Automatic update candidate staging: $CASE" t_auto_candidate_staging "$CASE"
+done
+
 t_auto_enable() {
     setup_update "auto_enable_$1"
     QUENCH_TEST_AUTO_CASE="$1"
     mkdir -p "$QUENCH_UPDATE_APT_DIR/apt.conf.d" "$QUENCH_TEST_UPDATE_CASE/units"
-    local PARTS="$QUENCH_UPDATE_APT_DIR/apt.conf.d" UNIT STATE
+    local PARTS="$QUENCH_UPDATE_APT_DIR/apt.conf.d" UNIT STATE FILE RC=0
     printf '%s\n' 'APT::Periodic::Enable "0";' 'APT::Periodic::Update-Package-Lists "0";' \
         'APT::Periodic::Unattended-Upgrade "0";' 'APT::Periodic::Download-Upgradeable-Packages "0";' \
         'APT::Periodic::AutocleanInterval "0";' > "$PARTS/99-template-no-auto-upgrades"
@@ -409,6 +507,12 @@ t_auto_enable() {
     done
     case "$1" in
         no_template) rm "$PARTS/99-template-no-auto-upgrades" ;;
+        vendor)
+            mv "$PARTS/99-template-no-auto-upgrades" "$PARTS/99zz-ppflight-no-auto-upgrades"
+            echo 'Unattended-Upgrade::Automatic-Reboot "false";' >> "$PARTS/99zz-ppflight-no-auto-upgrades" ;;
+        multiple|multi_timer_fail|multi_remove_fail|multi_external_edit)
+            cp "$PARTS/99-template-no-auto-upgrades" "$PARTS/99zz-ppflight-no-auto-upgrades"
+            cp "$PARTS/99-template-no-auto-upgrades" "$QUENCH_UPDATE_APT_DIR/apt.conf" ;;
         missing_unit) echo not-found > "$QUENCH_TEST_UPDATE_CASE/units/unattended-upgrades.service.state" ;;
         new_files|write_fail) rm "$PARTS/20auto-upgrades" "$PARTS/52quench-unattended-upgrades" ;;
         extra_template) echo 'APT::Get::AllowUnauthenticated "true";' >> "$PARTS/99-template-no-auto-upgrades" ;;
@@ -423,6 +527,7 @@ t_auto_enable() {
             done ;;
     esac
     cp -a "$PARTS" "$QUENCH_TEST_UPDATE_CASE/parts-before"
+    [ ! -f "$QUENCH_UPDATE_APT_DIR/apt.conf" ] || cp -p "$QUENCH_UPDATE_APT_DIR/apt.conf" "$QUENCH_TEST_UPDATE_CASE/main-before"
     cp -a "$QUENCH_TEST_UPDATE_CASE/units" "$QUENCH_TEST_UPDATE_CASE/units-before"
     systemd_available() { return 0; }
     # Never probe the runner's real dpkg locks from this service fixture.
@@ -439,15 +544,27 @@ t_auto_enable() {
             quench_test_real_replace "$@"
         }
     fi
+    if [ "$1" = multi_remove_fail ]; then
+        rm() {
+            [ "$*" != "$QUENCH_UPDATE_APT_DIR/apt.conf" ] || return 1
+            command rm "$@"
+        }
+    fi
     confirm_change_preview() {
         echo confirm >> "$QUENCH_TEST_UPDATE_CASE/calls"
         if [ "$QUENCH_TEST_AUTO_CASE" = cancel ]; then return 1; fi
         if [ "$QUENCH_TEST_AUTO_CASE" = template_edit ]; then echo '// external' >> "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"; fi
+        if [ "$QUENCH_TEST_AUTO_CASE" = template_added ]; then echo 'APT::Periodic::Enable "0";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-new-template"; fi
+        if [ "$QUENCH_TEST_AUTO_CASE" = template_linked ]; then
+            mv "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades" "$QUENCH_TEST_UPDATE_CASE/external"
+            ln -s "$QUENCH_TEST_UPDATE_CASE/external" "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
+        fi
         return 0
     }
     system_update_auto_install_dependency() {
         echo install >> "$QUENCH_TEST_UPDATE_CASE/calls"
         if [ "$QUENCH_TEST_AUTO_CASE" = missing_unit ]; then echo disabled > "$QUENCH_TEST_UPDATE_CASE/units/unattended-upgrades.service.state"; fi
+        if [ "$QUENCH_TEST_AUTO_CASE" = install_template_edit ]; then echo '// package change' >> "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"; fi
         [ "$QUENCH_TEST_AUTO_CASE" != install_fail ]
     }
     # Real APT precedence is covered by the Debian integration suite. Here use
@@ -456,7 +573,8 @@ t_auto_enable() {
         mkdir -p "$1/parts"
         system_update_auto_config_write "$1/parts/20auto-upgrades" "$1/parts/52quench-unattended-upgrades"
         echo candidate >> "$QUENCH_TEST_UPDATE_CASE/calls"
-        [ "$QUENCH_TEST_AUTO_CASE" != candidate_fail ]
+        case "$QUENCH_TEST_AUTO_CASE" in candidate_fail|linked_template) return 1 ;; esac
+        return 0
     }
     apt-config() {
         printf '%s\n' 'APT::Periodic::Enable "1";' 'APT::Periodic::Update-Package-Lists "1";' \
@@ -505,10 +623,11 @@ t_auto_enable() {
                 start)
                     if [ "$UNIT" = apt-daily-upgrade.timer ] && [ ! -e "$QUENCH_TEST_UPDATE_CASE/failure-fired" ]; then
                         case "$QUENCH_TEST_AUTO_CASE" in
-                            timer_fail|existing_timers|external_edit|busy)
+                            timer_fail|existing_timers|external_edit|busy|multi_timer_fail|multi_external_edit)
                                 : > "$QUENCH_TEST_UPDATE_CASE/failure-fired"
                                 if [ "$QUENCH_TEST_AUTO_CASE" = external_edit ]; then echo '// external change' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/52quench-unattended-upgrades"; fi
                                 if [ "$QUENCH_TEST_AUTO_CASE" = busy ]; then echo active > "$QUENCH_TEST_UPDATE_CASE/units/apt-daily-upgrade.service.active"; fi
+                                if [ "$QUENCH_TEST_AUTO_CASE" = multi_external_edit ]; then echo '// external replacement' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99zz-ppflight-no-auto-upgrades"; fi
                                 return 1 ;;
                         esac
                     fi
@@ -517,19 +636,44 @@ t_auto_enable() {
         done
         return 0
     }
+    # The transaction runs in a subshell; resolve its one private run directory
+    # instead of relying on QUENCH_UPDATE_RUN leaking back into this fixture.
+    system_enable_auto_security_updates || RC=$?
+    for FILE in "$QUENCH_UPDATE_STATE_DIR"/run-*; do
+        [ ! -d "$FILE" ] || QUENCH_UPDATE_RUN="$FILE"
+    done
     case "$1" in
-        success|runtime|unmasked|no_template|new_files|missing_unit)
-            assert_ok system_enable_auto_security_updates
+        success|runtime|unmasked|no_template|new_files|missing_unit|vendor|multiple)
+            assert_eq "$RC" 0
             assert_file_contains "$PARTS/20auto-upgrades" 'APT::Periodic::Enable "1";'
             [ ! -e "$PARTS/99-template-no-auto-upgrades" ] || fail 'template still effective'
+            [ ! -e "$PARTS/99zz-ppflight-no-auto-upgrades" ] || fail 'vendor template still effective'
+            [ ! -e "$QUENCH_UPDATE_APT_DIR/apt.conf" ] || fail 'pure main template still effective'
+            for FILE in "$QUENCH_TEST_UPDATE_CASE/parts-before/"*; do
+                case "${FILE##*/}" in 20auto-upgrades|52quench-unattended-upgrades) continue ;; esac
+                assert_ok cmp "$FILE" "$QUENCH_UPDATE_RUN/templates-before/apt.conf.d/${FILE##*/}"
+            done
+            if [ -f "$QUENCH_TEST_UPDATE_CASE/main-before" ]; then
+                assert_ok cmp "$QUENCH_TEST_UPDATE_CASE/main-before" "$QUENCH_UPDATE_RUN/templates-before/apt.conf"
+            fi
             assert_ok system_update_auto_units_ready
             assert_file_contains "$QUENCH_TEST_UPDATE_CASE/audit" SUCCESS
             ;;
         *)
-            assert_fail system_enable_auto_security_updates
+            assert_ne "$RC" 0
             ! grep -q SUCCESS "$QUENCH_TEST_UPDATE_CASE/audit" || fail 'failure logged as success'
             case "$1" in
                 template_edit) assert_file_contains "$PARTS/99-template-no-auto-upgrades" '// external' ;;
+                template_added) assert_file_contains "$PARTS/99-new-template" 'Enable "0";' ;;
+                template_linked) [ -L "$PARTS/99-template-no-auto-upgrades" ] || fail 'external symlink removed' ;;
+                install_template_edit)
+                    assert_file_contains "$PARTS/99-template-no-auto-upgrades" '// package change'
+                    assert_ok diff -r "$QUENCH_TEST_UPDATE_CASE/units" "$QUENCH_TEST_UPDATE_CASE/units-before" ;;
+                multi_external_edit)
+                    assert_file_contains "$PARTS/99zz-ppflight-no-auto-upgrades" '// external replacement'
+                    assert_ok cmp "$PARTS/99-template-no-auto-upgrades" "$QUENCH_TEST_UPDATE_CASE/parts-before/99-template-no-auto-upgrades"
+                    assert_ok cmp "$QUENCH_UPDATE_APT_DIR/apt.conf" "$QUENCH_TEST_UPDATE_CASE/main-before"
+                    assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/units/apt-daily.timer.active")" inactive ;;
                 external_edit)
                     assert_file_contains "$PARTS/52quench-unattended-upgrades" '// external change'
                     assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/units/apt-daily.timer.active")" inactive ;;
@@ -539,20 +683,35 @@ t_auto_enable() {
                     ! grep -q 'systemctl stop apt-daily-upgrade.service' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'killed APT'
                     ;;
                 *) assert_ok diff -r "$PARTS" "$QUENCH_TEST_UPDATE_CASE/parts-before"
+                   if [ -f "$QUENCH_TEST_UPDATE_CASE/main-before" ]; then
+                       assert_ok cmp "$QUENCH_UPDATE_APT_DIR/apt.conf" "$QUENCH_TEST_UPDATE_CASE/main-before"
+                   fi
                    assert_ok diff -r "$QUENCH_TEST_UPDATE_CASE/units" "$QUENCH_TEST_UPDATE_CASE/units-before" ;;
             esac
             ;;
     esac
     case "$1" in
-        cancel|extra_template|linked_template|active_updater|candidate_fail|template_edit)
+        cancel|extra_template|linked_template|active_updater|candidate_fail|template_edit|template_added|template_linked)
             ! grep -q '^install$' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'installed before approval/valid preflight'
             ! grep -Eq '^systemctl (stop|start|enable|disable|mask|unmask)' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'mutated units before approval'
             ;;
+        *) assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" install ;;
+    esac
+    case "$1" in
+        cancel|template_edit|template_added|template_linked)
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" confirm ;;
+        multi_timer_fail|multi_external_edit)
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" 'systemctl start apt-daily.timer apt-daily-upgrade.timer'
+            assert_file_contains "$QUENCH_UPDATE_RUN/templates-touched" apt.conf
+            assert_file_contains "$QUENCH_UPDATE_RUN/templates-touched" apt.conf.d/99zz-ppflight-no-auto-upgrades ;;
+        multi_remove_fail)
+            assert_file_contains "$QUENCH_UPDATE_RUN/templates-touched" apt.conf.d/99-template-no-auto-upgrades
+            assert_file_contains "$QUENCH_UPDATE_RUN/templates-touched" apt.conf.d/99zz-ppflight-no-auto-upgrades ;;
     esac
     assert_eq "$(grep -c '^unlock$' "$QUENCH_TEST_UPDATE_CASE/calls")" 1
     :
 }
-for CASE in success runtime unmasked no_template new_files missing_unit write_fail cancel extra_template linked_template active_updater candidate_fail template_edit install_fail policy_fail unmask_fail timer_fail existing_timers external_edit busy; do
+for CASE in success runtime unmasked no_template new_files missing_unit vendor multiple write_fail cancel extra_template linked_template active_updater candidate_fail template_edit template_added template_linked install_template_edit install_fail policy_fail unmask_fail timer_fail existing_timers external_edit busy multi_timer_fail multi_remove_fail multi_external_edit; do
     run_test "Automatic update enable transaction: $CASE" t_auto_enable "$CASE"
 done
 
