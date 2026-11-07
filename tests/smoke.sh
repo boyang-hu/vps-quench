@@ -1217,13 +1217,17 @@ t_sm_037() {
 run_test "BBR receive defaults are unsafe" t_sm_037
 
 t_top_026() {
+    local MANAGED_KEYS
+    # Read the complete producer output before matching: grep -q can otherwise
+    # terminate it with SIGPIPE and turn an ownership assertion into a false pass.
+    MANAGED_KEYS=$(bbr_managed_keys)
     [[ "$(bbr_effective_memory_mb 16384 512)" = 512 ]] || { echo "BBR memory selection was not clamped to physical RAM" >&2; exit 1; }
     [[ "$(bbr_buffer_cap_bytes 512)" = 33554432 ]] || { echo "BBR mixed buffer cap is not 1/16 of RAM" >&2; exit 1; }
     [[ "$(bbr_buffer_cap_bytes 512 proxy)" = 16777216 ]] || { echo "BBR proxy buffer cap is not 1/32 of RAM" >&2; exit 1; }
     [[ "$(bbr_buffer_cap_bytes 16384 bulk)" = 268435456 ]] || { echo "BBR buffer cap ignored the 256MiB absolute ceiling" >&2; exit 1; }
-    ! bbr_managed_keys | grep -qx 'vm.min_free_kbytes' || { echo "BBR must leave min_free_kbytes to the kernel" >&2; exit 1; }
-    ! bbr_managed_keys | grep -qx 'vm.swappiness' || { echo "BBR must leave Swap policy to the Swap module" >&2; exit 1; }
-    ! bbr_managed_keys | grep -qx 'net.ipv4.udp_wmem_min' || { echo "BBR must not manage ineffective udp_wmem_min" >&2; exit 1; }
+    grep -qx 'vm.min_free_kbytes' <<< "$MANAGED_KEYS" || { echo "BBR must track min_free_kbytes for measured-profile backup and restore" >&2; exit 1; }
+    ! grep -qx 'vm.swappiness' <<< "$MANAGED_KEYS" || { echo "BBR must leave Swap policy to the Swap module" >&2; exit 1; }
+    ! grep -qx 'net.ipv4.udp_wmem_min' <<< "$MANAGED_KEYS" || { echo "BBR must not manage ineffective udp_wmem_min" >&2; exit 1; }
     [[ "$(bbr_conntrack_max_for_memory 512)" = 131072 ]] || { echo "BBR 512MB conntrack tier is wrong" >&2; exit 1; }
     [[ "$(bbr_conntrack_max_for_memory 1024)" = 262144 ]] || { echo "BBR 1GB conntrack tier is wrong" >&2; exit 1; }
     [[ "$(bbr_conntrack_max_for_memory 2048)" = 524288 ]] || { echo "BBR 2GB conntrack tier is wrong" >&2; exit 1; }
