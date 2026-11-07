@@ -17,7 +17,7 @@ jobs:
           for script in vps-quench.sh build-offline-package.sh tests/offline-package.sh \
             tests/fail2ban-shared.sh tests/fail2ban-shared-integration.sh \
             tests/bbr-separation.sh tests/bbr-separation-integration.sh tests/lib/bbr-tc-fixture.sh \
-            tests/bbr-measure.sh tests/bbr-aligned.sh tests/bbr-measure-integration.sh tests/onboarding-performance.sh \
+            tests/bbr-measure.sh tests/bbr-aligned.sh tests/bbr-measure-integration.sh tests/onboarding-performance.sh tests/onboarding-updates.sh \
             tests/system-updates.sh tests/system-updates-apt-integration.sh tests/system-updates-tmux-integration.sh \
             tests/user-rename-integration.sh tests/confirm-input.sh; do
             bash -n "$script"
@@ -69,6 +69,9 @@ jobs:
 
       - name: Test first-run performance choices
         run: bash tests/onboarding-performance.sh
+
+      - name: Test first-run updates and session handoff
+        run: bash tests/onboarding-updates.sh
 
       - name: Test system update guards and failure paths
         run: bash tests/system-updates.sh

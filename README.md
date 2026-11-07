@@ -1,4 +1,4 @@
-# Quench — VPS 初始化与管理工具 V0.1.9
+# Quench — VPS 初始化与管理工具 V0.1.10
 
 > 首次开荒 · 用户与 SSH · Fail2ban · Firewall · BBR/FQ · DNS · Caddy 网站入口 · 系统与服务管理
 
@@ -28,24 +28,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 适合不能访问 GitHub 的中国内地 VPS。先在一台可以访问 GitHub 的电脑或跳板机下载：
 
 ```bash
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.9/quench-offline-V0.1.9.tar.gz
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.9/quench-offline-V0.1.9.tar.gz.sha256
-sha256sum -c quench-offline-V0.1.9.tar.gz.sha256
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.10/quench-offline-V0.1.10.tar.gz
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.10/quench-offline-V0.1.10.tar.gz.sha256
+sha256sum -c quench-offline-V0.1.10.tar.gz.sha256
 ```
 
 再通过 `scp`、SFTP 或 WinSCP 将两个文件传到 VPS。Linux/macOS 示例：
 
 ```bash
-scp quench-offline-V0.1.9.tar.gz* root@你的VPS地址:/root/
+scp quench-offline-V0.1.10.tar.gz* root@你的VPS地址:/root/
 ```
 
 登录 VPS 后离线安装：
 
 ```bash
 cd /root
-sha256sum -c quench-offline-V0.1.9.tar.gz.sha256
-tar -xzf quench-offline-V0.1.9.tar.gz
-cd quench-offline-V0.1.9
+sha256sum -c quench-offline-V0.1.10.tar.gz.sha256
+tar -xzf quench-offline-V0.1.10.tar.gz
+cd quench-offline-V0.1.10
 bash install.sh
 v
 ```
@@ -115,7 +115,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
  ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.9  ·  Boyang
+  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.10  ·  Boyang
 ────────────────────────────────────────────────────────────────
   SSH · BBR · DNS · Caddy · Firewall · NFT · Docker
 
@@ -155,7 +155,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 
 面向新 VPS 的可重复运行配置向导。所有完成状态都根据当前系统实时检查，不依赖一次性的完成标记；中途退出后可重新进入继续处理未完成项目。
 
-推荐流程为：环境、DNS 与时间预检 → 配置备份 → 用户与 SSH 安全接管 → 防火墙与 Fail2ban → SSH 基础加固 → 自动安全更新 → 内核网络安全基线 → 网络性能方案选择 → 最终安全体检。
+推荐流程为：环境、DNS 与时间预检 → 配置备份 → 系统与软件更新 → 用户与 SSH 安全接管 → 防火墙与 Fail2ban → SSH 基础加固 → 自动安全更新 → 内核网络安全基线 → 网络性能方案选择 → 最终安全体检。
+
+软件更新步骤也可从开荒菜单 `u` 单独进入，与更新中心共用预检、事务锁、计划预览和日志。Debian 12/13 默认先刷新索引，再执行不删包的当前版本更新（`apt-get --no-remove --with-new-pkgs upgrade`）；选 `2` 使用完整依赖更新（`apt-get dist-upgrade`，相当于 `apt full-upgrade`），可能移除软件包，必须核对计划。两者选择其一，不重复执行，不改软件源或升级 Debian 大版本，不自动重启；输入 `0` 可跳过。DNF/YUM/APK 使用各自的当前系统更新，其他系统明确提示跳过。
+
+远程 SSH 中未进入 tmux/screen 时，会复用更新中心的 tmux 安装与续接流程。离开 tmux 后，原会话的开荒推荐流程会暂停，避免更新仍在后台运行时继续修改 SSH、防火墙或启用自动更新；确认更新完成后重新进入向导，可跳过软件更新步骤。已经在 tmux/screen 中时，更新结束后继续开荒；更新失败则停止并提示处理。配置备份不是软件包升级的回滚快照。
 
 性能步骤提供三个选择，首次开荒菜单的 `8` 也进入同一入口：
 
@@ -746,6 +750,7 @@ BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-me
 
 | 版本 | Quench 主要变更 |
 |------|----------------|
+| **V0.1.10** | 首次开荒新增系统与软件更新步骤及独立 `u` 入口；默认刷新索引并执行不删包升级，可选完整依赖更新；复用更新中心预检、计划确认与 tmux 保护，更新失败或分离会话时暂停后续开荒，新增 25 项回归测试。 |
 | **V0.1.9** | 一键网络调优统一完整 TCP 参数、18 个公共候选并行筛选与端口重试、粗细扫描和自动整形；首次开荒与独立线路校准共用扫描引擎；增加小内存机器的可选 Swap 建议，保留独立 BBR/FQ 入口和外部 QoS 保护；补充参数一致性、低速对端、路径丢包及恢复失败测试。 |
 | **V0.1.8** | 自动安全更新按内容识别不同厂商的禁用配置，确认后逐文件备份接管并支持失败恢复，保留复杂策略和外部修改；y/n 确认输入错误时重新询问，保持默认选项且不延长回滚计时；SSH/UFW 回滚按变更范围恢复，增加逐步骤日志、UFW 命令诊断与失败状态检查；新增 UFW SSH 的 1Panel 兼容 `ALLOW` 模式及已有规则迁移。 |
 | **V0.1.7** | 实测网络调优与独立 BBR/FQ、tc 操作，首次开荒接入性能方案选择；Fail2ban 与 1Panel 共享基础配置；系统与软件更新中心、Debian 12 → 13 受控升级、云镜像源预检及自动安全更新冲突处理；升级支持 tmux 安装与会话接续；系统概览显示发行版与内核；Debian 12/13 用户改名保留 UID/GID，提供临时维护账号、清理及失败恢复入口。 |

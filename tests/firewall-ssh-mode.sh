@@ -273,6 +273,7 @@ t_recommended() {
     setup_firewall
     first_run_preflight() { :; }
     config_backup_create() { echo "$CASE_DIR/snapshot"; }
+    first_run_package_updates_setup() { :; }
     first_run_access_ready() { return 0; }
     first_run_firewall_ready() { return 0; }
     first_run_fail2ban_ready() { return 0; }

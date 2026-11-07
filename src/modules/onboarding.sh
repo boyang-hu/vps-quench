@@ -416,6 +416,63 @@ first_run_firewall_fail2ban_setup() {
     audit_action "完成首次开荒防火墙与 Fail2ban" SUCCESS
 }
 
+# This step uses the same package transaction/preview as the update center.
+# Return 3 after a tmux handoff: detaching a client is not update completion,
+# so the caller must not advance to SSH/firewall writes in the original session.
+first_run_package_updates_setup() {
+    local PM CHOICE MODE RC=0 HANDOFF=no
+    PM=$(system_package_manager)
+    case "$PM" in
+        apt)
+            if ! system_update_debian_code >/dev/null; then
+                warn "开荒软件更新目前支持 Debian 12/13；当前系统请通过包管理器手动更新，已跳过"
+                return 0
+            fi
+            ;;
+        dnf|yum|apk) : ;;
+        *) info "当前包管理器不支持开荒整机更新，已跳过；OpenWrt 请使用逐包维护或固件升级"; return 0 ;;
+    esac
+    if safety_timer_pending; then
+        warn "防断联回滚仍在计时；请先确认当前变更，再更新软件"
+        return 1
+    fi
+    print_header "首次开荒 · 系统与软件更新"
+    ui_hint "立即更新已安装软件；自动安全更新将在后续步骤单独配置。"
+    if [ "$PM" = apt ]; then
+        ui_hint "先刷新 APT 索引，再预览并确认升级计划；保持当前 Debian 大版本。"
+        menu_item "1" "更新当前系统（推荐，默认）  ${DIM}可安装新依赖，不删除已有包${NC}"
+        menu_item "2" "完整依赖更新  ${DIM}相当于 full-upgrade，可能删除包，须核对计划${NC}"
+    else
+        menu_item "1" "更新当前系统（推荐，默认）  ${DIM}由 $PM 展示更新计划并确认${NC}"
+    fi
+    menu_item "0" "暂时跳过"
+    menu_div
+    while true; do
+        if ! read -rp "$(ui_prompt '选择更新方式 [回车默认 1，0 跳过]: ')" CHOICE; then
+            info "未选择更新方式，已跳过软件更新"
+            return 0
+        fi
+        case "$CHOICE" in
+            ""|1) MODE=current; break ;;
+            2) if [ "$PM" = apt ]; then MODE=full; break; fi ;;
+            0) info "已跳过软件更新，可稍后从开荒菜单 u 或系统与软件更新中心进入"; return 0 ;;
+        esac
+        if [ "$PM" = apt ]; then warn "请输入 1、2 或 0；回车选择 1"
+        else warn "请输入 1 或 0；回车选择 1"; fi
+    done
+    if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && [ -z "${TMUX:-}${STY:-}" ]; then
+        HANDOFF=yes
+    fi
+    system_update_dispatch "$MODE" || RC=$?
+    [ "$RC" -eq 0 ] || return "$RC"
+    if [ "$HANDOFF" = yes ]; then
+        info "已返回原 SSH 会话；升级可能仍在 tmux 中运行，也可能已取消或结束"
+        ui_hint "请先确认升级结果；完成后重新进入开荒推荐流程，可选择 0 跳过本步骤。"
+        return 3
+    fi
+    return 0
+}
+
 first_run_auto_updates_apply() {
     print_header "首次开荒 · 自动安全更新"
     system_auto_updates_supported \
@@ -473,11 +530,11 @@ first_run_performance_setup() {
 
 first_run_recommended_flow() {
     print_header "首次开荒 · 推荐流程"
-    echo "  环境与 DNS 预检 → 配置备份 → 用户与 SSH → 防火墙与 Fail2ban"
-    echo "  → SSH 基线 → 自动安全更新 → 网络安全基线 → 性能方案选择 → 最终体检"
+    echo "  环境与 DNS 预检 → 配置备份 → 系统与软件更新 → 用户与 SSH"
+    echo "  → 防火墙与 Fail2ban → SSH 基线 → 自动安全更新 → 网络安全基线 → 性能方案选择 → 最终体检"
     echo ""
     ui_hint "每一步都会单独确认；已完成项目按实时状态跳过，可随时退出后重新进入"
-    local ANSWER BACKUP PERF_RC=0
+    local ANSWER BACKUP PERF_RC=0 UPDATE_RC=0
     ui_read_yes_no ANSWER "  开始推荐流程？(y/N): " n || return 1
     echo "$ANSWER" | grep -qiE '^y(es)?$' || return 0
 
@@ -486,6 +543,13 @@ first_run_recommended_flow() {
     BACKUP=$(config_backup_create first_run_wizard true) \
         && info "配置快照已创建：$BACKUP" \
         || { error "配置备份失败，推荐流程已停止"; return 1; }
+
+    first_run_package_updates_setup || UPDATE_RC=$?
+    case "$UPDATE_RC" in
+        0) : ;;
+        3) info "推荐流程已暂停；不会在原会话继续配置 SSH 和防火墙"; return 0 ;;
+        *) warn "软件更新未完成，推荐流程已停止；请先处理更新错误，或重新进入后明确跳过"; return "$UPDATE_RC" ;;
+    esac
 
     first_run_access_ready \
         || first_run_offer_step "配置用户与 SSH 安全接管" y first_run_access_setup \
@@ -528,6 +592,7 @@ first_run_wizard() {
         echo ""
         menu_group "开荒步骤"
         menu_pair "1" "环境与 DNS 预检" "2" "创建配置备份"
+        menu_item "u" "系统与软件更新（推荐先执行）"
         menu_pair "3" "用户与 SSH 安全接管" "4" "防火墙与 Fail2ban"
         menu_pair "5" "SSH 基础加固" "6" "自动安全更新"
         menu_pair "7" "内核网络安全基线" "8" "网络性能方案选择"
@@ -535,7 +600,7 @@ first_run_wizard() {
         menu_pair "0" "返回主菜单" "00" "退出脚本" "$RED" "$RED"
         menu_div
         echo ""
-        read -rp "$(ui_prompt '选择步骤 [0-9 / r]: ')" CHOICE
+        read -rp "$(ui_prompt '选择步骤 [0-9 / u / r]: ')" CHOICE || return 0
         case "$CHOICE" in
             1) first_run_preflight; ui_pause ;;
             2)
@@ -552,6 +617,7 @@ first_run_wizard() {
             7) first_run_network_security_apply; ui_pause ;;
             8) first_run_performance_setup; ui_pause ;;
             9) first_run_final_audit; ui_pause ;;
+            u|U) first_run_package_updates_setup; ui_pause ;;
             r|R) first_run_recommended_flow; ui_pause ;;
             0) return ;;
             00) safe_clear; echo -e "${GREEN}已退出。${NC}"; exit 0 ;;

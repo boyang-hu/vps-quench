@@ -62,6 +62,7 @@ setup_recommended() {
     setup_onboarding "$1"
     first_run_preflight() { echo preflight >> "$TEST_LOG"; }
     config_backup_create() { echo backup >> "$TEST_LOG"; echo "$TMP/config-backup.tar.gz"; }
+    first_run_package_updates_setup() { echo updates >> "$TEST_LOG"; }
     first_run_access_ready() { return 0; }
     first_run_firewall_ready() { return 0; }
     first_run_fail2ban_ready() { return 0; }
@@ -84,7 +85,7 @@ setup_recommended() {
 t_recommended() {
     setup_recommended "recommended_$1"
     assert_ok first_run_recommended_flow <<< "$(printf 'y\n%s\n' "$1")"
-    local EXPECTED=$'preflight\nbackup\nnetwork'
+    local EXPECTED=$'preflight\nbackup\nupdates\nnetwork'
     [ -z "$2" ] || EXPECTED="${EXPECTED}"$'\n'"$2"
     EXPECTED="${EXPECTED}"$'\n''audit'
     assert_eq "$(cat "$TEST_LOG")" "$EXPECTED"
