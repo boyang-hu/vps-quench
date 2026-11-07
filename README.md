@@ -1,4 +1,4 @@
-# Quench — VPS 初始化与管理工具 V0.1.8
+# Quench — VPS 初始化与管理工具 V0.1.9
 
 > 首次开荒 · 用户与 SSH · Fail2ban · Firewall · BBR/FQ · DNS · Caddy 网站入口 · 系统与服务管理
 
@@ -28,24 +28,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 适合不能访问 GitHub 的中国内地 VPS。先在一台可以访问 GitHub 的电脑或跳板机下载：
 
 ```bash
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.8/quench-offline-V0.1.8.tar.gz
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.8/quench-offline-V0.1.8.tar.gz.sha256
-sha256sum -c quench-offline-V0.1.8.tar.gz.sha256
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.9/quench-offline-V0.1.9.tar.gz
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.9/quench-offline-V0.1.9.tar.gz.sha256
+sha256sum -c quench-offline-V0.1.9.tar.gz.sha256
 ```
 
 再通过 `scp`、SFTP 或 WinSCP 将两个文件传到 VPS。Linux/macOS 示例：
 
 ```bash
-scp quench-offline-V0.1.8.tar.gz* root@你的VPS地址:/root/
+scp quench-offline-V0.1.9.tar.gz* root@你的VPS地址:/root/
 ```
 
 登录 VPS 后离线安装：
 
 ```bash
 cd /root
-sha256sum -c quench-offline-V0.1.8.tar.gz.sha256
-tar -xzf quench-offline-V0.1.8.tar.gz
-cd quench-offline-V0.1.8
+sha256sum -c quench-offline-V0.1.9.tar.gz.sha256
+tar -xzf quench-offline-V0.1.9.tar.gz
+cd quench-offline-V0.1.9
 bash install.sh
 v
 ```
@@ -73,7 +73,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 | `--fail2ban-menu` | Fail2ban 管理 |
 | `--bbr-menu` | 网络性能调优（BBR / tc / initcwnd） |
 | `--bbr-calibrate` | 直接进入线路实测与 policer 拐点校准 |
-| `--bbr-measure` | 实测调优向导：先测带宽，再推导参数、可选整形、复测 |
+| `--bbr-measure` | 一键调优：完整参数、实测扫描、自动整形、验证 |
 | `--bbr-verify` | 只测当前单流/多流吞吐与重传，不修改配置或队列 |
 | `--firewall-menu` | 防火墙管理 |
 | `--dns-menu` | DNS 管理与诊断 |
@@ -115,7 +115,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
  ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.8  ·  Boyang
+  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.9  ·  Boyang
 ────────────────────────────────────────────────────────────────
   SSH · BBR · DNS · Caddy · Firewall · NFT · Docker
 
@@ -159,7 +159,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 
 性能步骤提供三个选择，首次开荒菜单的 `8` 也进入同一入口：
 
-1. **实测调优（推荐）**：进入完整实测向导，先测带宽再推导参数，BBR/FQ 和 tc 分别可选，应用后复测；开始联网测速前仍需明确确认。
+1. **实测调优（推荐）**：进入完整一键向导，填写或实测带宽，自动完成完整参数、拐点扫描、整形和验证；也可选择不整形或指定速率，开始联网测速前需确认。
 2. **仅启用 BBR＋FQ**：保留基础模式，不测速、不调其他参数、不新增限速。
 3. **暂时跳过（回车默认）**：不执行性能操作，直接继续最终体检。
 
@@ -239,38 +239,47 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 
 ### 3. 网络性能调优
 
-推荐使用实测向导，不再用机器内存替代线路能力。基础 BBR/FQ、参数与 tc 仍可独立操作，不会因为启用 BBR 或修改缓冲区而恢复旧的限速：
+推荐使用一键调优。填写带宽、对端和用途后，按完整方案自动完成基础参数、路径检查、拐点扫描、整形与验证。只需要 BBR＋FQ 时仍可单独启用：
 
 | 入口 | 修改范围 |
 |------|----------|
-| `b` 只启用 BBR＋FQ | 只设置拥塞算法与默认 FQ，检查 IPv4/IPv6 默认出口的实际队列；不修改缓冲、转发或 initcwnd，不创建带宽上限 |
-| `1` 实测调优向导（推荐） | 先测后算、确认应用、再复测；启用 BBR/FQ 和 tc 校准分别询问，可跳过 |
-| `v` 只验证性能 | 在现有配置/队列下测单流和四流吞吐，不修改网络配置 |
-| `2 / 3 / p` 手填计算、手动配置、场景预设 | 高级入口，不测速；不选择 BBR、不修改 FQ、不恢复 tc 速率 |
-| `4` tc 出口整形 | 单独校准、设置、恢复或取消限速；不修改 TCP 拥塞算法与 sysctl 调优参数 |
+| `b` 只启用 BBR＋FQ | 只设置拥塞算法与默认 FQ，检查实际队列；保留已有缓冲和限速，不创建带宽上限 |
+| `1` 一键调优（推荐） | 完整 TCP 参数、初始窗口、实测扫描、按结果自动处理整形、最终验证 |
+| `v` 只验证性能 | 现有配置下各测 10 秒单流和四流，不修改参数或队列 |
+| `2 / 3 / p` 手填计算、手动配置、场景预设 | 保留高级独立入口，不执行一键方案；不选择 BBR、不修改 FQ、不恢复 tc 速率 |
+| `4` tc 出口整形 | 独立设置/取消限速；线路校准复用一键向导的扫描引擎，不改 TCP 参数或初始窗口 |
 
-新机器可以只选 `b`，以后需要限速再选 `4`。旧机器已有的调优值不会因选择基础模式而重置；同一份持久化文件按功能合并，后续调优也会保留已保存的 BBR/FQ 设置。
+**一键调优流程（`1`）：**
 
-基础模式不强制接管已有整形：保留现有 HTB、CAKE、FQ 限速和自定义队列。没有外部规则时，单队列使用不限速 FQ，多队列保留 `mq` 并使用 FQ 叶子；只有内核自动生成、无 root filter 的默认队列树才允许刷新。不能确认实际队列已使用 FQ 时会明确告警，不把 `default_qdisc=fq` 等同于当前网卡已生效。默认 FQ 由 sysctl 持久化，不安装另一个会在开机时覆盖外部 QoS 的服务；网络管理器、虚拟接口可能仍采用自己的队列，重启后可通过诊断确认。
+1. **三个主要输入：** 带宽可填 `400M`、`600M`、`1G` 等，回车自动测量；`0` 表示自动测带宽但不整形，`m` 可直接指定最终整形速率。对端支持 IP、域名、`host:port`、`[IPv6]:port`，回车筛选公共节点。用途选代理/加速、大文件/备份或网站/API/混合。双栈机器额外选择 IPv4/IPv6；只有一条协议族默认路由时自动选用。
+2. **选点与带宽：** 18 个公共候选并行解析和测延迟，按 RTT 排序；短 TCP 检查每批 4 路，随后用 3 秒 iperf3 单流确认协议可用。近端不可用时自动尝试远端，延迟未知的放最后。自有对端失败可直接重新输入，不必退出向导。手填带宽跳过自动估计；留空时在临时不限速 FQ 下测 10 秒四流，取首个有效接收吞吐并按 1/10/50Mbps 档距取整。
+3. **基础参数：** 启用内核已有的 BBR＋FQ；无 BBR 时提示并使用 cubic，不安装内核。按带宽、固定的 **150ms 业务 RTT 估计值** 和用途生成完整配置。带宽 >100Mbps 时对测速出口对应的默认路由设置 `initcwnd=32`、`initrwnd=32` 并持久化；≤100Mbps 撤销 Quench 管理的窗口设置。没有对应主表默认路由时跳过窗口并提示。
+4. **路径与扫描：** 先按带宽的 40% 跑 8 秒双流，提示路径丢包或对端过慢；再做 12 秒单流不限速探测。异常低速补两次取最佳整组结果，≥2.5Gbps 的可疑单流补 8 流确认。需要扫描时先冷却 15 秒，再按接收吞吐与重传推导区间，约 10 档粗扫，档间等待 3 秒。重传跳变要求超过 0.1% 和五倍本底（阈值封顶 1%），三次至少两次确认；补低速控制点识别路径底噪，再细扫收窄拐点。
+5. **整形与验证：** 有可靠拐点时，按标称/估计带宽档位留出 1/2/5/10/15/25/40Mbps 余量并自动应用 HTB＋FQ。确认没有拐点时撤销旧 Quench 整形；测不准、扫描越界或超过 10Gbps 扫描上限时保留旧整形。最终各测 10 秒单流和四流，报告实际吞吐、当前整形与估算重传比例。手动指定速率或选择不整形会跳过路径检查和扫描。
 
-**实测调优向导（`1`）：**
+正式测量每份样本最多 3 轮，每轮尝试同一 IP 的公共服务端口，轮间等待 8 秒；路径检查为 2 轮、间隔 5 秒。自有节点仅重试指定端口。连接超时、节点忙和缺失汇总均可重试；路由变化、日志写入失败等本地故障会停止。必须取得 sender 和 receiver 汇总，不用发送吞吐冒充实际送达量。
 
-1. 选择 IPv4/IPv6、自有 iperf3 节点，或留空自动筛选公共候选。自动选点先按同协议族 RTT 排序，再检查 iperf3 是否可用；仅尝试 100ms 内的候选，并可轮换公共节点的测试端口。选定后固定目标 IP，通过实际到对端的路由确定出口，不混用 IPv4/IPv6。
-2. 在当前配置下测单流和四流，作为调优前对照；再临时使用不限速 FQ，测三次四流吞吐，取中位数估计可用带宽（仅两次成功时取较低值）。随后恢复原队列；没有足够样本、恢复失败或路由变更时停止，不退回内存预设。波动超过 30% 时要求确认是否继续。
-3. 按带宽与业务目标 RTT 计算 `2 × BDP + 2 MiB` 的缓冲需求。**内存只负责安全封顶**：单连接上限按物理内存 `1/32`、最低 4MiB、最高 256MiB；不按内存选择带宽。TCP 缓冲起点按代理、网站/API/混合服务、少量大文件用途分别计算。
-4. 展示方案，确认后才持久化。BBR/FQ 可选启用；tc 校准也可以跳过，或在测到可靠拐点并再次确认后应用。不会自动设置 initcwnd 或开启内核转发。
-5. 等待测试突发消退，再测同节点单流/四流，显示吞吐变化和估算重传比例；下降超过 10% 会警告。参数写入成功不等于性能提升，复测失败会明确报错。
+**参数方案：**
 
-**两个输入的含义：**
+| 参数组 | 一键方案 |
+|------|----------|
+| TCP 最大收发缓冲 | `2 × BDP + 2MiB`，物理内存 `1/32` 封顶，最低 4MiB、最高 256MiB |
+| TCP 默认缓冲 | 代理 1MiB，网站/混合 2MiB，大文件按 BDP 限定在 1–8MiB |
+| TCP 总内存 | 按 4KiB 页换算，低水位/压力/上限为 RAM 的 `1/16`、`1/8`、`1/4`，最低 4096/8192/16384 页 |
+| 队列与连接 | `netdev_max_backlog=16384`、`netdev_budget=600`、`optmem_max=65536`、`somaxconn=8192`、`tcp_max_syn_backlog=8192` |
+| TCP 行为 | window scaling、自动收窗、SACK/DSACK、timestamps、syncookies 开启；`tcp_adv_win_scale=1`、`tcp_fastopen=3`、`tcp_mtu_probing=1` |
+| 其他 | `tcp_tw_reuse=1`、`tcp_fin_timeout=15`、`tcp_keepalive_time=600`、`tcp_no_metrics_save=0`、`tcp_slow_start_after_idle=0`、端口范围 1024–65535、`min_free_kbytes=32768`、`file-max=1000000` |
+| HTB / FQ | 4ms 线速数据量的 burst/cburst（最低 32768 字节），quantum=1514，FQ limit=40960、flow_limit=8192，并设置 maxrate |
 
-- 套餐带宽留空时使用实测值；知道准确套餐速率时可填 `400M`、`600M`、`1G` 等作为缓冲计算基准，仍会实际测速。单次公网测速可能受对端、路径或原有窗口限制，实测值不是线路的保证容量。
-- 业务目标 RTT 默认 **150ms，明确是估计值**，可手填 1–2000ms。近端测速节点用来测出口容量，它的低延迟不会被当作跨境业务 RTT。
+旧内核不支持的可选 sysctl 会注明跳过；关键缓冲写入失败或成功写入后回读不一致会回滚本次参数操作。调优不打开路由转发，不主动设置 `tcp_notsent_lowat` 或 `tcp_reordering`。旧 Quench 曾设置过 notsent 时，仅在原始基线存在时恢复；否则明确提示保留。高级预设已有的转发/conntrack/UDP 配置继续独立保留，因此已有机器的所有系统参数不一定与一台干净系统相同。
 
-新实测方案保留内核的 `tcp_mem`、`min_free_kbytes`、`tcp_adv_win_scale`；不另设低 `tcp_notsent_lowat`。旧 Quench 预设设置过后者时，仅在原始基线存在的情况下恢复该值；找不到基线会提示保留，不猜测。其他已有转发、UDP、独立 BBR/FQ 配置按键合并保留。
+**Swap 建议：** 调优结束后，物理内存 ≤1GiB 且无活动 Swap 时，提供 1–20GiB 的可选创建入口，默认 2GiB，输入 `0` 跳过。创建成功后设置 `swappiness=10`，使用 Quench 自有 Swap 模块并保留至少 512MiB 磁盘空间；不删除第三方 Swap。Swap 缓解内存压力，不保证网络提速。
 
-每轮记录保存到 `/var/lib/quench/performance/run-*`：原始样本汇总、输入来源、建议参数、前后参数快照及退出状态。应用前另建时间戳备份，可用 `7` 恢复参数；tc 仍由 `4` 独立管理。报告不是完整系统快照，也不是可恢复任意外部 QoS 的配置存档。
+**记录与恢复：** 每轮保存到 `/var/lib/quench/performance/run-*`：`connections.log` 记录连接原因和原始 iperf3 输出，`samples.tsv` 保存有效样本、时长、IP 和端口；另有参数建议、前后快照、路由快照、扫描结果与退出状态。选点失败也保留报告。参数可通过 `7` 恢复时间戳备份；tc 由 `4` 管理，初始窗口由 `5` 管理。部分阶段失败时明确报告已完成部分，不把整个向导宣称为成功。
 
-**测量边界：** 目前测的是 TCP 出向吞吐，不测试 UDP/QUIC，也不承诺跨境提速。前后对照受公网忙闲变化影响，不是严格 A/B。公共节点不保证可用或容量充足，自有近端高带宽节点优先；没有合适节点时停止。全流程可能消耗数十 GB 并影响同机业务，开始前必须确认；`v` 也会产生测速流量，但不修改队列或网络参数。实测调优不会接管外部 CAKE/HTB/FQ 限速；已有 Quench 限速会在明确许可的测量阶段临时撤去，随后恢复，不能无损恢复的队列拒绝接管。
+**测量边界：** 这里只测 TCP 出向吞吐，不测试 UDP/QUIC，也不承诺跨境提速。公共节点的负载、路径和容量会影响结果，自有近端高带宽节点更便于复测。开始前展示流量预估并确认；自动估计超过 50GiB，或扫描推算显著超出已同意的流量时再确认，拒绝后跳过后续扫描和验证。没有 iperf3 时可仅按手填带宽应用基础参数。外部 CAKE/HTB/FQ 限速和不可恢复的队列会阻止调优；`v` 可在这些队列上只测性能。
+
+Quench 的服务、文件和恢复机制统一使用自己的命名。初始窗口通过 systemd/OpenRC/SysV 在开机时恢复；不安装 PPP 或 networkd dispatcher 钩子。默认 FQ 由 sysctl 持久化，网络管理器仍可能覆盖接口队列，重启或重新拨号后可运行诊断核对。
 
 **高级场景预设（`p`，不测速）：** 保留旧的内存分档供手动选择，不能视为实测最优。
 
@@ -290,7 +299,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 
 **代理与线路场景：** `relay`（中转机）、`landing`（跨境落地）和 `line_landing`（低延迟线路落地）；只有用户确认路由/NAT 用途时才开启内核转发与 conntrack 调优。
 
-**建站怎么选：** 普通网站、博客、API 或 1Panel 部署的混合服务，进入主菜单 `3` → `1 实测调优向导`，用途选 `2 网站 / API / 混合服务`（内部标识仍为 `mixed`）。不测速时选 `3` → `p 场景预设` → `1 通用建站 / 混合服务`（`balanced`）；手动配置中的用途 `4` 也标为通用建站，但仍是自行选择缓冲的独立入口。以少量大文件传输为主时可选实测用途 `3`，或手动选择 `throughput` 高吞吐预设。建站无需硬套中转/落地预设，也不因建站额外开启路由/NAT；Docker 等已有转发需求保持独立管理。这里仅明确用途文案，未新增参数档位或更改默认选择，实测向导默认仍为代理/多连接。
+**建站怎么选：** 普通网站、博客、API 或 1Panel 部署的混合服务，进入主菜单 `3` → `1 实测调优向导`，用途选 `3 网站 / API / 混合服务`（内部标识仍为 `mixed`）。不测速时选 `3` → `p 场景预设` → `1 通用建站 / 混合服务`（`balanced`）；手动配置中的用途 `4` 也标为通用建站，但仍是自行选择缓冲的独立入口。以少量大文件传输为主时可选实测用途 `2`，或手动选择 `throughput` 高吞吐预设。建站无需硬套中转/落地预设，也不因建站额外开启路由/NAT；Docker 等已有转发需求保持独立管理。一键向导默认用途为代理/多连接。
 
 **手填 BDP 计算（`2`，不测速）：** 按 `2 × BDP + 2 MiB` 精确计算缓冲需求并对齐到 64 KiB，不再向固定档位取整；代理/低延迟场景按物理内存的 `1/32`、通用/大流场景按 `1/16` 控制单 socket 自动扩展上限，并统一设置 256 MiB 绝对上限。
 - 内存：512MB / 1G / 2G / 4G / 8G / 16G+
@@ -302,21 +311,21 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 **安全保护：**
 - 自动配置与智能预设按用途使用 `1/32` 或 `1/16` 内存预算，并设 256 MiB 绝对上限；手动配置超过场景预算时二次确认
 - 自动配置误选高内存档位时按实际物理内存计算，例如 512MB 机器选择 16GB 仍按 512MB 限制
-- 高级旧预设每连接初始/默认缓冲维持接收 4KB/128KB、发送 4KB/16KB；实测方案的 TCP 默认缓冲按用途设置为 1MiB / 2MiB / BDP（1–8MiB），同时受最大值约束
-- `tcp_mem`、`min_free_kbytes`、`tcp_adv_win_scale` 及高风险全局连接参数交还内核管理
+- 高级旧预设每连接初始/默认缓冲维持接收 4KB/128KB、发送 4KB/16KB；实测方案的 TCP 默认缓冲按用途设置为 1MiB / 2MiB / BDP（1–8MiB）（低内存大文件用途需留意内核实际支持的范围）
+- 完整一键方案包含上表中的总内存、连接及系统容量参数；高级旧预设不自动加入这些参数
 - 无 sysctl 写入权限（无特权容器）自动检测并提示
 - 基础模式检测内核 BBR 支持；参数调优和 tc 整形不要求先启用 BBR
-- 首次调优保存运行参数基线，每次应用保存运行快照；失败时自动回滚
+- 首次调优保存运行参数基线，每次应用保存运行快照；参数应用失败时恢复该次快照，扫描退出时恢复测试前队列
 - 切换预设时检测上一场景遗留的转发/conntrack 参数，并恢复到首次调优前基线（`ip_forward` 单独警告）
 - NFT 与 BBR 双向识别对方持有的 `ip_forward` / IPv6 RA 参数：切换性能预设或删除最后一条转发规则时，不会复位另一模块仍在使用的转发能力
 - 中转/落地场景默认不修改内核转发；仅在用户确认路由/NAT 用途后启用，并同时设置默认与当前出口 `accept_ra=2`
-- 网络调优不再修改 `vm.swappiness`，Swap 策略统一由独立的 Swap 管理模块负责
+- TCP 参数本身不包含 `vm.swappiness`；一键向导末尾的可选 Swap 步骤调用独立 Swap 模块设置为 10
 - 逐行 `sysctl -w` 应用；基础模式要求 BBR 和默认 FQ 均写入且回读一致，否则回滚 sysctl。实际队列应用另行核验，失败时明确说明已保存的参数与未完成的队列操作，不报告整套成功
-- 场景容量参数只会抬高到目标值，不会压低首次调优前已有的更高值；出站端口范围会取原范围与目标范围的并集
+- 高级场景预设的容量参数只会抬高到目标值，不会压低首次调优前已有的更高值；出站端口范围会取原范围与目标范围的并集
 
 **其他功能：**
-- 独立线路实测校准：由用户指定同协议族的近端 iperf3 对端、端口和标称带宽；先测单流不限速基线，异常低速时自动重复取优并补 4 流对照，≥2.5Gbps 的可疑单流补 8 流复核，再用粗扫、2/3 重复确认和最多四轮细扫定位 policer 拐点。自动扫描最高 10Gbps，超出时标记 `ABOVE_CAP`，不猜测限速值
-- 实测不到拐点时建议保留 BBR/fq、不增加 HTB；对端过慢、路径底噪或扫描越界时标记为 `INCONCLUSIVE` / `OUT_OF_RANGE`，不会猜测或自动应用限速值。最近结果保存在 `/var/lib/quench/tc-calibration.state`
+- 独立线路校准与一键向导共用同一套 12 秒扫描、低速复核、粗细扫及结果判定；只管理整形，不修改 TCP 参数和初始窗口。
+- `NO_KNEE` 会移除旧 Quench 整形；`INCONCLUSIVE` / `OUT_OF_RANGE` / `ABOVE_CAP` 保留。结果保存在 `/var/lib/quench/tc-calibration.state`。
 - 手动整形仍支持选择 100M / 200M / 300M / 400M / 500M / 600M / 800M / 1G / 2G / 2.5G / 5G / 10G 或自定义带宽，再选择 95% / 97% / 99%；也可直接填写最终速率。支持 `400`、`600M`、`1.5G`、`2.5G`，按十进制 `1G = 1000M` 换算
 - tc 使用 `htb` 聚合整形 + `fq` 叶子，burst 按约 4ms 线速数据量计算；写入和持久化重载后会统一换算 bit/Kbit/Mbit/Gbit/Tbit 并回读核对真实 HTB rate。可查看 `tc -s` qdisc/class 统计
 - 线路校准只临时接管可恢复的内核默认 qdisc 或已有 Quench 规则；检测到外部 CAKE/HTB、自定义 mq 叶子等 QoS 时拒绝测试。手动整形同样默认拒绝覆盖外部 QoS，输入精确确认词后才可接管或删除，操作前诊断快照保存到 `/var/lib/quench/tc-backups/`
@@ -729,7 +738,7 @@ GitHub Actions 还会在 Debian 12/13、Ubuntu、Alpine、Rocky Linux 容器中�
 
 ### BBR 模块维护
 
-BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-measure.sh` 负责实测向导、节点筛选、参数推导和前后对照。修改后需要重新生成单文件发行版，并执行 Bash 语法、冒烟、故障注入、`tests/bbr-separation.sh`、`tests/bbr-measure.sh` 和离线安装测试。CI 另在隔离 Linux network namespace 中运行真实 FQ/HTB 与 iperf3 测试，不向公共节点压测。
+BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-measure.sh` 负责一键向导、节点筛选、参数推导和验证；`src/modules/bbr-sweep.sh` 负责共用扫描引擎。修改后需要重新生成单文件发行版，并执行 Bash 语法、冒烟、故障注入、`tests/bbr-separation.sh`、`tests/bbr-measure.sh`、`tests/bbr-aligned.sh` 和离线安装测试。CI 另在隔离 Linux network namespace 中运行真实 FQ/HTB 与 iperf3 测试，不向公共节点压测。
 
 ---
 
@@ -737,6 +746,7 @@ BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-me
 
 | 版本 | Quench 主要变更 |
 |------|----------------|
+| **V0.1.9** | 一键网络调优统一完整 TCP 参数、18 个公共候选并行筛选与端口重试、粗细扫描和自动整形；首次开荒与独立线路校准共用扫描引擎；增加小内存机器的可选 Swap 建议，保留独立 BBR/FQ 入口和外部 QoS 保护；补充参数一致性、低速对端、路径丢包及恢复失败测试。 |
 | **V0.1.8** | 自动安全更新按内容识别不同厂商的禁用配置，确认后逐文件备份接管并支持失败恢复，保留复杂策略和外部修改；y/n 确认输入错误时重新询问，保持默认选项且不延长回滚计时；SSH/UFW 回滚按变更范围恢复，增加逐步骤日志、UFW 命令诊断与失败状态检查；新增 UFW SSH 的 1Panel 兼容 `ALLOW` 模式及已有规则迁移。 |
 | **V0.1.7** | 实测网络调优与独立 BBR/FQ、tc 操作，首次开荒接入性能方案选择；Fail2ban 与 1Panel 共享基础配置；系统与软件更新中心、Debian 12 → 13 受控升级、云镜像源预检及自动安全更新冲突处理；升级支持 tmux 安装与会话接续；系统概览显示发行版与内核；Debian 12/13 用户改名保留 UID/GID，提供临时维护账号、清理及失败恢复入口。 |
 | **V0.1.6** | 回滚脚本按快照时的 DNS 后端刷新运行态（resolvconf -u / 重启 systemd-resolved / 重启 NetworkManager，失败计入回滚结果），并用与 DNS 模块相同的读取逻辑核对实际生效的上游；safety_arm 新增 --sysctl-runtime=FILE，首次开荒内核安全基线把旧运行值随事务保存，延迟回滚逐项 sysctl -w 恢复并回读核对。 |

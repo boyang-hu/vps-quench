@@ -14,7 +14,7 @@ t_plan() {
     read -r B DEFAULT TARGET <<< "$(bbr_measure_buffer_plan 600 150 8192 proxy)"
     read -r C DEFAULT TARGET <<< "$(bbr_measure_buffer_plan 400 300 8192 proxy)"
     [ "$A" -lt "$B" ] && [ "$A" -lt "$C" ] || fail 'bandwidth and RTT must drive the proposal'
-    assert_eq "$A" 17104896
+    assert_eq "$A" 17097152
     read -r A DEFAULT TARGET <<< "$(bbr_measure_buffer_plan 10000 150 512 bulk)"
     assert_eq "$A" 16777216
     assert_eq "$DEFAULT" 8388608
@@ -37,8 +37,11 @@ t_generator() {
     local CONFIG
     CONFIG=$(bbr_measure_generate_config 600 150 4096 proxy)
     assert_contains "$CONFIG" 'tcp_rmem = 4096 1048576'
-    ! grep -Eq 'tcp_congestion_control|default_qdisc|tcp_mem|adv_win_scale|min_free|ip_forward|notsent' <<< "$CONFIG" \
+    ! grep -Eq 'tcp_congestion_control|default_qdisc|ip_forward|notsent' <<< "$CONFIG" \
         || fail 'measured generator touched independent/high-risk knobs'
+    assert_contains "$CONFIG" 'net.ipv4.tcp_mem = 65536 131072 262144'
+    assert_contains "$CONFIG" 'net.core.netdev_budget = 600'
+    assert_contains "$CONFIG" 'vm.min_free_kbytes = 32768'
     printf 'net.ipv4.tcp_notsent_lowat = 131072\n' > "$SYSCTL_FILE"
     printf 'net.ipv4.tcp_notsent_lowat = 4294967295\n' > "$BBR_BASELINE_FILE"
     CONFIG=$(bbr_measure_generate_config 600 150 4096 proxy)
@@ -78,6 +81,16 @@ setup_session() {
     bbr_tcp_fastopen_value() { echo 3; }
     bbr_backup_sysctl() { echo backup >> "$LOG"; }
     bbr_enable_core_locked() { echo core >> "$LOG"; }
+    bbr_measure_apply_core() { echo core >> "$LOG"; }
+    bbr_measure_cwnd() { echo "cwnd $1" >> "$LOG"; }
+    bbr_measure_path_check() { echo "path $1" >> "$LOG"; }
+    bbr_measure_swap_advice() { :; }
+    bbr_measure_verdict() { :; }
+    bbr_default_routes() { echo '6|default dev eth6'; }
+    bbr_sweep_run() {
+        printf 'calibrate 12 %s\n' "$QUENCH_PERF_DEV" >> "$LOG"
+        printf 'STATUS=INCONCLUSIVE\nUNSHAPED_MBPS=600\n' > "$BBR_CALIBRATION_RESULT_FILE"
+    }
     bbr_apply_sysctl() { printf '%s\n' "$1" > "$CASE_DIR/applied"; echo "apply $2" >> "$LOG"; }
     bbr_calibration_run() { printf 'calibrate %s %s\n' "$5" "$6" >> "$LOG"; }
     sleep() { :; }
@@ -103,7 +116,7 @@ t_session() {
     assert_file_contains "$LOG" restore
     if [ "$1" = combined ]; then
         assert_file_contains "$LOG" core
-        assert_file_contains "$LOG" 'calibrate 8 eth6'
+        assert_file_contains "$LOG" 'calibrate 12 eth6'
     else
         ! grep -Eq '^core|^calibrate' "$LOG" || fail 'parameter-only workflow changed core/shaping'
     fi
@@ -156,7 +169,7 @@ t_failure() {
     assert_file_contains "$LOG" unlock
     :
 }
-for CASE in baseline probe restore route guard backup signal cancelled; do
+for CASE in baseline probe restore route guard backup signal; do
     run_test "Stop without applying guessed config on $CASE" t_failure "$CASE"
 done
 
@@ -164,7 +177,7 @@ t_post_failure() {
     setup_session "post_$1"
     case "$1" in
         apply) bbr_apply_sysctl() { echo attempt >> "$LOG"; return 1; } ;;
-        shape) bbr_calibration_run() { return 1; } ;;
+        shape) bbr_sweep_run() { return 1; } ;;
         verify) bbr_measure_pair() { [ "$1" != after ]; } ;;
     esac
     assert_fail bbr_measure_session tune peer.test 5201 4 '' 150 proxy y y
@@ -183,6 +196,7 @@ t_peer() {
     bbr_measure_resolve() { echo "$1"; }
     bbr_measure_rtt() { case "$1" in far) echo 150 ;; near) echo 10 ;; middle) echo 30 ;; esac; }
     bbr_measure_peer_ready() { [ "$1:$2:$3" = near:5202:6 ]; }
+    bbr_measure_tcp_open() { :; }
     # command -v only; the network is mocked above.
     ping() { :; }
     assert_ok bbr_measure_pick_peer 6
@@ -191,6 +205,208 @@ t_peer() {
     :
 }
 run_test 'Public selection orders by RTT, validates protocol, retries only candidate ports' t_peer
+
+t_peer_full_pool() {
+    QUENCH_PERF_PEER=''; QUENCH_PERF_PORT=''
+    bbr_measure_peer_pool() { printf 'p1\np2\np3\np4\np5\n'; }
+    bbr_measure_resolve() { echo "$1"; }
+    bbr_measure_rtt() { echo "${1#p}"; }
+    bbr_measure_tcp_open() { [ "$1:$2" = p5:5209 ]; }
+    bbr_measure_peer_ready() { [ "$1:$2:$3" = p5:5209:4 ]; }
+    assert_ok bbr_measure_pick_peer 4
+    assert_eq "$QUENCH_PERF_PEER" p5
+    assert_eq "$QUENCH_PERF_PORT" 5209
+    assert_eq "$QUENCH_PERF_PROBE_PIDS" ''
+}
+run_test 'Fifth candidate and service port 5209 are eligible' t_peer_full_pool
+
+t_peer_fallback() {
+    local RTT_VALUE="$1"
+    QUENCH_PERF_PEER=''; QUENCH_PERF_PORT=''
+    bbr_measure_peer_pool() { echo distant; }
+    bbr_measure_resolve() { echo 192.0.2.1; }
+    bbr_measure_rtt() { [ "$RTT_VALUE" != unknown ] || return 1; echo "$RTT_VALUE"; }
+    bbr_measure_tcp_open() { :; }
+    bbr_measure_peer_ready() { :; }
+    assert_ok bbr_measure_pick_peer 4
+    assert_eq "$QUENCH_PERF_PEER" 192.0.2.1
+}
+for RTT in 150 unknown; do
+    run_test "Remote/unknown RTT $RTT falls back without stopping the wizard" t_peer_fallback "$RTT"
+done
+
+t_discovery_parallel() {
+    local TEST_DISCOVERY_DIR="$TMP/concurrent"
+    mkdir -p "$TEST_DISCOVERY_DIR"
+    bbr_measure_peer_pool() { seq 1 19; }
+    bbr_measure_resolve() {
+        : > "$TEST_DISCOVERY_DIR/$1.started"
+        if [ "$1" = 1 ]; then
+            local N
+            for N in {1..50}; do [ ! -f "$TEST_DISCOVERY_DIR/18.started" ] || break; sleep 0.02; done
+            [ -f "$TEST_DISCOVERY_DIR/18.started" ] || return 1
+            [ ! -f "$TEST_DISCOVERY_DIR/19.started" ] || return 1
+        fi
+        echo "192.0.2.$1"
+    }
+    bbr_measure_rtt() { echo 10; }
+    bbr_measure_tcp_open() { :; }
+    bbr_measure_peer_ready() { :; }
+    assert_ok bbr_measure_pick_peer 4
+    assert_eq "$QUENCH_PERF_PEER" 192.0.2.1
+    [ -f "$TEST_DISCOVERY_DIR/19.started" ] || fail 'discovery skipped later batch'
+    assert_eq "$QUENCH_PERF_PROBE_PIDS" ''
+}
+run_test 'Discovery runs eighteen workers concurrently, waits before the next batch' t_discovery_parallel
+
+t_discovery_cancel() {
+    local TEST_DISCOVERY_DIR="$TMP/discovery-cancel" PID N RC=0
+    mkdir -p "$TEST_DISCOVERY_DIR"
+    bash -s -- "$ROOT" "$TEST_DISCOVERY_DIR" > "$TEST_DISCOVERY_DIR/output" 2>&1 <<'CHILD' &
+export QUENCH_TEST_MODE=1
+source "$1/vps-quench.sh"
+TEST_DISCOVERY_DIR=$2
+QUENCH_TMP_REGISTRY=''
+quench_tmp_registry_init
+printf '%s\n' "$QUENCH_TMP_REGISTRY" > "$TEST_DISCOVERY_DIR/registry"
+QUENCH_PERF_REPORT=''; QUENCH_PERF_RESTORE=0
+bbr_calibration_lock_release() { :; }
+txn_write_end() { :; }
+bbr_measure_peer_pool() { seq 1 19; }
+bbr_measure_resolve() {
+    : > "$TEST_DISCOVERY_DIR/$1.started"
+    sleep 1
+    : > "$TEST_DISCOVERY_DIR/$1.done"
+    echo "192.0.2.$1"
+}
+bbr_measure_rtt() { echo 10; }
+bbr_measure_peer_ready() { echo unexpected-handshake; return 1; }
+trap bbr_measure_cleanup EXIT
+trap 'exit 130' INT TERM HUP
+bbr_measure_pick_peer 4
+CHILD
+    PID=$!
+    for N in {1..100}; do
+        [ ! -f "$TEST_DISCOVERY_DIR/18.started" ] || break
+        sleep 0.02
+    done
+    kill -TERM "$PID" 2>/dev/null || true
+    wait "$PID" || RC=$?
+    assert_eq "$RC" 130
+    for N in {1..18}; do
+        [ -f "$TEST_DISCOVERY_DIR/$N.done" ] || fail 'cleanup returned before worker finished'
+    done
+    [ ! -f "$TEST_DISCOVERY_DIR/19.started" ] || fail 'started next batch after cancellation'
+    [ ! -e "$(cat "$TEST_DISCOVERY_DIR/registry")" ] || fail 'temporary registry leaked'
+    ! grep -q unexpected-handshake "$TEST_DISCOVERY_DIR/output" || fail 'iperf ran after cancellation'
+}
+run_test 'Cancellation drains bounded discovery workers and cleans temporary resources' t_discovery_cancel
+
+t_default_family() {
+    ip() { [ "$1" != -6 ] || echo 'default via fe80::1 dev eth0'; }
+    assert_eq "$(bbr_measure_default_family)" 6
+    ip() { echo 'default dev eth0'; }
+    assert_eq "$(bbr_measure_default_family)" 4
+}
+run_test 'IPv6-only default route suggests IPv6; dual-stack keeps IPv4 default' t_default_family
+
+t_ping_compat() {
+    timeout() { shift; "$@"; }
+    ping() {
+        case "$1" in -4|-6) echo 'ping: invalid option'; return 1 ;; esac
+        echo 'round-trip min/avg/max = 10.0/11.5/13.0 ms'
+    }
+    ping6() { echo 'round-trip min/avg/max = 20.0/21.5/23.0 ms'; }
+    assert_eq "$(bbr_measure_rtt 192.0.2.1 4)" 11.50
+    assert_eq "$(bbr_measure_rtt 2001:db8::1 6)" 21.50
+}
+run_test 'BusyBox ping option fallback preserves address family' t_ping_compat
+
+t_early_report() {
+    setup_session early_report
+    bbr_measure_pick_peer() { bbr_measure_log '[dns_failed] host=unresolvable.test'; return 1; }
+    assert_fail bbr_measure_session tune '' 5201 4 '' 150 proxy n n
+    local REPORTS=("$QUENCH_PERF_REPORT_DIR"/run-*)
+    assert_file_contains "${REPORTS[0]}/connections.log" dns_failed
+    assert_file_contains "${REPORTS[0]}/outcome.txt" 'exit_code=1'
+    ! grep -q '^measure' "$LOG" || fail 'measured after selection failure'
+}
+run_test 'Failed peer selection still leaves diagnostics and exit status' t_early_report
+
+t_retry() {
+    local MODE="$1" COUNT=0
+    local LOG="$TMP/retry-$MODE"; : > "$LOG"
+    QUENCH_PERF_PEER=192.0.2.1; QUENCH_PERF_PORT=5201; QUENCH_PERF_FAMILY=6
+    QUENCH_PERF_PORTS=''
+    [ "$MODE" != public ] || QUENCH_PERF_PORTS=$'5201\n5202\n5209'
+    bbr_measure_tcp_open() { [ "$2" = 5209 ]; }
+    sleep() { :; }
+    bbr_calibration_measure_once() {
+        COUNT=$((COUNT + 1))
+        printf '%s %s %s\n' "$1" "$2" "$3" >> "$LOG"
+        QUENCH_PERF_RETRYABLE=1
+        [ "$MODE" != parse ] || QUENCH_PERF_RETRYABLE=0
+        if [ "$COUNT" = 2 ] && [ "$MODE" != exhausted ]; then
+            BBR_CAL_RECEIVER=600; return 0
+        fi
+        BBR_CAL_RECEIVER=''; return 1
+    }
+    case "$MODE" in
+        public|custom)
+            assert_ok bbr_calibration_measure 192.0.2.1 5201 6 8 1 sample
+            assert_eq "$COUNT" 2
+            if [ "$MODE" = public ]; then assert_eq "$QUENCH_PERF_PORT" 5209
+            else assert_eq "$QUENCH_PERF_PORT" 5201; fi ;;
+        exhausted)
+            assert_fail bbr_calibration_measure 192.0.2.1 5201 6 8 1 sample
+            assert_eq "$COUNT" 3
+            assert_eq "$BBR_CAL_RECEIVER" '' ;;
+        parse)
+            assert_fail bbr_calibration_measure 192.0.2.1 5201 6 8 1 sample
+            assert_eq "$COUNT" 1 ;;
+    esac
+    ! grep -vE '^192.0.2.1 520[129] 6$' "$LOG" || fail 'changed peer or protocol family'
+}
+for MODE in public custom exhausted parse; do
+    run_test "Retry $MODE keeps peer/family, limits attempts, rejects invalid samples" t_retry "$MODE"
+done
+
+t_iperf_log() {
+    QUENCH_PERF_REPORT="$TMP/iperf-log"; mkdir -p "$QUENCH_PERF_REPORT"
+    timeout() { shift; "$@"; }
+    iperf3() { echo 'iperf3: error - the server is busy running a test. try again later'; return 1; }
+    assert_fail bbr_measure_peer_ready 192.0.2.1 5201 4
+    assert_eq "$BBR_CAL_IPERF_PID" ''
+    assert_eq "$BBR_CAL_TEMP_FILE" ''
+    assert_file_contains "$QUENCH_PERF_REPORT/connections.log" '[handshake] peer=192.0.2.1 port=5201 exit=1'
+    assert_fail bbr_calibration_measure_once 192.0.2.1 5201 4 8 1 test
+    assert_eq "$QUENCH_PERF_RETRYABLE" 1
+    assert_eq "$BBR_CAL_RECEIVER" ''
+    assert_file_contains "$QUENCH_PERF_REPORT/connections.log" '[test/1]'
+    iperf3() { echo '[  5] 0.00-8.00 sec 600 MBytes 620 Mbits/sec sender'; }
+    assert_fail bbr_calibration_measure_once 192.0.2.1 5201 4 8 1 malformed
+    assert_eq "$QUENCH_PERF_RETRYABLE" 0
+}
+run_test 'Handshake and measurement retain actual iperf error and clear stale results' t_iperf_log
+
+t_swap_advice() {
+    local MODE="$1" CALLED=0
+    bbr_physical_memory_mb() { if [ "$MODE" = large ]; then echo 2048; else echo 512; fi; }
+    bbr_measure_swap_active() {
+        case "$MODE" in present) return 0 ;; unknown) return 2 ;; *) return 1 ;; esac
+    }
+    df() { printf 'Filesystem 1M-blocks Used Available\n/dev/test 10000 1 9999\n'; }
+    swap_managed_path() { echo /swapfile.quench; }
+    swap_create_apply() { assert_eq "$1" 2048; CALLED=$((CALLED + 1)); }
+    swap_set_swappiness_apply() { assert_eq "$1" 10; }
+    local INPUT=0
+    [ "$MODE" != accept ] || INPUT=2
+    assert_ok bbr_measure_swap_advice <<< "$INPUT"
+    if [ "$MODE" = accept ]; then assert_eq "$CALLED" 1; else assert_eq "$CALLED" 0; fi
+}
+for MODE in accept decline present unknown large; do
+    run_test "Low RAM swap advice: $MODE" t_swap_advice "$MODE"
+done
 
 t_resolve() {
     timeout() { shift; "$@"; }
@@ -250,19 +466,22 @@ t_registry() {
 }
 run_test 'Subworkflow cleanup does not delete parent menu temporary resources' t_registry
 
-t_low_samples() {
-    setup_session low_samples
+t_probe_rounding() {
+    setup_session probe_rounding
+    QUENCH_PERF_DEV=eth6; BBR_CAL_TC_BIN=tc
+    QUENCH_PERF_PEER=192.0.2.10; QUENCH_PERF_PORT=5201; QUENCH_PERF_FAMILY=6
+    QUENCH_PERF_REPORT=''
     bbr_calibration_measure() {
         MEASURE_N=$((MEASURE_N+1))
-        [ "$MEASURE_N" -le 3 ] || return 1
-        BBR_CAL_SENDER=600; BBR_CAL_RECEIVER=600; BBR_CAL_RETRANS=0; BBR_CAL_LOSS=0
+        assert_eq "$4" 10; assert_eq "$5" 4
+        BBR_CAL_SENDER=621; BBR_CAL_RECEIVER=623; BBR_CAL_RETRANS=0; BBR_CAL_LOSS=0
     }
-    assert_fail bbr_measure_session tune peer.test 5201 4 '' 150 proxy y y
-    [ ! -e "$CASE_DIR/applied" ] || fail 'one successful bandwidth sample was enough to apply'
-    assert_file_contains "$LOG" restore
-    :
+    assert_ok bbr_measure_probe
+    assert_eq "$MEASURE_N" 1
+    assert_eq "$QUENCH_PERF_BW" 600
+    assert_eq "$QUENCH_PERF_RESTORE" 0
 }
-run_test 'Require at least two successful unlimited bandwidth samples' t_low_samples
+run_test 'Auto bandwidth uses one valid ten-second four-stream sample and rounds like tcpfit' t_probe_rounding
 
 t_route() {
     ip() {
@@ -303,39 +522,58 @@ t_reusable_queue() {
 }
 run_test 'Restored default queues remain eligible for subsequent tuning; verify actual restore' t_reusable_queue
 
-t_aggregate() {
-    setup_session "aggregate_$1"
-    cp "$ROOT/tests/lib/bbr-tc-fixture.sh" "$CASE_DIR/bin/tc"
-    chmod +x "$CASE_DIR/bin/tc"
-    PATH="$CASE_DIR/bin:$PATH"
-    unset -f tc bbr_calibration_run
-    # Use the real scanning decision function, not the session fixture stub.
-    source "$ROOT/src/modules/bbr.sh"
-    TC_STATE_FILE="$CASE_DIR/tc.state"
-    local TEST_STATUS="" APPLIED=0 SEEN8=0 RESTORE_RC="$1"
-    default_iface() { echo eth4; }
-    bbr_calibration_lock_acquire() { :; }
-    bbr_calibration_write_result() { TEST_STATUS=$1; }
-    bbr_calibration_capture_qdisc() { :; }
-    bbr_calibration_traffic_mark() { :; }
-    bbr_calibration_set_fq() { :; }
-    bbr_calibration_finish() { trap - INT TERM HUP; return "$RESTORE_RC"; }
-    bbr_tc_apply_selected_rate() { APPLIED=1; }
-    bbr_calibration_measure() {
-        BBR_CAL_SENDER=3000; BBR_CAL_RECEIVER=3000; BBR_CAL_RETRANS=9000; BBR_CAL_LOSS=2
-        if [ "$5" = 8 ]; then
-            SEEN8=1; BBR_CAL_SENDER=9000; BBR_CAL_RECEIVER=9000; BBR_CAL_LOSS=0.001
-        fi
+
+t_scan_result() {
+    setup_session "scan-result-$1"
+    bbr_tc_apply_selected_rate() { echo "shape $1 $2" >> "$LOG"; }
+    bbr_tc_remove_selected() { echo "remove $1" >> "$LOG"; }
+    local RESULT="$1"
+    bbr_sweep_run() {
+        printf 'STATUS=%s\nUNSHAPED_MBPS=600\nKNEE_MBPS=598\nRECOMMEND_MBPS=583\n' "$RESULT" > "$BBR_CALIBRATION_RESULT_FILE"
     }
-    if [ "$RESTORE_RC" = 0 ]; then assert_ok bbr_calibration_run peer.test 5201 6 5000 8 wan6
-    else assert_fail bbr_calibration_run peer.test 5201 6 5000 8 wan6; fi
-    assert_eq "$SEEN8" 1
-    assert_eq "$BBR_CAL_DEV" wan6
-    assert_eq "$TEST_STATUS" NO_KNEE
-    assert_eq "$APPLIED" 0
-    :
+    assert_ok bbr_measure_session tune peer.test 5201 6 600 150 proxy y auto
+    case "$RESULT" in
+        KNEE) assert_file_contains "$LOG" 'shape eth6 583' ;;
+        NO_KNEE) assert_file_contains "$LOG" 'remove eth6' ;;
+        *)
+            ! grep -Eq '^shape|^remove' "$LOG" || fail 'uncertain result changed shaping'
+            if [ "$RESULT" = CANCELLED ]; then
+                ! grep -q '^measure' "$LOG" || fail 'cancelled scan still spent verification traffic'
+            fi ;;
+    esac
 }
-run_test 'High-bandwidth scan uses eight-stream confirmation and the selected egress' t_aggregate 0
-run_test 'Calibration restore failure prevents subsequent persistent actions' t_aggregate 1
+for STATUS in KNEE NO_KNEE INCONCLUSIVE OUT_OF_RANGE ABOVE_CAP CANCELLED; do
+    run_test "Wizard applies only the permitted action for $STATUS" t_scan_result "$STATUS"
+done
+
+t_old_shape() {
+    setup_session old_shape
+    printf 'DEV=eth6\nRATE=950\n' > "$TC_STATE_FILE"
+    bbr_sweep_run() { printf 'STATUS=NO_KNEE\nUNSHAPED_MBPS=100\n' > "$BBR_CALIBRATION_RESULT_FILE"; }
+    bbr_tc_remove_selected() { fail 'slow result removed existing limiter'; }
+    assert_ok bbr_measure_session tune peer.test 5201 6 100 150 proxy y auto
+    assert_eq "$(bbr_state_value "$BBR_CALIBRATION_RESULT_FILE" STATUS)" INCONCLUSIVE
+}
+run_test 'Slow automatic bandwidth cannot invalidate an existing higher limiter' t_old_shape
+
+t_scan_only() {
+    setup_session scan_only
+    bbr_measure_cwnd() { fail 'scan-only changed initial windows'; }
+    assert_ok bbr_measure_session calibrate peer.test 5201 6 600 150 proxy n auto
+    ! grep -Eq '^backup|^core|^apply|^cwnd' "$LOG" || fail 'independent scan applied base tuning'
+    assert_file_contains "$LOG" 'calibrate 12 eth6'
+}
+run_test 'Standalone calibration shares the scanner and leaves TCP parameters alone' t_scan_only
+
+t_no_iperf() {
+    setup_session no_iperf
+    QUENCH_PERF_HAVE_IPERF=0
+    ip() { echo 'default dev eth6'; }
+    bbr_measure_connect() { fail 'fallback tried to measure'; }
+    assert_ok bbr_measure_session tune '' 5201 6 400 150 proxy y auto
+    assert_file_contains "$LOG" 'apply measured'
+    ! grep -Eq '^measure|^calibrate' "$LOG" || fail 'basic-only fallback attempted tests'
+}
+run_test 'Without iperf the explicit bandwidth drives base tuning without measurements' t_no_iperf
 
 test_summary 'Measured performance workflow'

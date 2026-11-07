@@ -1317,7 +1317,7 @@ EOF
     chmod +x "$TC_BIN_DIR/tc"
     cat > "$TC_HELPER" <<'EOF'
 #!/bin/sh
-# QUENCH_TC_HELPER_VERSION=3
+# QUENCH_TC_HELPER_VERSION=4
 [ "${1:-}" = apply ] || exit 1
 : > "$TC_MARKER"
 EOF
@@ -1506,9 +1506,9 @@ EOF
         || { echo "BBR force takeover did not delete the foreign root qdisc" >&2; exit 1; }
     grep -qx 'qdisc add dev eth0 root handle 1: htb default 10' "$TC_TEST_LOG" \
         || { echo "BBR force takeover did not install its root qdisc" >&2; exit 1; }
-    grep -qx 'class add dev eth0 parent 1: classid 1:10 htb rate 100mbit ceil 100mbit burst 100kb cburst 100kb' "$TC_TEST_LOG" \
+    grep -qx 'class add dev eth0 parent 1: classid 1:10 htb rate 100mbit ceil 100mbit burst 102400b cburst 102400b quantum 1514' "$TC_TEST_LOG" \
         || { echo "BBR force takeover did not install its shaping class" >&2; exit 1; }
-    grep -qx 'qdisc add dev eth0 parent 1:10 handle 100: fq maxrate 100mbit' "$TC_TEST_LOG" \
+    grep -qx 'qdisc add dev eth0 parent 1:10 handle 100: fq limit 40960 flow_limit 8192 maxrate 100mbit' "$TC_TEST_LOG" \
         || { echo "BBR force takeover did not install its fq leaf" >&2; exit 1; }
     SNAPSHOT=$(find "$TC_BACKUP_DIR" -type f -name 'eth0_*.txt' -print -quit)
     [ -n "$SNAPSHOT" ] || { echo "BBR force takeover did not save a tc snapshot" >&2; exit 1; }
@@ -1670,69 +1670,13 @@ EOF
 }
 run_test "calibration could not capture kernel mq leaves" t_sm_047
 t_sm_048() {
-    CAL_BIN="$TMP/calibration-no-knee-bin"
-    mkdir -p "$CAL_BIN"
-    printf '#!/bin/sh\nexit 0\n' > "$CAL_BIN/tc"
-    chmod +x "$CAL_BIN/tc"
-    PATH="$CAL_BIN:$PATH"
-    TC_STATE_FILE="$TMP/calibration-no-knee-tc.state"
-    FINISHED=0 RESULT_STATUS="" APPLIED=0
-    default_iface() { echo eth0; }
-    bbr_calibration_lock_acquire() { :; }
-    bbr_calibration_capture_qdisc() { BBR_CAL_QDISC_MODE=default; BBR_CAL_QDISC_TYPE=fq; }
-    bbr_calibration_traffic_mark() { :; }
-    bbr_calibration_set_fq() { :; }
-    bbr_calibration_measure() {
-        BBR_CAL_SENDER=505; BBR_CAL_RECEIVER=500; BBR_CAL_RETRANS=1; BBR_CAL_LOSS=0.0010
-    }
-    bbr_calibration_write_result() { RESULT_STATUS=$1; }
-    bbr_calibration_finish() { trap - INT TERM HUP; FINISHED=1; }
-    bbr_tc_apply_selected_rate() { APPLIED=1; }
-    bbr_calibration_run test.example 5201 4 500 8 >/dev/null \
-        || { echo "clean calibration path returned failure" >&2; exit 1; }
-    [ "$RESULT_STATUS" = NO_KNEE ] && [ "$FINISHED" -eq 1 ] && [ "$APPLIED" -eq 0 ] \
-        || { echo "clean calibration invented a policer or skipped cleanup" >&2; exit 1; }
-    :
+    CAL_ARGS="$TMP/calibration-entry"
+    bbr_measure_session() { printf '%s\n' "$*" > "$CAL_ARGS"; }
+    bbr_calibration_run test.example 5201 4 500
+    [ "$(cat "$CAL_ARGS")" = 'calibrate test.example 5201 4 500 150 proxy n auto' ] \
+        || { echo "independent calibration did not use the shared measured workflow" >&2; exit 1; }
 }
-run_test "clean calibration path returned failure" t_sm_048
-t_sm_049() {
-    CAL_BIN="$TMP/calibration-knee-bin"
-    mkdir -p "$CAL_BIN"
-    printf '#!/bin/sh\nexit 0\n' > "$CAL_BIN/tc"
-    chmod +x "$CAL_BIN/tc"
-    PATH="$CAL_BIN:$PATH"
-    TC_STATE_FILE="$TMP/calibration-knee-tc.state"
-    CURRENT_RATE=0 FINISHED=0 RESULT_STATUS="" RESULT_KNEE="" RESULT_RECOMMEND="" APPLIED=0
-    default_iface() { echo eth0; }
-    sleep() { :; }
-    bbr_calibration_lock_acquire() { :; }
-    bbr_calibration_capture_qdisc() { BBR_CAL_QDISC_MODE=default; BBR_CAL_QDISC_TYPE=fq; }
-    bbr_calibration_traffic_mark() { :; }
-    bbr_calibration_set_fq() { :; }
-    bbr_calibration_apply_shaper() { CURRENT_RATE=$2; }
-    bbr_calibration_measure() {
-        if [ "$CURRENT_RATE" -eq 0 ]; then
-            BBR_CAL_SENDER=500; BBR_CAL_RECEIVER=480; BBR_CAL_RETRANS=9000; BBR_CAL_LOSS=2.0000
-        elif [ "$CURRENT_RATE" -le 500 ]; then
-            BBR_CAL_SENDER=$CURRENT_RATE; BBR_CAL_RECEIVER=$CURRENT_RATE; BBR_CAL_RETRANS=1; BBR_CAL_LOSS=0.0010
-        else
-            BBR_CAL_SENDER=$CURRENT_RATE; BBR_CAL_RECEIVER=480; BBR_CAL_RETRANS=9000; BBR_CAL_LOSS=2.0000
-        fi
-    }
-    bbr_calibration_write_result() {
-        RESULT_STATUS=$1; RESULT_KNEE=${7:-}; RESULT_RECOMMEND=${8:-}
-    }
-    bbr_calibration_finish() { trap - INT TERM HUP; FINISHED=1; }
-    bbr_tc_apply_selected_rate() { APPLIED=1; }
-    bbr_calibration_run test.example 5201 4 500 8 >/dev/null <<'EOF'
-n
-EOF
-    [ "$RESULT_STATUS" = KNEE ] && [ "$RESULT_KNEE" = 499 ] && [ "$RESULT_RECOMMEND" = 487 ] \
-        && [ "$FINISHED" -eq 1 ] && [ "$APPLIED" -eq 0 ] \
-        || { echo "calibration knee/refinement decision is wrong" >&2; exit 1; }
-    :
-}
-run_test "calibration knee/refinement decision is wrong" t_sm_049
+run_test "Independent calibration dispatches the shared scan without TCP parameter changes" t_sm_048
 t_top_033() {
     [[ "$(bbr_recommend_profile 4095)" = balanced ]] || { echo "BBR sub-4GB recommendation changed unexpectedly" >&2; exit 1; }
     [[ "$(bbr_recommend_profile 4096)" = throughput ]] || { echo "BBR 4GB recommendation does not match documentation" >&2; exit 1; }
@@ -1747,7 +1691,7 @@ awk 'p && /^CWND_HELPER_EOF$/{exit} /<< '\''CWND_HELPER_EOF'\''/{p=1; next} p{pr
 t_top_034() {
     sh -n "$BBR_TC_HELPER_TEST" || { echo "Generated tc helper has syntax errors" >&2; exit 1; }
     sh -n "$BBR_CWND_HELPER_TEST" || { echo "Generated initcwnd helper has syntax errors" >&2; exit 1; }
-    grep -qxF '# QUENCH_TC_HELPER_VERSION=3' "$BBR_TC_HELPER_TEST" \
+    grep -qxF '# QUENCH_TC_HELPER_VERSION=4' "$BBR_TC_HELPER_TEST" \
         || { echo "Generated tc helper is missing its compatibility version" >&2; exit 1; }
     :
 }
@@ -1766,7 +1710,7 @@ t_sm_050() {
     cat > "$HELPER_BIN/ip" <<'EOF'
 #!/bin/sh
 if [ "$2 $3" = "route show" ]; then
-    echo "default dev eth0 metric 100 initcwnd 20 initrwnd 20"
+    echo "default dev eth0 metric 100 ${HELPER_WINDOWS:-initcwnd 20 initrwnd 20}"
 else
     printf '%s\n' "$*" >> "$HELPER_LOG"
 fi
@@ -1779,6 +1723,9 @@ EOF
         || { echo "Generated initcwnd helper did not apply both families" >&2; exit 1; }
     : > "$HELPER_LOG"
     PATH="$HELPER_BIN:$PATH" "$HELPER_RUN" remove \
+        || { echo "Generated initcwnd helper failed to preserve an external window" >&2; exit 1; }
+    [ ! -s "$HELPER_LOG" ] || { echo "Generated helper removed a window it did not own" >&2; exit 1; }
+    HELPER_WINDOWS='initcwnd 50' PATH="$HELPER_BIN:$PATH" "$HELPER_RUN" remove \
         || { echo "Generated initcwnd helper could not restore kernel defaults" >&2; exit 1; }
     grep -qx -- '-4 route replace default dev eth0 metric 100' "$HELPER_LOG" \
         && grep -qx -- '-6 route replace default dev eth0 metric 100' "$HELPER_LOG" \
@@ -2306,15 +2253,17 @@ t_web_profile_menu() {
 run_test 'Web hosting preset label retains the existing balanced dispatch' t_web_profile_menu
 
 t_web_measured_role() {
+    ip() { [ "$1" != -4 ] || echo 'default dev eth0'; }
+    bbr_measure_dependencies() { :; }
     bbr_measure_session() { printf 'role:%s core:%s shape:%s\n' "$7" "$8" "$9"; }
     local OUT
-    OUT=$(bbr_measure_menu tune <<< "$(printf '4\n192.0.2.1\n5201\n\n150\n%s\nn\nn\ny\n' "$1")")
-    assert_contains "$OUT" "role:$2 core:n shape:n"
+    OUT=$(bbr_measure_menu tune <<< "$(printf '400M\n192.0.2.1:5201\n%s\ny\n' "$1")")
+    assert_contains "$OUT" "role:$2 core:y shape:auto"
     :
 }
-run_test 'Measured web hosting choice remains mixed without enabling BBR or shaping implicitly' t_web_measured_role 2 mixed
+run_test 'One-click web hosting choice uses mixed and the complete agreed plan' t_web_measured_role 3 mixed
 run_test 'Measured wizard default remains proxy' t_web_measured_role '' proxy
-run_test 'Measured large-file choice remains bulk' t_web_measured_role 3 bulk
+run_test 'Measured large-file choice remains bulk' t_web_measured_role 2 bulk
 
 # 事务保护盘点：从菜单可达的入口出发，凡是写入回滚快照覆盖路径的函数都必须经过
 # txn_write_begin / safety_arm。名单式测试只能覆盖已知函数，这里用调用图兜底。

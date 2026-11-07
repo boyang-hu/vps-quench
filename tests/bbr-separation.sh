@@ -304,4 +304,32 @@ t_measured_failure() {
 run_test 'Rejected measured parameter rolls back and retains old configuration' t_measured_failure reject
 run_test 'Measured parameter readback mismatch is a transaction failure' t_measured_failure stale
 
+t_optional_measured() {
+    setup_bbr "optional_$1"
+    local MODE="$1"
+    sysctl() {
+        case "$1" in
+            -n) cat "$CASE_DIR/sysctl/$2" 2>/dev/null ;;
+            -w)
+                case "$2" in
+                    net.ipv4.tcp_adv_win_scale=1)
+                        [ "$MODE" != missing ] || return 1
+                        return 0 ;;
+                esac
+                printf '%s\n' "${2#*=}" > "$CASE_DIR/sysctl/${2%%=*}" ;;
+        esac
+    }
+    if [ "$MODE" = missing ]; then
+        assert_ok bbr_apply_sysctl $'net.core.rmem_max = 16777216\nnet.ipv4.tcp_adv_win_scale = 1' measured
+        assert_eq "$(sysctl -n net.core.rmem_max)" 16777216
+        assert_file_contains "$SYSCTL_FILE" '# skipped unsupported: net.ipv4.tcp_adv_win_scale = 1'
+    else
+        printf '2\n' > "$CASE_DIR/sysctl/net.ipv4.tcp_adv_win_scale"
+        assert_fail bbr_apply_sysctl $'net.core.rmem_max = 16777216\nnet.ipv4.tcp_adv_win_scale = 1' measured
+        assert_eq "$(sysctl -n net.core.rmem_max)" 212992
+    fi
+}
+run_test 'Removed optional kernel knobs are skipped without abandoning supported parameters' t_optional_measured missing
+run_test 'Optional write reported successful must still match readback or roll back' t_optional_measured mismatch
+
 test_summary 'BBR/FQ and tc separation'

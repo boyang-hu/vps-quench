@@ -32,6 +32,17 @@ for TRY in 1 2 3 4 5; do
     sleep 1
 done
 [ "$READY" = 1 ] || { cat "$TMP/server.log" >&2; exit 1; }
+# Pretend a public candidate advertises two ports, but expose only 5209 on loopback.
+# This exercises real TCP preflight, handshake and the port retained after rotation.
+QUENCH_PERF_REPORT="$TMP/rotation"; mkdir -p "$QUENCH_PERF_REPORT"
+QUENCH_PERF_PEER=127.0.0.1; QUENCH_PERF_FAMILY=4; QUENCH_PERF_PORT=5208
+QUENCH_PERF_PORTS=$'5208\n5209'
+bbr_calibration_measure 127.0.0.1 5208 4 1 1 rotation
+[ "$QUENCH_PERF_PORT" = 5209 ]
+grep -q 'peer=127.0.0.1 port=5208 exit=' "$QUENCH_PERF_REPORT/connections.log"
+grep -q 'peer=127.0.0.1 port=5209 exit=0' "$QUENCH_PERF_REPORT/connections.log"
+QUENCH_PERF_PEER=''; QUENCH_PERF_FAMILY=''; QUENCH_PERF_PORT=''; QUENCH_PERF_PORTS=''
+QUENCH_PERF_REPORT=''
 BEFORE=$(tc qdisc show dev lo)
 for STREAMS in 1 4; do
     bbr_calibration_measure 127.0.0.1 5209 4 1 "$STREAMS" integration

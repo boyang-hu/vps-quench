@@ -122,8 +122,10 @@ t_confirmation() {
     setup_onboarding confirmation
     # Exercise the real measured wizard input layer; do not permit any network session.
     source "$ROOT/src/modules/bbr-measure.sh"
+    ip() { [ "$1" != -4 ] || echo 'default dev eth0'; }
+    bbr_measure_dependencies() { :; }
     bbr_measure_session() { fail 'measurement began without the final consent'; }
-    assert_ok first_run_performance_setup <<< $'1\n4\n192.0.2.1\n5201\n\n150\n1\nn\nn\nn'
+    assert_ok first_run_performance_setup <<< $'1\n400M\n192.0.2.1:5201\n1\nn'
     assert_eq "$(cat "$TEST_LOG")" ''
     :
 }

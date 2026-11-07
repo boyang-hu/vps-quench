@@ -453,7 +453,7 @@ first_run_performance_setup() {
     local CHOICE
     print_header "首次开荒 · 网络性能设置"
     ui_hint "已启用 BBR 也可以重新实测；测速会消耗流量，进入向导后仍需单独确认"
-    menu_item "1" "实测调优（推荐）  ${DIM}测速、计算参数、可选整形、复测${NC}"
+    menu_item "1" "一键调优（推荐）  ${DIM}完整参数、实测扫描、自动整形、验证${NC}"
     menu_item "2" "仅启用 BBR＋FQ  ${DIM}不测速、不调其他参数、不新增限速${NC}"
     menu_item "3" "暂时跳过（默认）"
     menu_div

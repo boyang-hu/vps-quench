@@ -23,7 +23,7 @@ case "$1 $2" in
                 printf 'qdisc fq 7ffd: root refcnt 2\n' > "$QUENCH_TEST_TC_ROOT/qdisc" ;;
             *'root handle 1: htb default 10')
                 printf 'qdisc htb 1: root default 0x10\n' > "$QUENCH_TEST_TC_ROOT/qdisc" ;;
-            *'parent 1:10 handle 100: fq maxrate '*)
+            *'parent 1:10 handle 100: fq limit 40960 flow_limit 8192 maxrate '*)
                 printf 'qdisc fq 100: parent 1:10 maxrate %s\n' "${!#}" >> "$QUENCH_TEST_TC_ROOT/qdisc" ;;
             *) exit 1 ;;
         esac
