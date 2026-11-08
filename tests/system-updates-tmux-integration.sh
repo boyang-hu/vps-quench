@@ -19,7 +19,17 @@ cat > "$QUENCH_TEST_TMUX_FIXTURE" <<'SH'
 set -euo pipefail
 export QUENCH_TEST_MODE=1
 source "$QUENCH_TEST_TMUX_SCRIPT"
-self_resolve_script_source() { printf '%s\n' "$QUENCH_TEST_TMUX_FIXTURE"; }
+QUENCH_UPDATE_STATE_DIR="$QUENCH_TEST_TMUX_ROOT/updates"
+self_resolve_script_source() {
+    [ "${QUENCH_TEST_TMUX_STREAM:-0}" != 1 ] || return 1
+    printf '%s\n' "$QUENCH_TEST_TMUX_FIXTURE"
+}
+self_fetch_script() {
+    printf 'APP_VERSION="%s"\n' "$APP_VERSION" > "$1"
+    cat "$QUENCH_TEST_TMUX_FIXTURE" >> "$1"
+    chmod 700 "$1"
+    echo downloaded >> "$QUENCH_TEST_TMUX_ROOT/downloads"
+}
 confirm_change_preview() { :; }
 safety_timer_pending() { return 1; }
 system_update_tmux_install() { echo 'Unexpected package installation' >&2; exit 9; }
@@ -56,13 +66,14 @@ fixture = os.environ['QUENCH_TEST_TMUX_FIXTURE']
 socket = os.environ['QUENCH_TEST_TMUX_SOCKET']
 clients = {}
 
-def start(mode):
+def start(mode, stream=False):
     pid, fd = pty.fork()
     if pid == 0:
         fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 120, 0, 0))
         env = dict(os.environ, TERM='xterm-256color', SSH_CONNECTION='192.0.2.1 1234 192.0.2.2 22')
         env.pop('TMUX', None)
         env.pop('STY', None)
+        env['QUENCH_TEST_TMUX_STREAM'] = '1' if stream else '0'
         os.execvpe('bash', ['bash', fixture, mode], env)
     clients[pid] = fd
     return pid, fd
@@ -120,6 +131,23 @@ try:
     exited(pid, fd)
     assert subprocess.run(['tmux', '-S', socket, 'has-session', '-t', '=quench-update'],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0
+    # Online launch stages a private file, survives detach, and reconnects without
+    # fetching another script or launching the requested action a second time.
+    pid, fd = start('full', stream=True)
+    ready(fd)
+    staged = pathlib.Path((root / 'resumed-script').read_text().strip())
+    assert staged.is_relative_to(root / 'updates') and staged.is_file()
+    assert staged.stat().st_mode & 0o077 == 0
+    assert (root / 'actions').read_text() == 'current\nfull\n'
+    os.write(fd, b'\x02d')
+    exited(pid, fd)
+    assert staged.is_file(), 'detach removed the running session script'
+    pid, fd = start('current', stream=True)
+    ready(fd)
+    assert (root / 'downloads').read_text() == 'downloaded\n'
+    assert (root / 'actions').read_text() == 'current\nfull\n'
+    os.write(fd, b'finish\n')
+    exited(pid, fd)
     print('Real tmux handoff, quoted argv, detach survival and reconnect passed.')
 finally:
     for pid, fd in clients.items():

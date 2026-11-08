@@ -51,6 +51,14 @@ jobs:
           docker run --rm -e QUENCH_TEST_APT_CONTAINER=1 -v "$PWD:/repo" -w /repo "$IMAGE" \
             sh -c 'apt-get update && apt-get install -y bash python3 python3-apt && bash tests/system-updates-apt-integration.sh'
 
+      - name: Test onboarding on fresh Debian without Python
+        if: startsWith(matrix.image, 'debian:')
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm -e QUENCH_TEST_BOOTSTRAP_CONTAINER=1 -v "$PWD:/repo:ro" -w /repo "$IMAGE" \
+            bash tests/system-updates-bootstrap-integration.sh
+
       - name: Test real account rename in a disposable Debian container
         if: startsWith(matrix.image, 'debian:')
         env:

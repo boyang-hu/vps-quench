@@ -929,11 +929,21 @@ setup_tmux() {
             *' new-session '*)
                 [ "$#" = 12 ] || fail 'tmux argv was not preserved'
                 assert_eq "$9" bash
-                assert_eq "${10}" "/tmp/quench path with 'quote/\$(literal).sh"
+                if [ -e "$QUENCH_TEST_UPDATE_CASE/stream" ]; then
+                    assert_eq "${10}" "$QUENCH_TEST_UPDATE_CASE/staged.sh"
+                else
+                    assert_eq "${10}" "/tmp/quench path with 'quote/\$(literal).sh"
+                fi
                 assert_eq "${11}" --system-update-resume
                 ;;
         esac
         [ ! -e "$QUENCH_TEST_UPDATE_CASE/tmux-fail" ]
+    }
+    system_update_tmux_stage_script() {
+        echo download >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        [ ! -e "$QUENCH_TEST_UPDATE_CASE/download-fail" ] || return 1
+        printf 'APP_VERSION="%s"\n' "$APP_VERSION" > "$QUENCH_TEST_UPDATE_CASE/staged.sh"
+        printf '%s\n' "$QUENCH_TEST_UPDATE_CASE/staged.sh"
     }
     system_update_action() { echo "action $1" >> "$QUENCH_TEST_UPDATE_CASE/calls"; }
     system_update_debian_major() { echo major >> "$QUENCH_TEST_UPDATE_CASE/calls"; }
@@ -947,11 +957,14 @@ t_tmux_handoff() {
         screen) STY=already-inside ;;
         local) SSH_CONNECTION= SSH_TTY= ;;
         tty-only) SSH_CONNECTION= ;;
-        install|install-fail|cancel-install) touch "$QUENCH_TEST_UPDATE_CASE/no-tmux" ;;
+        install|install-fail|cancel-install|stream-install) touch "$QUENCH_TEST_UPDATE_CASE/no-tmux" ;;
     esac
     case "$1" in
         no-tty|cancel|stream|install-fail|tmux-fail|pending) touch "$QUENCH_TEST_UPDATE_CASE/$1" ;;
         cancel-install) touch "$QUENCH_TEST_UPDATE_CASE/cancel" ;;
+        stream-install) touch "$QUENCH_TEST_UPDATE_CASE/stream" ;;
+        stream-cancel) touch "$QUENCH_TEST_UPDATE_CASE/stream" "$QUENCH_TEST_UPDATE_CASE/cancel" ;;
+        download-fail) touch "$QUENCH_TEST_UPDATE_CASE/stream" "$QUENCH_TEST_UPDATE_CASE/download-fail" ;;
         held) QUENCH_TXN_LOCK_HELD=1 ;;
         nested) QUENCH_TXN_WRITE_DEPTH=1 ;;
         existing|existing-stream|attach-fail)
@@ -961,17 +974,17 @@ t_tmux_handoff() {
             ;;
     esac
     case "$1" in
-        no-tty|stream|install-fail|tmux-fail|attach-fail|held|nested|pending) assert_fail system_update_dispatch current ;;
+        no-tty|download-fail|install-fail|tmux-fail|attach-fail|held|nested|pending) assert_fail system_update_dispatch current ;;
         *) assert_ok system_update_dispatch current ;;
     esac
     case "$1" in
-        tmux|screen|local)
+        tmux|screen)
             assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/calls")" 'action current'
             ;;
         *) ! grep -q '^action\|^major' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'handoff fell through to a duplicate update' ;;
     esac
     case "$1" in
-        launch|tty-only|install|tmux-fail)
+        launch|tty-only|local|install|tmux-fail|stream|stream-install)
             assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" 'new-session -A -s quench-update'
             assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" '--system-update-resume current'
             ;;
@@ -979,17 +992,21 @@ t_tmux_handoff() {
             assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" 'attach-session -t =quench-update'
             ! grep -q 'new-session\|^install' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'existing session was recreated'
             ;;
-        no-tty|cancel|cancel-install|stream|install-fail|held|nested|pending)
+        no-tty|cancel|cancel-install|stream-cancel|download-fail|install-fail|held|nested|pending)
             ! grep -q 'new-session\|attach-session' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'unsafe handoff'
             ;;
     esac
     case "$1" in
-        install|install-fail) assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" install ;;
+        install|install-fail|stream-install) assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" install ;;
         *) ! grep -q '^install' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'unrequested installation' ;;
+    esac
+    case "$1" in
+        stream|stream-install|download-fail) assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" download ;;
+        *) ! grep -q '^download' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'unrequested download' ;;
     esac
     :
 }
-for FORM in launch tty-only tmux screen local install existing existing-stream cancel cancel-install stream no-tty install-fail tmux-fail attach-fail held nested pending; do
+for FORM in launch tty-only tmux screen local install existing existing-stream cancel cancel-install stream stream-install stream-cancel download-fail no-tty install-fail tmux-fail attach-fail held nested pending; do
     run_test "tmux update handoff: $FORM" t_tmux_handoff "$FORM"
 done
 
@@ -1075,6 +1092,166 @@ t_tmux_dependency() {
 }
 for FORM in apt dnf yum apk pacman refresh-fail apply-fail broken missing-binary lock-fail; do
     run_test "tmux dependency bootstrap: $FORM" t_tmux_dependency "$FORM"
+done
+
+
+# Run the real action/preview wrapper with a missing-interpreter fixture. The
+# env shim above keeps apt-get in-process and no test installs host packages.
+t_python_bootstrap() {
+    setup_update "python_$1"
+    local FORM="$1" RC=0
+    system_update_terminal_ready() { [ "$FORM" != no_tty ]; }
+    system_update_python_ready() { [ -f "$QUENCH_TEST_UPDATE_CASE/python-ready" ]; }
+    apt-get() {
+        printf 'apt-get %s\n' "$*" >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        if [[ " $* " == *'python-bootstrap/'* ]]; then
+            [[ " $* " == *' Dir::Etc::sourceparts=- '* ]] || fail 'bootstrap used global sources'
+            [[ " $* " == *' Dir::State::lists='*'/python-bootstrap/lists '* ]] || fail 'bootstrap used global indices'
+            [[ " $* " == *' APT::Get::AllowUnauthenticated=false '* ]] || fail 'bootstrap disabled authentication'
+            if [[ " $* " == *' update '* ]]; then
+                [ "$FORM" != refresh_fail ]; return $?
+            fi
+            [[ " $* " == *' --no-remove --no-install-recommends install python3 '* ]] || fail 'unexpected bootstrap action'
+            if [[ " $* " == *' -s '* ]]; then
+                [ "$FORM" != plan_fail ] || return 1
+                case "$FORM" in
+                    removal) echo 'Remv old-package [1]' ;;
+                    critical) echo 'Inst libc6 [1] (2 Debian:12/bookworm [amd64])' ;;
+                    *) echo 'Inst python3 (3.11 Debian:12/bookworm [amd64])' ;;
+                esac
+                return 0
+            fi
+            [ "$FORM" != install_fail ] || return 100
+            [ "$FORM" = still_missing ] || touch "$QUENCH_TEST_UPDATE_CASE/python-ready"
+        elif [[ " $* " == *' -s '* ]]; then
+            system_update_python_ready || fail 'full update preview ran without interpreter'
+            echo 'Inst curl [7.1] (7.2 Debian:12/bookworm [amd64])'
+        fi
+    }
+    case "$FORM" in
+        present) touch "$QUENCH_TEST_UPDATE_CASE/python-ready" ;;
+        cancel) touch "$QUENCH_TEST_UPDATE_CASE/cancel" ;;
+        broken) touch "$QUENCH_TEST_UPDATE_CASE/broken" ;;
+        custom_env) APT_CONFIG=/tmp/quench-custom-apt ;;
+        unsafe_original) echo 'deb http://deb.debian.org/debian sid main' > "$QUENCH_UPDATE_APT_DIR/sources.list" ;;
+        lock_fail) txn_write_begin() { return 1; } ;;
+    esac
+    cp -a "$QUENCH_UPDATE_APT_DIR" "$QUENCH_TEST_UPDATE_CASE/original-sources"
+    system_update_action full || RC=$?
+    assert_ok diff -r "$QUENCH_UPDATE_APT_DIR" "$QUENCH_TEST_UPDATE_CASE/original-sources"
+    case "$FORM" in
+        success|present)
+            assert_eq "$RC" 0
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" 'dist-upgrade'
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/audit" SUCCESS
+            ;;
+        cancel)
+            assert_eq "$RC" 0
+            ! grep -q SUCCESS "$QUENCH_TEST_UPDATE_CASE/audit" || fail 'declined dependency audited as success'
+            ;;
+        *) assert_ne "$RC" 0 ;;
+    esac
+    if [ "$FORM" != success ] && [ "$FORM" != present ]; then
+        ! grep -q dist-upgrade "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'failed bootstrap reached whole-system upgrade'
+    fi
+    case "$FORM" in
+        present|cancel|broken|custom_env|no_tty|lock_fail)
+            ! grep -q 'install python3' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'unexpected Python install' ;;
+        *)
+            local SOURCES
+            SOURCES=$(find "$QUENCH_UPDATE_STATE_DIR" -name sources.list -print)
+            assert_file_contains "$SOURCES" 'signed-by=/usr/share/keyrings/debian-archive-keyring.gpg'
+            assert_file_contains "$SOURCES" 'bookworm-security main'
+            ! grep -qE 'sid|stable|trixie' "$SOURCES" || fail 'bootstrap selected another release'
+            ;;
+    esac
+    [ "$FORM" != unsafe_original ] || system_update_python_ready || fail 'fixture never finished bootstrap'
+    ! grep -Eq 'install (-y|--assume-yes)|force-conf|allow-unauthenticated' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'bootstrap bypassed consent'
+}
+for FORM in success present cancel no_tty custom_env broken lock_fail refresh_fail plan_fail removal critical install_fail still_missing unsafe_original; do
+    run_test "Missing Python is handled before the selected update: $FORM" t_python_bootstrap "$FORM"
+done
+
+
+t_tmux_stage() {
+    setup_update "tmux_stage_$1"
+    local FORM="$1" RESULT RC=0
+    self_fetch_script() {
+        printf 'APP_VERSION="%s"\n' "$APP_VERSION" > "$1"
+        chmod 700 "$1"
+        [ "$FORM" != failed ]
+    }
+    RESULT=$(system_update_tmux_stage_script) || RC=$?
+    if [ "$FORM" = failed ]; then
+        assert_ne "$RC" 0
+        assert_eq "$RESULT" ''
+        assert_eq "$(find "$QUENCH_UPDATE_STATE_DIR" -type f -name vps-quench.sh -print)" ''
+    else
+        assert_eq "$RC" 0
+        assert_file_contains "$RESULT" "APP_VERSION=\"$APP_VERSION\""
+        assert_ok bash -n "$RESULT"
+        [ -z "$(find "$RESULT" -perm -0044 -print)" ] || fail 'session script is publicly readable'
+        case "$RESULT" in "$QUENCH_UPDATE_STATE_DIR"/quench-session.*/vps-quench.sh) : ;; *) fail 'script is outside the managed state directory' ;; esac
+    fi
+}
+for FORM in success failed; do run_test "Private session staging: $FORM" t_tmux_stage "$FORM"; done
+
+t_tmux_version_change() {
+    setup_tmux "version_$1"
+    local FORM="$1"
+    touch "$QUENCH_TEST_UPDATE_CASE/stream"
+    system_update_tmux_stage_script() {
+        echo 'APP_VERSION="V99.0.0"' > "$QUENCH_TEST_UPDATE_CASE/staged.sh"
+        printf '%s\n' "$QUENCH_TEST_UPDATE_CASE/staged.sh"
+    }
+    confirm_change_preview() {
+        echo "$1" >> "$QUENCH_TEST_UPDATE_CASE/confirmations"
+        [ "$1" != '续接脚本版本发生变化' ] || [ "$FORM" = accept ]
+    }
+    assert_ok system_update_dispatch current
+    assert_file_contains "$QUENCH_TEST_UPDATE_CASE/confirmations" '续接脚本版本发生变化'
+    if [ "$FORM" = accept ]; then
+        assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" 'new-session'
+    else
+        ! grep -q new-session "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'changed version started without consent'
+    fi
+}
+for FORM in accept decline; do run_test "Changed continuation script version: $FORM" t_tmux_version_change "$FORM"; done
+
+
+t_onboarding_context() {
+    setup_update "onboarding_context_$1"
+    local FORM="$1" RC=0 MODE=current CONTEXT=onboarding
+    SSH_CONNECTION='192.0.2.1 1234 192.0.2.2 22'; TMUX=''; STY=''
+    system_update_session_ready() { return 1; }
+    system_update_terminal_ready() { [ "$FORM" != no_tty ]; }
+    case "$FORM" in
+        full) MODE=full ;;
+        protected) CONTEXT=protected ;;
+        invalid) CONTEXT=unprotected ;;
+        major|autoremove) MODE="$FORM" ;;
+        broken) touch "$QUENCH_TEST_UPDATE_CASE/broken" ;;
+    esac
+    system_update_action "$MODE" "$CONTEXT" || RC=$?
+    case "$FORM" in
+        current|full)
+            assert_eq "$RC" 0
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" backup
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/audit" SUCCESS
+            assert_eq "$(tail -n 1 "$QUENCH_TEST_UPDATE_CASE/calls")" unlock
+            ;;
+        broken)
+            assert_ne "$RC" 0
+            ! grep -q backup "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'onboarding bypassed package health checks'
+            ;;
+        *)
+            assert_ne "$RC" 0
+            assert_eq "$(cat "$QUENCH_TEST_UPDATE_CASE/calls")" ''
+            ;;
+    esac
+}
+for FORM in current full protected invalid major autoremove broken no_tty; do
+    run_test "Onboarding foreground exception preserves normal update guards: $FORM" t_onboarding_context "$FORM"
 done
 
 test_summary 'System and software updates'

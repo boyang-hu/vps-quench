@@ -18,7 +18,7 @@ jobs:
             tests/fail2ban-shared.sh tests/fail2ban-shared-integration.sh \
             tests/bbr-separation.sh tests/bbr-separation-integration.sh tests/lib/bbr-tc-fixture.sh \
             tests/bbr-measure.sh tests/bbr-aligned.sh tests/bbr-measure-integration.sh tests/onboarding-performance.sh tests/onboarding-updates.sh \
-            tests/system-updates.sh tests/system-updates-apt-integration.sh tests/system-updates-tmux-integration.sh \
+            tests/system-updates.sh tests/system-updates-apt-integration.sh tests/system-updates-tmux-integration.sh tests/system-updates-bootstrap-integration.sh \
             tests/user-rename-integration.sh tests/confirm-input.sh; do
             bash -n "$script"
           done

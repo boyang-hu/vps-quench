@@ -2,7 +2,7 @@
 # 由 build.sh 从 src/ 生成；请修改模块源码后重新构建发行脚本。
 
 # ============================================================
-#  Quench V0.1.10 — VPS 初始化与管理工具
+#  Quench V0.1.11 — VPS 初始化与管理工具
 #  作者：Boyang
 #
 #  项目说明：
@@ -13,6 +13,7 @@
 #  - 提供受控的系统/软件包更新与独立 Debian 大版本升级向导（不自动重启）
 #
 #  发布版本：
+#  V0.1.11: 开荒软件更新直接在当前终端执行，取消强制 tmux 跳转；精简 Debian 镜像在流程内补齐 Python 后继续；独立更新中心保留会话保护，支持在线启动时校验下载续接脚本；补充无 Python 的全新 Debian 与会话回归测试。
 #  V0.1.10: 首次开荒新增系统与软件更新步骤，默认刷新索引并执行不删包升级，可选完整依赖更新；复用更新中心预检与 tmux 保护，更新失败或会话分离时阻止继续配置，补充向导与跨发行版测试。
 #  V0.1.9: 一键网络调优统一完整 TCP 参数、公共节点并行筛选与端口重试、粗细扫描和自动整形；首次开荒与独立线路校准共用扫描引擎；增加小内存机器的可选 Swap 建议，保留独立 BBR/FQ 入口和外部 QoS 保护，扩展失败恢复与参数一致性测试。
 #  V0.1.8: 自动安全更新按内容识别不同厂商的禁用配置，确认后逐文件备份接管并支持失败恢复；y/n 确认输入错误时重新询问；SSH/UFW 回滚按变更范围恢复，补充逐步骤日志和失败状态检查；新增 UFW SSH 的 1Panel 兼容 ALLOW 模式及已有规则迁移。
@@ -615,7 +616,7 @@ vis_len() {
 BOX_W=64
 UI_COMPACT=0
 APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
-APP_VERSION="V0.1.10"
+APP_VERSION="V0.1.11"
 APP_AUTHOR="Boyang"
 
 # 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、
@@ -17026,6 +17027,68 @@ system_update_debian_code() {
     esac
 }
 
+system_update_python_ready() {
+    command -v python3 >/dev/null 2>&1 \
+        && python3 -c 'import pathlib, re, shlex, sys' >/dev/null 2>&1
+}
+
+# Called under the update transaction lock, with QUENCH_UPDATE_RUN prepared.
+# The source parser cannot validate user repositories until Python exists.
+# Bootstrap using only signed, fixed-codename Debian sources and private lists;
+# then run the full original-source checks before any requested system upgrade.
+system_update_require_python() {
+    system_update_python_ready && return 0
+    local CODE BOOTSTRAP PLAN
+    local APT_ARGS=()
+    CODE=$(system_update_debian_code) || return 1
+    [ -z "${APT_CONFIG:-}" ] || { error "检测到 APT_CONFIG 自定义配置，请先在标准环境下执行"; return 1; }
+    system_update_terminal_ready || { error "缺少更新检查依赖 python3；请从交互终端进入更新流程以自动安装"; return 1; }
+    info "检测到缺少可用的 python3，将在本流程中补齐软件源检查依赖"
+    confirm_change_preview "补齐更新检查依赖" \
+        "从当前 Debian ${CODE} 的官方签名仓库安装 python3 及必要依赖" \
+        "不改写现有软件源、不执行整机升级；安装完成后继续刚才选择的操作" || return 2
+    system_update_apt_health || return 1
+    BOOTSTRAP="$QUENCH_UPDATE_RUN/python-bootstrap"
+    mkdir -p "$BOOTSTRAP/lists/partial" || return 1
+    # HTTP also works on minimal images without CA certificates; APT verifies
+    # both repository metadata and package hashes with the Debian archive keyring.
+    printf '%s\n' \
+        "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian.org/debian $CODE main" \
+        "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian.org/debian $CODE-updates main" \
+        "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://deb.debian.org/debian-security $CODE-security main" \
+        > "$BOOTSTRAP/sources.list" || return 1
+    APT_ARGS=(-o "Dir::Etc::sourcelist=$BOOTSTRAP/sources.list" -o Dir::Etc::sourceparts=-
+        -o "Dir::State::lists=$BOOTSTRAP/lists" -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache=
+        -o Dir::Etc::preferences=- -o Dir::Etc::preferencesparts=- -o APT::Default-Release=
+        -o APT::Get::AllowUnauthenticated=false -o Acquire::AllowInsecureRepositories=false
+        -o Acquire::AllowWeakRepositories=false -o Acquire::AllowDowngradeToInsecureRepositories=false
+        -o APT::Update::Error-Mode=any -o DPkg::Lock::Timeout=60)
+    if ! system_update_logged env LC_ALL=C apt-get "${APT_ARGS[@]}" update; then
+        error "依赖仓库刷新失败；未启动所选系统更新，可重新进入当前步骤重试"
+        return 1
+    fi
+    PLAN="$BOOTSTRAP/plan.txt"
+    if ! LC_ALL=C apt-get "${APT_ARGS[@]}" -s --no-remove --no-install-recommends install python3 > "$PLAN" 2>&1; then
+        cat "$PLAN"; error "python3 依赖计划生成失败；未启动所选系统更新"; return 1
+    fi
+    cat "$PLAN"
+    if grep -Eq '^Remv |^Inst (openssh-server|sudo|systemd|systemd-sysv|apt|dpkg|libc6|linux-image[^ ]*|grub[^ ]*|initramfs-tools[^ ]*)( |:)' "$PLAN"; then
+        error "依赖计划涉及删除或变更系统关键包，已停止自动安装；所选系统更新尚未启动"
+        return 1
+    fi
+    # Use APT's own final confirmation. No implicit -y/forced conffile policy.
+    if ! system_update_logged env LC_ALL=C NEEDRESTART_MODE=l apt-get "${APT_ARGS[@]}" \
+        --no-remove --no-install-recommends install python3; then
+        error "python3 安装未完成；未启动所选系统更新，可在当前步骤重试"
+        return 1
+    fi
+    if ! system_update_python_ready; then
+        error "安装后 python3 仍不可用；请检查 $QUENCH_UPDATE_RUN/commands.log"
+        return 1
+    fi
+    info "更新检查依赖已就绪，继续检查现有软件源并执行所选操作"
+}
+
 # Conservative parser: reject unknown formats rather than silently miss a source.
 # Python is used only by this advanced module, not by startup or the UI.
 # major prints the single source file it can atomically replace; stage writes a
@@ -17033,7 +17096,7 @@ system_update_debian_code() {
 # disabled stanzas or third-party sources. Live writes belong to the transaction.
 system_update_sources() {
     local MODE="$1" CODE="$2" DEST="${3:-}"
-    command -v python3 >/dev/null 2>&1 || { error "需要 python3 解析软件源；请先从常用软件管理安装"; return 1; }
+    command -v python3 >/dev/null 2>&1 || { error "软件源检查依赖 python3 未就绪，请重新进入更新流程自动补齐"; return 1; }
     python3 - "$QUENCH_UPDATE_APT_DIR" "$MODE" "$CODE" "$DEST" <<'PY'
 import pathlib, re, shlex, sys
 root, mode, code, dest = pathlib.Path(sys.argv[1]), *sys.argv[2:]
@@ -17263,10 +17326,16 @@ system_update_terminal_ready() {
     [ -t 0 ] && [ -t 1 ]
 }
 
+system_update_needs_tmux() {
+    # Update-center actions get session protection even when sudo/su strips
+    # SSH_*. Onboarding uses an explicit foreground context instead.
+    [ -z "${TMUX:-}${STY:-}" ]
+}
+
 system_update_session_ready() {
     system_update_terminal_ready || { error "更新需要交互终端，不能从 cron 或无输入管道执行"; return 1; }
-    if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && [ -z "${TMUX:-}${STY:-}" ]; then
-        error "远程更新请先进入 tmux 或 screen，再运行 Quench，避免断线中断软件包配置"
+    if system_update_needs_tmux; then
+        error "更新中心需要 tmux 或 screen 会话；请从更新中心入口自动准备会话"
         return 1
     fi
 }
@@ -17311,8 +17380,26 @@ system_update_tmux_hint() {
     ui_hint "临时离开：先按 Ctrl+B，再按 D；不要输入 exit 或杀掉会话。服务器重启后会话不会保留。"
 }
 
+# A consumed pipe cannot be copied. With explicit handoff consent, fetch the
+# commit-pinned, SHA256-checked script through the existing downloader. Keep the
+# private file after client detach: the live tmux child still needs its script.
+system_update_tmux_stage_script() (
+    umask 077
+    local STAGE
+    mkdir -p "$QUENCH_UPDATE_STATE_DIR" || return 1
+    chmod 700 "$QUENCH_UPDATE_STATE_DIR" || return 1
+    STAGE=$(mktemp -d "$QUENCH_UPDATE_STATE_DIR/quench-session.XXXXXX") || return 1
+    if ! self_fetch_script "$STAGE/vps-quench.sh" >&2; then
+        rm -f "$STAGE/vps-quench.sh"
+        rmdir "$STAGE" 2>/dev/null || true
+        error "续接脚本下载或校验失败；未开始系统更新，可留在此入口重试" >&2
+        return 1
+    fi
+    printf '%s\n' "$STAGE/vps-quench.sh"
+)
+
 system_update_tmux_launch() {
-    local MODE="$1" SCRIPT NEED_INSTALL=no
+    local MODE="$1" SCRIPT NEED_INSTALL=no SOURCE_NOTE="" VERSION
     if [ "${QUENCH_TXN_LOCK_HELD:-0}" = 1 ] || [ "${QUENCH_TXN_WRITE_DEPTH:-0}" -gt 0 ] || safety_timer_pending; then
         error "请先完成当前配置事务/防断联确认，再进入升级会话"
         return 1
@@ -17324,23 +17411,34 @@ system_update_tmux_launch() {
         tmux -L quench attach-session -t '=quench-update'
         return $?
     fi
-    # A pipe or /dev/fd is already consumed by Bash: don't reread it, silently
-    # fetch different code, or resume an older locally installed version.
-    SCRIPT=$(self_resolve_script_source "$0") || {
-        error "当前从管道/临时流运行，无法在 tmux 中重新打开同一份脚本"
-        ui_hint "请先在主菜单 m → 1 安装到本地，再执行 v 进入更新中心；或保存脚本为文件后用 bash 运行。"
-        return 1
-    }
+    SCRIPT=$(self_resolve_script_source "$0" 2>/dev/null || true)
+    if [ -z "$SCRIPT" ]; then
+        SOURCE_NOTE="当前为在线启动：将下载并校验仓库脚本，保存为私有会话副本后继续，不改动已安装的 Quench"
+    else
+        SOURCE_NOTE="使用当前本地脚本进入会话，不重复下载"
+    fi
     system_update_tmux_available || NEED_INSTALL=yes
     if [ "$NEED_INSTALL" = yes ]; then
+        info "未检测到 tmux，将在这里安装并继续"
         confirm_change_preview "安装 tmux 并进入升级会话" \
             "安装 tmux 及其必要依赖（可能联网、运行软件包安装钩子）；不执行整机升级" \
+            "$SOURCE_NOTE" \
             "进入独立 quench-update 会话后继续所选操作，仍保留全部预检和升级确认" || return 0
-        system_update_tmux_install || return 1
     else
         confirm_change_preview "进入 tmux 升级会话" \
+            "$SOURCE_NOTE" \
             "进入独立 quench-update 会话后继续所选操作，仍保留全部预检和升级确认" || return 0
     fi
+    if [ -z "$SCRIPT" ]; then
+        info "正在准备续接脚本，无需退出当前向导安装 Quench"
+        SCRIPT=$(system_update_tmux_stage_script) || return 1
+        VERSION=$(awk -F'"' '/^APP_VERSION="/ {print $2; exit}' "$SCRIPT")
+        if [ "$VERSION" != "$APP_VERSION" ]; then
+            confirm_change_preview "续接脚本版本发生变化" \
+                "当前运行 ${APP_VERSION}，校验后的会话副本为 ${VERSION}；确认后使用该版本继续所选操作" || return 0
+        fi
+    fi
+    if [ "$NEED_INSTALL" = yes ]; then system_update_tmux_install || return 1; fi
     system_update_tmux_hint
     # Dedicated server ignores user tmux hooks/options. Multiple command args
     # are exec'd directly, not interpolated into a shell command string. -A
@@ -17360,7 +17458,7 @@ system_update_dispatch() {
         *) error "无效的更新操作：$MODE"; return 2 ;;
     esac
     system_update_terminal_ready || { error "更新需要交互终端，不能从 cron 或无输入管道执行"; return 1; }
-    if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && [ -z "${TMUX:-}${STY:-}" ]; then
+    if system_update_needs_tmux; then
         system_update_tmux_launch "$MODE"
         return $?
     fi
@@ -17758,8 +17856,10 @@ system_update_auto_enable_cleanup() {
 
 system_update_auto_enable_apt() (
     umask 077
-    system_update_apt_preflight || return 1
     systemd_available || { error "Debian 自动安全更新入口需要 systemd；其他调度方式请人工配置"; return 1; }
+    system_update_run_prepare || return 1
+    system_update_require_python || return $?
+    system_update_apt_preflight || return 1
     local QUENCH_AUTO_MUTATED=no QUENCH_AUTO_UNITS_TOUCHED=no
     local QUENCH_AUTO_TARGETS=("${QUENCH_APT_AUTO_UPGRADES_FILE:-$QUENCH_UPDATE_APT_DIR/apt.conf.d/20auto-upgrades}" "${QUENCH_APT_UNATTENDED_FILE:-$QUENCH_UPDATE_APT_DIR/apt.conf.d/52quench-unattended-upgrades}")
     local QUENCH_AUTO_TOUCHED=(no no) QUENCH_AUTO_CANDIDATES=()
@@ -17773,7 +17873,6 @@ system_update_auto_enable_apt() (
             error "配置不是普通文件：$FILE"; return 1
         fi
     done
-    system_update_run_prepare || return 1
     system_update_auto_templates_scan > "$QUENCH_UPDATE_RUN/templates.list" || return 1
     system_update_auto_units_snapshot > "$QUENCH_UPDATE_RUN/units-before" || { error "无法安全读取自动更新服务状态"; return 1; }
     while IFS= read -r REL; do
@@ -17941,16 +18040,26 @@ system_update_other_locked() {
 }
 
 system_update_action() (
-    local MODE="$1" RC=0
+    local MODE="$1" CONTEXT="${2:-protected}" RC=0
     umask 077
-    [ "$MODE" = check ] || system_update_session_ready || return 1
+    case "$CONTEXT" in
+        protected) [ "$MODE" = check ] || system_update_session_ready || return 1 ;;
+        onboarding)
+            # A deliberate foreground exception for initial provisioning only.
+            # No environment flag or general CLI bypass for major/removal actions.
+            case "$MODE" in current|full) : ;; *) error "开荒更新不支持该操作：$MODE"; return 2 ;; esac
+            system_update_terminal_ready || { error "开荒更新需要交互终端"; return 1; }
+            ;;
+        *) error "无效的更新入口：$CONTEXT"; return 2 ;;
+    esac
     txn_write_begin "系统与软件更新：$MODE" || return 1
     trap 'txn_write_end' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
     system_update_run_prepare || return 1
     if [ "$(system_package_manager)" = apt ]; then
-        system_update_apt_locked "$MODE" || RC=$?
+        system_update_require_python || RC=$?
+        if [ "$RC" -eq 0 ]; then system_update_apt_locked "$MODE" || RC=$?; fi
     else
         system_update_other_locked "$MODE" || RC=$?
     fi
@@ -18019,7 +18128,6 @@ system_update_auto_menu() {
     read -rp "选择 [0-2]: " CH || return 0
     case "$CH" in
         1)
-            if [ "$(system_package_manager)" = apt ]; then system_update_apt_preflight || return 1; fi
             confirm_change_preview "启用自动安全更新" "安装必要依赖，启用系统 timer；不自动重启" || return 0
             system_enable_auto_security_updates
             ;;
@@ -18206,6 +18314,7 @@ system_update_debian_major() (
     txn_write_begin "Debian 12 → 13" || return 1
     trap 'txn_write_end' EXIT
     system_update_run_prepare || return 1
+    system_update_require_python || return $?
     system_update_major_preflight || return 1
     local ANSWER TIMER DIFF_RC=0
     # Freeze the exact candidate before asking. A changed live source must not
@@ -18720,11 +18829,10 @@ first_run_firewall_fail2ban_setup() {
     audit_action "完成首次开荒防火墙与 Fail2ban" SUCCESS
 }
 
-# This step uses the same package transaction/preview as the update center.
-# Return 3 after a tmux handoff: detaching a client is not update completion,
-# so the caller must not advance to SSH/firewall writes in the original session.
+# Onboarding runs in the current terminal; the package transaction, source
+# checks, plan confirmation and failure handling are shared with the update center.
 first_run_package_updates_setup() {
-    local PM CHOICE MODE RC=0 HANDOFF=no
+    local PM CHOICE MODE
     PM=$(system_package_manager)
     case "$PM" in
         apt)
@@ -18742,6 +18850,7 @@ first_run_package_updates_setup() {
     fi
     print_header "首次开荒 · 系统与软件更新"
     ui_hint "立即更新已安装软件；自动安全更新将在后续步骤单独配置。"
+    ui_hint "开荒更新在当前终端执行；请保持连接，完成后继续向导，无需安装 tmux。"
     if [ "$PM" = apt ]; then
         ui_hint "先刷新 APT 索引，再预览并确认升级计划；保持当前 Debian 大版本。"
         menu_item "1" "更新当前系统（推荐，默认）  ${DIM}可安装新依赖，不删除已有包${NC}"
@@ -18764,17 +18873,8 @@ first_run_package_updates_setup() {
         if [ "$PM" = apt ]; then warn "请输入 1、2 或 0；回车选择 1"
         else warn "请输入 1 或 0；回车选择 1"; fi
     done
-    if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && [ -z "${TMUX:-}${STY:-}" ]; then
-        HANDOFF=yes
-    fi
-    system_update_dispatch "$MODE" || RC=$?
-    [ "$RC" -eq 0 ] || return "$RC"
-    if [ "$HANDOFF" = yes ]; then
-        info "已返回原 SSH 会话；升级可能仍在 tmux 中运行，也可能已取消或结束"
-        ui_hint "请先确认升级结果；完成后重新进入开荒推荐流程，可选择 0 跳过本步骤。"
-        return 3
-    fi
-    return 0
+    system_update_terminal_ready || { error "开荒更新需要交互终端"; return 1; }
+    system_update_action "$MODE" onboarding
 }
 
 first_run_auto_updates_apply() {
@@ -18849,11 +18949,10 @@ first_run_recommended_flow() {
         || { error "配置备份失败，推荐流程已停止"; return 1; }
 
     first_run_package_updates_setup || UPDATE_RC=$?
-    case "$UPDATE_RC" in
-        0) : ;;
-        3) info "推荐流程已暂停；不会在原会话继续配置 SSH 和防火墙"; return 0 ;;
-        *) warn "软件更新未完成，推荐流程已停止；请先处理更新错误，或重新进入后明确跳过"; return "$UPDATE_RC" ;;
-    esac
+    if [ "$UPDATE_RC" -ne 0 ]; then
+        warn "软件更新未完成，推荐流程已停止；请先处理更新错误，或重新进入后明确跳过"
+        return "$UPDATE_RC"
+    fi
 
     first_run_access_ready \
         || first_run_offer_step "配置用户与 SSH 安全接管" y first_run_access_setup \

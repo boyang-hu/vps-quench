@@ -416,11 +416,10 @@ first_run_firewall_fail2ban_setup() {
     audit_action "完成首次开荒防火墙与 Fail2ban" SUCCESS
 }
 
-# This step uses the same package transaction/preview as the update center.
-# Return 3 after a tmux handoff: detaching a client is not update completion,
-# so the caller must not advance to SSH/firewall writes in the original session.
+# Onboarding runs in the current terminal; the package transaction, source
+# checks, plan confirmation and failure handling are shared with the update center.
 first_run_package_updates_setup() {
-    local PM CHOICE MODE RC=0 HANDOFF=no
+    local PM CHOICE MODE
     PM=$(system_package_manager)
     case "$PM" in
         apt)
@@ -438,6 +437,7 @@ first_run_package_updates_setup() {
     fi
     print_header "首次开荒 · 系统与软件更新"
     ui_hint "立即更新已安装软件；自动安全更新将在后续步骤单独配置。"
+    ui_hint "开荒更新在当前终端执行；请保持连接，完成后继续向导，无需安装 tmux。"
     if [ "$PM" = apt ]; then
         ui_hint "先刷新 APT 索引，再预览并确认升级计划；保持当前 Debian 大版本。"
         menu_item "1" "更新当前系统（推荐，默认）  ${DIM}可安装新依赖，不删除已有包${NC}"
@@ -460,17 +460,8 @@ first_run_package_updates_setup() {
         if [ "$PM" = apt ]; then warn "请输入 1、2 或 0；回车选择 1"
         else warn "请输入 1 或 0；回车选择 1"; fi
     done
-    if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && [ -z "${TMUX:-}${STY:-}" ]; then
-        HANDOFF=yes
-    fi
-    system_update_dispatch "$MODE" || RC=$?
-    [ "$RC" -eq 0 ] || return "$RC"
-    if [ "$HANDOFF" = yes ]; then
-        info "已返回原 SSH 会话；升级可能仍在 tmux 中运行，也可能已取消或结束"
-        ui_hint "请先确认升级结果；完成后重新进入开荒推荐流程，可选择 0 跳过本步骤。"
-        return 3
-    fi
-    return 0
+    system_update_terminal_ready || { error "开荒更新需要交互终端"; return 1; }
+    system_update_action "$MODE" onboarding
 }
 
 first_run_auto_updates_apply() {
@@ -545,11 +536,10 @@ first_run_recommended_flow() {
         || { error "配置备份失败，推荐流程已停止"; return 1; }
 
     first_run_package_updates_setup || UPDATE_RC=$?
-    case "$UPDATE_RC" in
-        0) : ;;
-        3) info "推荐流程已暂停；不会在原会话继续配置 SSH 和防火墙"; return 0 ;;
-        *) warn "软件更新未完成，推荐流程已停止；请先处理更新错误，或重新进入后明确跳过"; return "$UPDATE_RC" ;;
-    esac
+    if [ "$UPDATE_RC" -ne 0 ]; then
+        warn "软件更新未完成，推荐流程已停止；请先处理更新错误，或重新进入后明确跳过"
+        return "$UPDATE_RC"
+    fi
 
     first_run_access_ready \
         || first_run_offer_step "配置用户与 SSH 安全接管" y first_run_access_setup \

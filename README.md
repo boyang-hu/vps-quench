@@ -1,4 +1,4 @@
-# Quench — VPS 初始化与管理工具 V0.1.10
+# Quench — VPS 初始化与管理工具 V0.1.11
 
 > 首次开荒 · 用户与 SSH · Fail2ban · Firewall · BBR/FQ · DNS · Caddy 网站入口 · 系统与服务管理
 
@@ -28,24 +28,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 适合不能访问 GitHub 的中国内地 VPS。先在一台可以访问 GitHub 的电脑或跳板机下载：
 
 ```bash
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.10/quench-offline-V0.1.10.tar.gz
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.10/quench-offline-V0.1.10.tar.gz.sha256
-sha256sum -c quench-offline-V0.1.10.tar.gz.sha256
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.11/quench-offline-V0.1.11.tar.gz
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.11/quench-offline-V0.1.11.tar.gz.sha256
+sha256sum -c quench-offline-V0.1.11.tar.gz.sha256
 ```
 
 再通过 `scp`、SFTP 或 WinSCP 将两个文件传到 VPS。Linux/macOS 示例：
 
 ```bash
-scp quench-offline-V0.1.10.tar.gz* root@你的VPS地址:/root/
+scp quench-offline-V0.1.11.tar.gz* root@你的VPS地址:/root/
 ```
 
 登录 VPS 后离线安装：
 
 ```bash
 cd /root
-sha256sum -c quench-offline-V0.1.10.tar.gz.sha256
-tar -xzf quench-offline-V0.1.10.tar.gz
-cd quench-offline-V0.1.10
+sha256sum -c quench-offline-V0.1.11.tar.gz.sha256
+tar -xzf quench-offline-V0.1.11.tar.gz
+cd quench-offline-V0.1.11
 bash install.sh
 v
 ```
@@ -115,7 +115,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
  ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.10  ·  Boyang
+  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.11  ·  Boyang
 ────────────────────────────────────────────────────────────────
   SSH · BBR · DNS · Caddy · Firewall · NFT · Docker
 
@@ -159,7 +159,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 
 软件更新步骤也可从开荒菜单 `u` 单独进入，与更新中心共用预检、事务锁、计划预览和日志。Debian 12/13 默认先刷新索引，再执行不删包的当前版本更新（`apt-get --no-remove --with-new-pkgs upgrade`）；选 `2` 使用完整依赖更新（`apt-get dist-upgrade`，相当于 `apt full-upgrade`），可能移除软件包，必须核对计划。两者选择其一，不重复执行，不改软件源或升级 Debian 大版本，不自动重启；输入 `0` 可跳过。DNF/YUM/APK 使用各自的当前系统更新，其他系统明确提示跳过。
 
-远程 SSH 中未进入 tmux/screen 时，会复用更新中心的 tmux 安装与续接流程。离开 tmux 后，原会话的开荒推荐流程会暂停，避免更新仍在后台运行时继续修改 SSH、防火墙或启用自动更新；确认更新完成后重新进入向导，可跳过软件更新步骤。已经在 tmux/screen 中时，更新结束后继续开荒；更新失败则停止并提示处理。配置备份不是软件包升级的回滚快照。
+精简 Debian 镜像缺少 `python3` 时，流程内会提示补齐软件源检查依赖，安装完成后继续原操作，无需退出向导。引导安装使用当前 Debian 代号的官方签名仓库和独立临时索引，只安装 Python 及必要依赖，不改写原有软件源；原软件源的完整检查仍在整机更新前执行。取消、安装失败或计划涉及删除/升级系统关键包时不会启动所选更新。
+
+开荒的软件更新直接在当前交互终端执行，不要求安装或进入 tmux/screen，也不会切换会话；更新完成后继续后续开荒，更新失败则停止并提示处理。缺少 Python 时仍在流程内补齐。执行期间请保持终端连接；配置备份不是软件包升级的回滚快照。独立更新中心和 Debian 大版本升级向导仍保留 tmux/screen 会话保护。
 
 性能步骤提供三个选择，首次开荒菜单的 `8` 也进入同一入口：
 
@@ -560,9 +562,9 @@ DNS 管理会识别 `systemd-resolved`、NetworkManager、resolvconf 或静态 `
 
 日常更新会检查传统 `.list` 和 deb822 `.sources`，拒绝浮动 `stable` / `testing`、混合 Debian 发行版和绕过签名校验的源；刷新失败、模拟失败、安装失败或后检查异常都不会记为成功。第三方仓库保持原样，不自动添加源追逐上游最新版；APT 源位置自定义、Ubuntu 等其他 APT 发行版暂不使用此受控流程。DNF/YUM 保留交互式普通/安全更新，Alpine 保留交互式普通更新；OpenWrt 不执行全量升级。
 
-更新需交互终端；通过 SSH 操作须在 `tmux` / `screen` 中进行。更新中心选择实际更新、移除依赖或 Debian 大版本升级时，若尚未进入会话，会询问是否安装 tmux（仅缺少时，支持 APT/DNF/YUM/APK）并继续到独立的 `quench-update` 会话；已有 tmux/screen 会话直接沿用。自动安装仅引导 tmux 及必要依赖，不执行整机升级，仍可能运行安装钩子；正式升级仍保留预检、预览和确认。
+独立更新中心需交互终端，并在 `tmux` / `screen` 中进行（开荒向导的当前版本更新例外，直接在原终端执行）。在更新中心选定实际更新、移除依赖或 Debian 大版本升级后，若尚未进入会话，会在当前流程中按需安装 tmux（支持 APT/DNF/YUM/APK）并进入独立的 `quench-update` 会话；已有 tmux/screen 会话直接沿用，无需重复安装。检测不依赖 SSH 环境变量，控制台和面板终端同样适用。自动安装仅引导 tmux 及必要依赖，不执行整机升级，仍可能运行安装钩子；正式升级仍保留预检、预览和确认。
 
-若 `quench-update` 已存在，只询问并重新连接，不重复执行新选择的操作。可按 **Ctrl+B，再按 D** 临时离开；重新登录后以同一 root 身份运行 `tmux -L quench attach -t quench-update` 继续查看。专用会话使用独立 socket，首次创建不加载用户 tmux 配置；退出更新菜单会结束该会话。断线保护不等于升级回滚，也不能跨服务器重启保留任务。自动进入需要一份可重新读取的本地脚本；通过 `bash <(curl …)` 启动时，请先从主菜单 `m → 1` 安装，再用 `v` 进入更新中心（不会悄悄下载另一版本来续接）。
+若 `quench-update` 已存在，只询问并重新连接，不重复执行新选择的操作。可按 **Ctrl+B，再按 D** 临时离开；重新登录后以同一 root 身份运行 `tmux -L quench attach -t quench-update` 继续查看。专用会话使用独立 socket，首次创建不加载用户 tmux 配置；退出更新菜单会结束该会话。断线保护不等于升级回滚，也不能跨服务器重启保留任务。本地启动会使用当前脚本；通过 `bash <(curl …)` 在线启动时，确认后在流程内下载锁定到仓库提交并通过 SHA256 校验的脚本，保存到 `/var/lib/quench/updates/quench-session.*` 作为私有会话副本，无需先安装 Quench。若副本版本与当前版本不同，会单独提示确认；已安装的 Quench 保持原样，分离会话时不会删除续接副本。
 
 软件包安装可能重启服务，配置文件冲突由管理员选择，正式升级不全局使用 `-y` 或强制覆盖现有配置。不会自动重启服务器；没有 `reboot-required` 标记也不代表一定无需重启。容器镜像、1Panel 自身、Quench 脚本以及手动安装的二进制不属于 APT 包更新范围，请使用各自管理入口。
 
@@ -750,6 +752,7 @@ BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-me
 
 | 版本 | Quench 主要变更 |
 |------|----------------|
+| **V0.1.11** | 开荒软件更新改为当前终端直接执行，不强制安装或进入 tmux；精简 Debian 镜像在流程内补齐 Python 依赖后继续原操作；独立更新中心保留会话保护，在线启动时可校验下载私有续接脚本；增加全新 Debian 镜像与更新入口边界测试。 |
 | **V0.1.10** | 首次开荒新增系统与软件更新步骤及独立 `u` 入口；默认刷新索引并执行不删包升级，可选完整依赖更新；复用更新中心预检、计划确认与 tmux 保护，更新失败或分离会话时暂停后续开荒，新增 25 项回归测试。 |
 | **V0.1.9** | 一键网络调优统一完整 TCP 参数、18 个公共候选并行筛选与端口重试、粗细扫描和自动整形；首次开荒与独立线路校准共用扫描引擎；增加小内存机器的可选 Swap 建议，保留独立 BBR/FQ 入口和外部 QoS 保护；补充参数一致性、低速对端、路径丢包及恢复失败测试。 |
 | **V0.1.8** | 自动安全更新按内容识别不同厂商的禁用配置，确认后逐文件备份接管并支持失败恢复，保留复杂策略和外部修改；y/n 确认输入错误时重新询问，保持默认选项且不延长回滚计时；SSH/UFW 回滚按变更范围恢复，增加逐步骤日志、UFW 命令诊断与失败状态检查；新增 UFW SSH 的 1Panel 兼容 `ALLOW` 模式及已有规则迁移。 |

@@ -24,8 +24,13 @@ setup_updates() {
     menu_group() { :; }
     menu_div() { :; }
     ui_pause() { :; }
-    system_update_action() { printf 'action:%s\n' "$1" >> "$TEST_LOG"; }
-    system_update_tmux_launch() { printf 'tmux:%s\n' "$1" >> "$TEST_LOG"; }
+    system_update_action() {
+        assert_eq "${2:-}" onboarding
+        printf 'action:%s\n' "$1" >> "$TEST_LOG"
+    }
+    system_update_tmux_launch() { fail 'onboarding launched tmux'; }
+    system_update_tmux_install() { fail 'onboarding installed tmux'; }
+    system_update_tmux_stage_script() { fail 'onboarding fetched a continuation script'; }
     system_update_debian_major() { fail 'onboarding started a major release upgrade'; }
 }
 
@@ -81,37 +86,32 @@ t_failure() {
         pending) safety_timer_pending() { return 0; } ;;
         terminal) system_update_terminal_ready() { return 1; } ;;
         update) system_update_action() { return 7; } ;;
-        launch)
-            SSH_TTY=/dev/pts/1
-            system_update_tmux_launch() { return 7; }
-            ;;
     esac
     local RC=0
     first_run_package_updates_setup <<< 1 || RC=$?
-    case "$1" in update|launch) assert_eq "$RC" 7 ;; *) assert_eq "$RC" 1 ;; esac
+    case "$1" in update) assert_eq "$RC" 7 ;; *) assert_eq "$RC" 1 ;; esac
     assert_eq "$(cat "$TEST_LOG")" ''
 }
-for CASE in pending terminal update launch; do
+for CASE in pending terminal update; do
     run_test "Update entry fails without later mutations: $CASE" t_failure "$CASE"
 done
 
 t_session() {
     setup_updates "session_$1"
-    SSH_CONNECTION='192.0.2.1 1234 192.0.2.2 22'
+    SSH_CONNECTION='192.0.2.1 1234 192.0.2.2 22'; TMUX=; STY=
     case "$1" in
         tmux) TMUX=inside ;;
         screen) STY=inside ;;
+        local) SSH_CONNECTION=; SSH_TTY= ;;
         tty-only) SSH_CONNECTION=''; SSH_TTY=/dev/pts/1 ;;
     esac
     local RC=0
     first_run_package_updates_setup <<< 1 || RC=$?
-    case "$1" in
-        tmux|screen) assert_eq "$RC" 0; assert_eq "$(cat "$TEST_LOG")" action:current ;;
-        *) assert_eq "$RC" 3; assert_eq "$(cat "$TEST_LOG")" tmux:current ;;
-    esac
+    assert_eq "$RC" 0
+    assert_eq "$(cat "$TEST_LOG")" action:current
 }
-for CASE in ssh tty-only tmux screen; do
-    run_test "Update handoff distinguishes client return from completion: $CASE" t_session "$CASE"
+for CASE in ssh tty-only local tmux screen; do
+    run_test "Onboarding runs in the current terminal without tmux installation: $CASE" t_session "$CASE"
 done
 
 setup_flow() {
@@ -134,27 +134,24 @@ t_flow() {
     local RC=0 OUTPUT EXPECTED=$'preflight\nbackup'
     case "$1" in
         failure) system_update_action() { echo failed >> "$TEST_LOG"; return 7; } ;;
-        handoff|cancel-handoff)
-            SSH_CONNECTION='192.0.2.1 1234 192.0.2.2 22'
-            [ "$1" != cancel-handoff ] || system_update_tmux_launch() { :; }
-            ;;
+        ssh) SSH_CONNECTION='192.0.2.1 1234 192.0.2.2 22'; TMUX= ;;
+        exit-three) system_update_action() { echo failed >> "$TEST_LOG"; return 3; } ;;
     esac
     OUTPUT=$(first_run_recommended_flow <<< $'y\n1') || RC=$?
     case "$1" in
-        success)
+        success|ssh)
             assert_eq "$RC" 0
             EXPECTED+=$'\naction:current\naccess\nperformance\naudit'
             ;;
         failure) assert_eq "$RC" 7; EXPECTED+=$'\nfailed' ;;
-        handoff) assert_eq "$RC" 0; EXPECTED+=$'\ntmux:current' ;;
-        cancel-handoff) assert_eq "$RC" 0 ;;
+        exit-three) assert_eq "$RC" 3; EXPECTED+=$'\nfailed' ;;
     esac
     assert_eq "$(cat "$TEST_LOG")" "$EXPECTED"
-    if [ "$1" != success ]; then
+    if [ "$1" = failure ] || [ "$1" = exit-three ]; then
         ! grep -q '推荐流程已执行完成' <<< "$OUTPUT" || fail 'unfinished update reported onboarding completion'
     fi
 }
-for CASE in success failure handoff cancel-handoff; do
+for CASE in success failure ssh exit-three; do
     run_test "Recommended flow updates after backup, blocks following steps when unfinished: $CASE" t_flow "$CASE"
 done
 
