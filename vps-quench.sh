@@ -2,7 +2,7 @@
 # 由 build.sh 从 src/ 生成；请修改模块源码后重新构建发行脚本。
 
 # ============================================================
-#  Quench V0.1.11 — VPS 初始化与管理工具
+#  Quench V0.1.12 — VPS 初始化与管理工具
 #  作者：Boyang
 #
 #  项目说明：
@@ -13,6 +13,7 @@
 #  - 提供受控的系统/软件包更新与独立 Debian 大版本升级向导（不自动重启）
 #
 #  发布版本：
+#  V0.1.12: 日常及开荒更新对比更新前后 systemd 失败单元，已有故障保留警告但不误判本次升级失败；新增故障和状态读取异常仍阻止继续，保留 APT/dpkg 与 SSH 检查；补充 20 项服务状态回归测试。
 #  V0.1.11: 开荒软件更新直接在当前终端执行，取消强制 tmux 跳转；精简 Debian 镜像在流程内补齐 Python 后继续；独立更新中心保留会话保护，支持在线启动时校验下载续接脚本；补充无 Python 的全新 Debian 与会话回归测试。
 #  V0.1.10: 首次开荒新增系统与软件更新步骤，默认刷新索引并执行不删包升级，可选完整依赖更新；复用更新中心预检与 tmux 保护，更新失败或会话分离时阻止继续配置，补充向导与跨发行版测试。
 #  V0.1.9: 一键网络调优统一完整 TCP 参数、公共节点并行筛选与端口重试、粗细扫描和自动整形；首次开荒与独立线路校准共用扫描引擎；增加小内存机器的可选 Swap 建议，保留独立 BBR/FQ 入口和外部 QoS 保护，扩展失败恢复与参数一致性测试。
@@ -616,7 +617,7 @@ vis_len() {
 BOX_W=64
 UI_COMPACT=0
 APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
-APP_VERSION="V0.1.11"
+APP_VERSION="V0.1.12"
 APP_AUTHOR="Boyang"
 
 # 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、
@@ -17511,8 +17512,22 @@ system_update_reboot_required() {
     [ -f /var/run/reboot-required ]
 }
 
+# Stable unit names, not localized descriptions or the optional failure bullet.
+# A failed query/parser must never look like an empty (healthy) snapshot.
+system_update_failed_units() {
+    local OUTPUT UNITS
+    OUTPUT=$(LC_ALL=C SYSTEMD_COLORS=0 systemctl --failed --plain --no-legend --no-pager 2>&1) \
+        || { error "无法读取 systemd 失败单元：$OUTPUT" >&2; return 1; }
+    UNITS=$(printf '%s\n' "$OUTPUT" | awk 'NF {if (NF < 4 || $3 != "failed") exit 1; print $1}') \
+        || { error "无法解析 systemd 失败单元：$OUTPUT" >&2; return 1; }
+    [ -n "$UNITS" ] || return 0
+    printf '%s\n' "$UNITS" | LC_ALL=C sort -u
+}
+
 system_update_postcheck() {
-    local RC=0 FAILED
+    # Only a caller-supplied snapshot from this transaction allows comparison.
+    # Standalone health checks and major upgrades remain strict.
+    local BASELINE="${1:-}" RC=0 FAILED NEW EXISTING AFTER
     if [ "$(system_package_manager)" = apt ]; then
         system_update_apt_health || RC=1
     fi
@@ -17520,12 +17535,32 @@ system_update_postcheck() {
         sshd -t || { warn "sshd 配置验证失败；保持当前连接，先修复再重启"; RC=1; }
     fi
     if systemd_available; then
-        FAILED=$(systemctl --failed --no-legend --no-pager 2>&1) || { warn "$FAILED"; return 1; }
-        if [ -n "$FAILED" ]; then
-            warn "存在失败服务（也可能在更新前已失败，请核对）："
+        FAILED=$(system_update_failed_units) || return 1
+        if [ -n "$BASELINE" ]; then
+            [ -f "$BASELINE" ] && [ -r "$BASELINE" ] || { error "更新前服务状态记录不可读，无法确认后检查结果"; return 1; }
+            AFTER="${BASELINE%/*}/services-after.txt"
+            : > "$AFTER" || return 1
+            if [ -n "$FAILED" ]; then printf '%s\n' "$FAILED" > "$AFTER" || return 1; fi
+            NEW=$(LC_ALL=C comm -13 "$BASELINE" "$AFTER") || return 1
+            EXISTING=$(LC_ALL=C comm -12 "$BASELINE" "$AFTER") || return 1
+            printf '%s' "$NEW" > "${BASELINE%/*}/services-new.txt" || return 1
+            if [ -n "$EXISTING" ]; then
+                warn "以下单元在更新前已失败，当前仍未恢复；需单独排查，不据此判定本次软件包更新失败："
+                printf '%s\n' "$EXISTING"
+            fi
+            if [ -n "$NEW" ]; then
+                warn "更新期间新增失败单元，后检查未通过，请核对服务日志："
+                printf '%s\n' "$NEW"
+                RC=1
+            fi
+        elif [ -n "$FAILED" ]; then
+            warn "当前存在失败单元；没有本次更新前的状态记录，不能判断何时发生："
             printf '%s\n' "$FAILED"
             RC=1
         fi
+    elif [ -n "$BASELINE" ]; then
+        error "更新前使用 systemd，但更新后不可用，无法完成服务状态检查"
+        RC=1
     fi
     if system_update_reboot_required; then
         warn "系统提示需要重启；请安排维护窗口，Quench 不会自动重启"
@@ -17956,7 +17991,7 @@ system_update_auto_enable_apt() (
 )
 
 system_update_apt_locked() {
-    local MODE="$1" CODE PLAN PACKAGE STATUS INPUT
+    local MODE="$1" BASELINE="${2:-}" CODE PLAN PACKAGE STATUS INPUT
     local PKG_NAMES=() ARGS=()
     CODE=$(system_update_debian_code) || return 1
     system_update_apt_preflight || return 1
@@ -17995,7 +18030,7 @@ system_update_apt_locked() {
                 "服务可能重启，软件包配置发生冲突时可能保留旧版本；请检查更新日志" || return 2
             system_update_backup || return 1
             system_update_logged env APT_CONFIG="$QUENCH_UPDATE_RUN/security.conf" unattended-upgrade --verbose || return 1
-            system_update_postcheck
+            system_update_postcheck "$BASELINE"
             return $?
             ;;
         *) return 1 ;;
@@ -18008,7 +18043,11 @@ system_update_apt_locked() {
         error "计划删除访问/引导/包管理关键包，拒绝自动执行；请人工核对"
         return 1
     fi
-    grep -Eq '^(Inst|Remv) ' "$PLAN" || { info "没有符合条件的更新；请留意保留/锁定的软件包"; return 0; }
+    grep -Eq '^(Inst|Remv) ' "$PLAN" || {
+        info "没有符合条件的更新；请留意保留/锁定的软件包"
+        system_update_postcheck "$BASELINE"
+        return $?
+    }
     confirm_change_preview "执行以上软件包计划" "保持当前 Debian 大版本，不修改软件源" \
         "可能重启相关服务；配置文件冲突交由你选择，不自动覆盖" \
         "记录不是系统快照，升级不能自动撤销；不会自动重启机器" || return 2
@@ -18017,7 +18056,7 @@ system_update_apt_locked() {
     system_update_sources check "$CODE" || return 1
     # Let APT show its final plan and ask again; no -y, no forced conffile policy.
     system_update_logged env LC_ALL=C NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=60 "${ARGS[@]}" || return 1
-    system_update_postcheck
+    system_update_postcheck "$BASELINE"
 }
 
 system_update_other_locked() {
@@ -18040,7 +18079,7 @@ system_update_other_locked() {
 }
 
 system_update_action() (
-    local MODE="$1" CONTEXT="${2:-protected}" RC=0
+    local MODE="$1" CONTEXT="${2:-protected}" RC=0 BASELINE=""
     umask 077
     case "$CONTEXT" in
         protected) [ "$MODE" = check ] || system_update_session_ready || return 1 ;;
@@ -18058,8 +18097,18 @@ system_update_action() (
     trap 'exit 143' TERM HUP
     system_update_run_prepare || return 1
     if [ "$(system_package_manager)" = apt ]; then
-        system_update_require_python || RC=$?
-        if [ "$RC" -eq 0 ]; then system_update_apt_locked "$MODE" || RC=$?; fi
+        # Snapshot before even bootstrapping Python: dependency installation can
+        # also change service state. Never reuse a previous run's baseline.
+        if [ "$MODE" != check ] && systemd_available; then
+            BASELINE="$QUENCH_UPDATE_RUN/services-before.txt"
+            system_update_failed_units > "$BASELINE" || RC=1
+            if [ "$RC" -eq 0 ] && [ -s "$BASELINE" ]; then
+                warn "更新前已存在失败单元；更新后将对比状态，这些故障仍需单独排查："
+                cat "$BASELINE" || RC=1
+            fi
+        fi
+        if [ "$RC" -eq 0 ]; then system_update_require_python || RC=$?; fi
+        if [ "$RC" -eq 0 ]; then system_update_apt_locked "$MODE" "$BASELINE" || RC=$?; fi
     else
         system_update_other_locked "$MODE" || RC=$?
     fi

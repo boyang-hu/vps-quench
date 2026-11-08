@@ -8,6 +8,7 @@ trap 'rm -rf "$QUENCH_TEST_UPDATES_ROOT"' EXIT
 export QUENCH_TEST_MODE=1
 source "$ROOT/vps-quench.sh"
 source "$ROOT/tests/lib/harness.sh"
+QUENCH_TEST_REAL_POSTCHECK=$(declare -f system_update_postcheck)
 
 setup_update() {
     QUENCH_TEST_UPDATE_CASE="$QUENCH_TEST_UPDATES_ROOT/$1"
@@ -27,6 +28,7 @@ setup_update() {
     txn_write_end() { echo unlock >> "$QUENCH_TEST_UPDATE_CASE/calls"; }
     system_package_manager() { echo apt; }
     system_update_session_ready() { :; }
+    systemd_available() { return 1; }
     system_update_backup() { echo backup >> "$QUENCH_TEST_UPDATE_CASE/calls"; }
     system_update_postcheck() { [ ! -e "$QUENCH_TEST_UPDATE_CASE/post-fail" ]; }
     system_update_reboot_required() { return 1; }
@@ -1253,5 +1255,105 @@ t_onboarding_context() {
 for FORM in current full protected invalid major autoremove broken no_tty; do
     run_test "Onboarding foreground exception preserves normal update guards: $FORM" t_onboarding_context "$FORM"
 done
+
+
+# Exercise the real postcheck through both onboarding APT entry points. Every
+# systemctl/sshd call is a fixture; no host service is queried or modified.
+t_service_baseline() {
+    setup_update "service_baseline_$1"
+    eval "$QUENCH_TEST_REAL_POSTCHECK"
+    local FORM="$1" MODE=current RC=0 OUT RUN
+    systemd_available() { return 0; }
+    system_update_terminal_ready() { return 0; }
+    sshd() { [ ! -f "$QUENCH_TEST_UPDATE_CASE/ssh-broken" ]; }
+    printf '%s\n' 'networking.service loaded failed failed Raise network interfaces' > "$QUENCH_TEST_UPDATE_CASE/before"
+    cp "$QUENCH_TEST_UPDATE_CASE/before" "$QUENCH_TEST_UPDATE_CASE/after"
+    case "$FORM" in
+        full) MODE=full ;;
+        security) MODE=security ;;
+        new|bootstrap-new) : > "$QUENCH_TEST_UPDATE_CASE/before" ;;
+        mixed) echo 'ssh.service loaded failed failed OpenSSH server' >> "$QUENCH_TEST_UPDATE_CASE/after" ;;
+        recovered) : > "$QUENCH_TEST_UPDATE_CASE/after" ;;
+        healthy) : > "$QUENCH_TEST_UPDATE_CASE/before"; : > "$QUENCH_TEST_UPDATE_CASE/after" ;;
+        no-updates) : > "$QUENCH_TEST_UPDATE_CASE/plan" ;;
+        description) echo 'networking.service loaded failed failed Different translated description' > "$QUENCH_TEST_UPDATE_CASE/after" ;;
+        reordered)
+            echo 'a.service loaded failed failed Before' >> "$QUENCH_TEST_UPDATE_CASE/before"
+            printf '%s\n' 'a.service loaded failed failed After' 'networking.service loaded failed failed Changed' > "$QUENCH_TEST_UPDATE_CASE/after"
+            ;;
+        malformed-before) echo 'unexpected output' > "$QUENCH_TEST_UPDATE_CASE/before" ;;
+        malformed-after) echo 'unexpected output' > "$QUENCH_TEST_UPDATE_CASE/after" ;;
+        ssh-error) touch "$QUENCH_TEST_UPDATE_CASE/ssh-broken" ;;
+        apt-error) system_update_apt_health() { [ ! -f "$QUENCH_TEST_UPDATE_CASE/applied" ]; } ;;
+        systemd-lost) systemd_available() { [ ! -f "$QUENCH_TEST_UPDATE_CASE/applied" ]; } ;;
+    esac
+    systemctl() {
+        assert_eq "$*" '--failed --plain --no-legend --no-pager'
+        local PHASE=before
+        if [ -f "$QUENCH_TEST_UPDATE_CASE/queried" ]; then PHASE=after; fi
+        touch "$QUENCH_TEST_UPDATE_CASE/queried"
+        printf 'service-%s\n' "$PHASE" >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        case "$FORM:$PHASE" in query-before:before|query-after:after) echo 'system bus unavailable'; return 1 ;; esac
+        cat "$QUENCH_TEST_UPDATE_CASE/$PHASE"
+    }
+    system_update_require_python() {
+        assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" service-before
+        echo bootstrap >> "$QUENCH_TEST_UPDATE_CASE/calls"
+    }
+    # Package application remains stubbed but leaves evidence for postchecking.
+    env() {
+        while [[ "${1:-}" == *=* ]]; do shift; done
+        if [[ " $* " == *' -o DPkg::Lock::Timeout=60 '* ]]; then
+            touch "$QUENCH_TEST_UPDATE_CASE/applied"
+            if [ "$FORM" = missing-baseline ]; then rm "$QUENCH_UPDATE_RUN/services-before.txt"; fi
+        fi
+        "$@"
+    }
+    if [ "$FORM" = security ]; then
+        OUT=$(system_update_action "$MODE") || RC=$?
+    else
+        OUT=$(system_update_action "$MODE" onboarding) || RC=$?
+    fi
+    for RUN in "$QUENCH_UPDATE_STATE_DIR"/run-*; do :; done
+    case "$FORM" in
+        current|full|security|recovered|healthy|no-updates|description|reordered)
+            assert_eq "$RC" 0
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/audit" SUCCESS
+            assert_file_contains "$RUN/result.txt" 'exit_code=0'
+            test -f "$RUN/services-after.txt" || fail 'postcheck missing (including no-op update)'
+            case "$FORM" in
+                recovered|healthy) [[ "$OUT" != *'当前仍未恢复'* ]] || fail 'recovered unit reported as failing' ;;
+                *) assert_contains "$OUT" '在更新前已失败'; assert_contains "$OUT" networking.service ;;
+            esac
+            ;;
+        *)
+            assert_ne "$RC" 0
+            assert_file_contains "$QUENCH_TEST_UPDATE_CASE/audit" FAILED
+            ! grep -q SUCCESS "$QUENCH_TEST_UPDATE_CASE/audit" || fail 'failed health check audited as success'
+            ;;
+    esac
+    case "$FORM" in
+        new|mixed|bootstrap-new) assert_contains "$OUT" '新增失败单元'; test -s "$RUN/services-new.txt" || fail 'new failure not recorded' ;;
+        query-before|malformed-before)
+            ! grep -Eq 'bootstrap|apt-get' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'packages touched without reliable baseline'
+            ;;
+    esac
+    assert_eq "$(tail -1 "$QUENCH_TEST_UPDATE_CASE/calls")" unlock
+}
+for FORM in current full security recovered healthy no-updates description reordered new mixed bootstrap-new query-before query-after malformed-before malformed-after missing-baseline ssh-error apt-error systemd-lost; do
+    run_test "Update service baseline: $FORM" t_service_baseline "$FORM"
+done
+
+t_service_standalone() {
+    setup_update standalone_services
+    eval "$QUENCH_TEST_REAL_POSTCHECK"
+    systemd_available() { return 0; }
+    sshd() { return 0; }
+    systemctl() { echo 'networking.service loaded failed failed Raise network interfaces'; }
+    # A stale previous run must not soften a standalone health check.
+    echo networking.service > "$QUENCH_UPDATE_RUN/services-before.txt"
+    assert_fail system_update_postcheck
+}
+run_test 'Standalone service check does not reuse a stale update baseline' t_service_standalone
 
 test_summary 'System and software updates'
