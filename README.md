@@ -1,4 +1,4 @@
-# Quench — VPS 初始化与管理工具 V0.1.12
+# Quench — VPS 初始化与管理工具 V0.1.13
 
 > 首次开荒 · 用户与 SSH · Fail2ban · Firewall · BBR/FQ · DNS · Caddy 网站入口 · 系统与服务管理
 
@@ -28,24 +28,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 适合不能访问 GitHub 的中国内地 VPS。先在一台可以访问 GitHub 的电脑或跳板机下载：
 
 ```bash
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.12/quench-offline-V0.1.12.tar.gz
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.12/quench-offline-V0.1.12.tar.gz.sha256
-sha256sum -c quench-offline-V0.1.12.tar.gz.sha256
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.13/quench-offline-V0.1.13.tar.gz
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.13/quench-offline-V0.1.13.tar.gz.sha256
+sha256sum -c quench-offline-V0.1.13.tar.gz.sha256
 ```
 
 再通过 `scp`、SFTP 或 WinSCP 将两个文件传到 VPS。Linux/macOS 示例：
 
 ```bash
-scp quench-offline-V0.1.12.tar.gz* root@你的VPS地址:/root/
+scp quench-offline-V0.1.13.tar.gz* root@你的VPS地址:/root/
 ```
 
 登录 VPS 后离线安装：
 
 ```bash
 cd /root
-sha256sum -c quench-offline-V0.1.12.tar.gz.sha256
-tar -xzf quench-offline-V0.1.12.tar.gz
-cd quench-offline-V0.1.12
+sha256sum -c quench-offline-V0.1.13.tar.gz.sha256
+tar -xzf quench-offline-V0.1.13.tar.gz
+cd quench-offline-V0.1.13
 bash install.sh
 v
 ```
@@ -115,7 +115,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
  ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.12  ·  Boyang
+  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.13  ·  Boyang
 ────────────────────────────────────────────────────────────────
   SSH · BBR · DNS · Caddy · Firewall · NFT · Docker
 
@@ -169,7 +169,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 2. **仅启用 BBR＋FQ**：保留基础模式，不测速、不调其他参数、不新增限速。
 3. **暂时跳过（回车默认）**：不执行性能操作，直接继续最终体检。
 
-即使 BBR 已经启用，也不会自动略过性能方案选择。防断联回滚尚未确认时会阻止进入性能步骤；性能操作失败后仍执行最终体检，但明确报告未完成，不把失败当成开荒成功。
+性能步骤完成后会停留显示结果，按 Enter 后才进入最终体检；明确跳过性能设置时不额外停顿。即使 BBR 已经启用，也不会自动略过性能方案选择。防断联回滚尚未确认时会阻止进入性能步骤；性能操作失败后仍执行最终体检，但明确报告未完成，不把失败当成开荒成功。
 
 - DNS 正常时只报告结果并保留云厂商或现有解析配置；只有解析失败时才提供进入 DNS 管理修复的入口。
 - 预检会显示时区、活动 NTP 后端和同步状态；未同步时给出警告，但不会在向导中擅自切换时间服务，修复统一从时间模块执行。
@@ -280,6 +280,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 旧内核不支持的可选 sysctl 会注明跳过；关键缓冲写入失败或成功写入后回读不一致会回滚本次参数操作。调优不打开路由转发，不主动设置 `tcp_notsent_lowat` 或 `tcp_reordering`。旧 Quench 曾设置过 notsent 时，仅在原始基线存在时恢复；否则明确提示保留。高级预设已有的转发/conntrack/UDP 配置继续独立保留，因此已有机器的所有系统参数不一定与一台干净系统相同。
 
 **Swap 建议：** 调优结束后，物理内存 ≤1GiB 且无活动 Swap 时，提供 1–20GiB 的可选创建入口，默认 2GiB，输入 `0` 跳过。创建成功后设置 `swappiness=10`，使用 Quench 自有 Swap 模块并保留至少 512MiB 磁盘空间；不删除第三方 Swap。Swap 缓解内存压力，不保证网络提速。
+
+**结果报告：** 实测调优、独立校准和性能验证结束后会显示汇总，包括完成状态、最后阶段、测速对端、单流/四流吞吐与估算重传比例、扫描结论，以及当前拥塞算法、缓冲区、实际队列和整形状态。失败或跳过验证时明确标记未完成/无有效样本，不把参数带宽基准当作测速结果；报告同时保存为本轮目录的 `summary.txt`。交互菜单按 Enter 后返回，开荒推荐流程按 Enter 后继续；等待确认时已释放调优锁。
 
 **记录与恢复：** 每轮保存到 `/var/lib/quench/performance/run-*`：`connections.log` 记录连接原因和原始 iperf3 输出，`samples.tsv` 保存有效样本、时长、IP 和端口；另有参数建议、前后快照、路由快照、扫描结果与退出状态。选点失败也保留报告。参数可通过 `7` 恢复时间戳备份；tc 由 `4` 管理，初始窗口由 `5` 管理。部分阶段失败时明确报告已完成部分，不把整个向导宣称为成功。
 
@@ -754,6 +756,7 @@ BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-me
 
 | 版本 | Quench 主要变更 |
 |------|----------------|
+| **V0.1.13** | TCP 调优、独立校准及性能验证结束显示结果汇总并保存 summary.txt；开荒性能步骤按 Enter 后才进入最终体检，独立菜单保持一次确认；区分估计带宽与实测结果，失败或未验证明确标记；新增报告和暂停流程回归测试。 |
 | **V0.1.12** | 日常及开荒更新记录并对比 systemd 失败单元；已有故障明确警告但不误判本次更新失败，新增故障、状态读取异常及 APT/dpkg、SSH 配置错误仍阻止继续；独立健康检查和大版本升级保持严格检查；新增 20 项回归测试。 |
 | **V0.1.11** | 开荒软件更新改为当前终端直接执行，不强制安装或进入 tmux；精简 Debian 镜像在流程内补齐 Python 依赖后继续原操作；独立更新中心保留会话保护，在线启动时可校验下载私有续接脚本；增加全新 Debian 镜像与更新入口边界测试。 |
 | **V0.1.10** | 首次开荒新增系统与软件更新步骤及独立 `u` 入口；默认刷新索引并执行不删包升级，可选完整依赖更新；复用更新中心预检、计划确认与 tmux 保护，更新失败或分离会话时暂停后续开荒，新增 25 项回归测试。 |

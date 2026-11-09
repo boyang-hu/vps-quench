@@ -498,7 +498,7 @@ first_run_performance_setup() {
         warn "防断联回滚仍在计时；请先确认网络正常，再进行性能设置"
         return 1
     fi
-    local CHOICE
+    local CHOICE RC=0 CONTINUE="${1:-no}"
     print_header "首次开荒 · 网络性能设置"
     ui_hint "已启用 BBR 也可以重新实测；测速会消耗流量，进入向导后仍需单独确认"
     menu_item "1" "一键调优（推荐）  ${DIM}完整参数、实测扫描、自动整形、验证${NC}"
@@ -511,12 +511,16 @@ first_run_performance_setup() {
             return 0
         fi
         case "$CHOICE" in
-            1) bbr_measure_menu tune; return $? ;;
-            2) bbr_enable_core; return $? ;;
+            1) bbr_measure_menu tune || RC=$?; break ;;
+            2) bbr_enable_core || RC=$?; break ;;
             ""|3) info "已跳过网络性能设置，可稍后从网络性能调优菜单进入"; return 0 ;;
             *) warn "请输入 1、2 或 3；回车跳过" ;;
         esac
     done
+    # Recommended onboarding immediately clears the screen for the final audit.
+    # Standalone menus already pause once, and skipping needs no extra prompt.
+    if [ "$CONTINUE" = continue ]; then ui_pause '按 Enter 继续开荒' || return 130; fi
+    return "$RC"
 }
 
 first_run_recommended_flow() {
@@ -564,7 +568,8 @@ first_run_recommended_flow() {
         warn "防断联回滚仍在计时；确认网络正常后再继续性能设置"
         return 1
     fi
-    first_run_performance_setup || PERF_RC=$?
+    first_run_performance_setup continue || PERF_RC=$?
+    [ "$PERF_RC" -ne 130 ] || return "$PERF_RC"
     first_run_final_audit
     if [ "$PERF_RC" -ne 0 ]; then
         warn "最终体检已执行，但性能步骤未完成；请检查提示，可稍后从网络性能调优菜单重试"

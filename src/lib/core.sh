@@ -2,7 +2,7 @@
 # 由 build.sh 从 src/ 生成；请修改模块源码后重新构建发行脚本。
 
 # ============================================================
-#  Quench V0.1.12 — VPS 初始化与管理工具
+#  Quench V0.1.13 — VPS 初始化与管理工具
 #  作者：Boyang
 #
 #  项目说明：
@@ -13,6 +13,7 @@
 #  - 提供受控的系统/软件包更新与独立 Debian 大版本升级向导（不自动重启）
 #
 #  发布版本：
+#  V0.1.13: TCP 调优结束显示并保存结果报告，汇总吞吐、重传、扫描结论和运行参数；开荒性能步骤按 Enter 后继续，失败/未验证明确标记，补充报告与暂停流程回归测试。
 #  V0.1.12: 日常及开荒更新对比更新前后 systemd 失败单元，已有故障保留警告但不误判本次升级失败；新增故障和状态读取异常仍阻止继续，保留 APT/dpkg 与 SSH 检查；补充 20 项服务状态回归测试。
 #  V0.1.11: 开荒软件更新直接在当前终端执行，取消强制 tmux 跳转；精简 Debian 镜像在流程内补齐 Python 后继续；独立更新中心保留会话保护，支持在线启动时校验下载续接脚本；补充无 Python 的全新 Debian 与会话回归测试。
 #  V0.1.10: 首次开荒新增系统与软件更新步骤，默认刷新索引并执行不删包升级，可选完整依赖更新；复用更新中心预检与 tmux 保护，更新失败或会话分离时阻止继续配置，补充向导与跨发行版测试。
@@ -617,7 +618,7 @@ vis_len() {
 BOX_W=64
 UI_COMPACT=0
 APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
-APP_VERSION="V0.1.12"
+APP_VERSION="V0.1.13"
 APP_AUTHOR="Boyang"
 
 # 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、
@@ -714,7 +715,7 @@ status_pair() {
 
 ui_hint() { echo -e "  ${DIM}› $1${NC}"; }
 ui_prompt() { printf '  %s›%s %s' "$CYAN$BOLD" "$NC" "$1"; }
-ui_pause() { echo ""; read -rp "$(ui_prompt '按 Enter 返回')" _; }
+ui_pause() { echo ""; read -rp "$(ui_prompt "${1:-按 Enter 返回}")" _; }
 ui_continue() { echo ""; read -rp "$(ui_prompt '按 Enter 继续')" _; }
 
 

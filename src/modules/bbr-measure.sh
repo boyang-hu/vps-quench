@@ -548,6 +548,64 @@ bbr_measure_verdict() {
     done
 }
 
+# Plain text for both the terminal and summary.txt; use only this run's samples
+# and scan result. Read runtime state after any temporary queue restoration.
+bbr_measure_summary() {
+    local RC="$1" VALUE KEY STATUS QDISC RATE
+    printf '\n========== TCP 调优结果报告 ==========\n'
+    if [ "$RC" -eq 0 ]; then
+        printf '流程结果：已完成（验证情况见下方）\n'
+    else
+        printf '流程结果：未完成（退出码 %s）；部分配置可能已应用，请检查记录\n' "$RC"
+    fi
+    printf '最后阶段：%s\n' "${QUENCH_PERF_STAGE:-准备}"
+    printf '出口网卡：%s · IPv%s\n' "${QUENCH_PERF_DEV:-未确定}" "${QUENCH_PERF_FAMILY:-?}"
+    printf '测速对端：%s · 端口 %s\n' "${QUENCH_PERF_PEER:-未选定}" "${QUENCH_PERF_PORT:-?}"
+    VALUE=$(bbr_state_value "$QUENCH_PERF_REPORT/context.txt" buffer_basis_mbps 2>/dev/null || true)
+    [ -z "$VALUE" ] || printf '参数带宽基准：%s Mbps（不是最终测速结果）\n' "$VALUE"
+    VALUE=$(bbr_state_value "$QUENCH_PERF_REPORT/context.txt" target_rtt 2>/dev/null || true)
+    [ -z "$VALUE" ] || printf '业务 RTT 估计：%s ms（不是实测延迟）\n' "$VALUE"
+    STATUS=$(bbr_state_value "$QUENCH_PERF_REPORT/calibration.state" STATUS 2>/dev/null || true)
+    case "$STATUS" in
+        KNEE) VALUE='检测到限速拐点' ;;
+        NO_KNEE) VALUE='未检测到限速拐点' ;;
+        CANCELLED) VALUE='扫描已取消' ;;
+        INCONCLUSIVE) VALUE='样本不足以确定拐点' ;;
+        ABOVE_CAP|OUT_OF_RANGE) VALUE='超出扫描范围，未取得可用拐点' ;;
+        *) VALUE='未完成扫描或本轮未扫描' ;;
+    esac
+    printf '扫描结论：%s\n' "$VALUE"
+    if [ "$STATUS" = KNEE ]; then
+        VALUE=$(bbr_state_value "$QUENCH_PERF_REPORT/calibration.state" RECOMMEND_MBPS 2>/dev/null || true)
+        printf '建议整形：%s Mbps（实际状态见下方）\n' "${VALUE:-未知}"
+    fi
+    printf '\n最终验证（本机发送 → 对端接收）：\n'
+    awk -F '\t' '
+        ($1=="after" || $1=="verify") && ($2==1 || $2==4) {rate[$2]=$5; loss[$2]=$7}
+        END {for(i=1;i<=4;i+=3) {
+            label=(i==1?"单流":"四流")
+            if(i in rate) printf "  %s：%s Mbps · 估算重传比例 %s%%\n",label,rate[i],loss[i]
+            else printf "  %s：无有效验证样本（跳过或未完成）\n",label
+        }}' "$QUENCH_PERF_REPORT/samples.tsv" || return 1
+    printf '  结果仅代表本轮所选对端；估算重传比例不是实际丢包率。\n'
+    printf '\n当前参数（运行值）：\n'
+    for KEY in net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
+        VALUE=$(sysctl -n "$KEY" 2>/dev/null) || VALUE=无法读取
+        printf '  %s = %s\n' "$KEY" "${VALUE:-无法读取}"
+    done
+    printf '  tcp_rmem / tcp_wmem 依次为最小、默认、最大值，单位字节。\n'
+    if [ -n "${QUENCH_PERF_DEV:-}" ] && [ -n "${BBR_CAL_TC_BIN:-}" ]; then
+        if QDISC=$("$BBR_CAL_TC_BIN" qdisc show dev "$QUENCH_PERF_DEV" 2>/dev/null) && [ -n "$QDISC" ]; then
+            RATE=$(bbr_tc_rate_display "$QUENCH_PERF_DEV" "$BBR_CAL_TC_BIN" 2>/dev/null || true)
+            printf '当前整形：%s\n实际队列：\n%s\n' "${RATE:-无法确认}" "$QDISC"
+        else
+            printf '实际队列与整形：无法读取，请检查 tc\n'
+        fi
+    fi
+    printf '\n完整记录：%s\n报告文件：%s/summary.txt\n' "$QUENCH_PERF_REPORT" "$QUENCH_PERF_REPORT"
+    printf '======================================\n'
+}
+
 bbr_measure_cleanup() {
     local RC=$?
     trap - EXIT
@@ -558,6 +616,9 @@ bbr_measure_cleanup() {
         bbr_calibration_restore_qdisc || { error "原队列恢复失败，请立即检查 tc"; RC=1; }
     fi
     if [ -n "${QUENCH_PERF_REPORT:-}" ]; then
+        if ! bbr_measure_summary "$RC" > "$QUENCH_PERF_REPORT/summary.txt"; then
+            error "无法生成完整的调优结果报告"; RC=1
+        fi
         if ! printf 'exit_code=%s\n' "$RC" >> "$QUENCH_PERF_REPORT/outcome.txt"; then
             error "无法写入最终报告状态"; RC=1
         fi
@@ -566,6 +627,9 @@ bbr_measure_cleanup() {
     bbr_calibration_lock_release
     txn_write_end
     quench_tmp_cleanup
+    # Display only after cleanup has released the measurement/transaction locks.
+    # UI callers own the Enter prompt; noninteractive/CLI calls never block here.
+    if [ -n "${QUENCH_PERF_REPORT:-}" ]; then cat "$QUENCH_PERF_REPORT/summary.txt" || RC=1; fi
     exit "$RC"
 }
 
@@ -579,6 +643,7 @@ bbr_measure_session() (
     QUENCH_PERF_PORTS=""; QUENCH_PERF_PROBE_PIDS=""
     QUENCH_PERF_DEV=""; QUENCH_PERF_REPORT=""; QUENCH_PERF_RESTORE=0
     QUENCH_PERF_SINGLE=""; QUENCH_PERF_MULTI=""; QUENCH_PERF_BW=""
+    QUENCH_PERF_STAGE=准备
     QUENCH_TMP_REGISTRY=""
     txn_write_begin "网络调优向导" || exit 1
     trap bbr_measure_cleanup EXIT
@@ -596,6 +661,7 @@ bbr_measure_session() (
         SHAPE=keep; SKIP_VERIFY=1
         QUENCH_PERF_DEV=$(ip "-$FAMILY" route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<NF;i++)if($i=="dev"){print $(i+1);exit}}')
     else
+        QUENCH_PERF_STAGE=连接测速对端
         bbr_measure_connect "$HOST" "$PORT" "$FAMILY" || exit 1
         QUENCH_PERF_DEV=$(bbr_measure_iface "$QUENCH_PERF_PEER" "$FAMILY") || exit 1
     fi
@@ -605,6 +671,7 @@ bbr_measure_session() (
     printf 'peer=%s\nport=%s\nfamily=%s\ndev=%s\nmode=%s\nnominal=%s\ntarget_rtt=%s\nrole=%s\nversion=%s\nshaping=%s\n' \
         "$QUENCH_PERF_PEER" "$QUENCH_PERF_PORT" "$FAMILY" "$QUENCH_PERF_DEV" "$MODE" "$NOMINAL" "$RTT" "$ROLE" "$APP_VERSION" "$SHAPE" >> "$QUENCH_PERF_REPORT/context.txt" || exit 1
     if [ "$MODE" = verify ]; then
+        QUENCH_PERF_STAGE=仅验证性能
         bbr_measure_pair verify || exit 1
         bbr_measure_verdict
         info "验证未修改网络参数或队列"
@@ -613,6 +680,7 @@ bbr_measure_session() (
     bbr_measure_queue_guard "$QUENCH_PERF_DEV" "$BBR_CAL_TC_BIN" || exit 1
     BW=$NOMINAL
     if [ "$MODE" = tune ]; then
+        QUENCH_PERF_STAGE=基础参数调优
         bbr_runtime_snapshot "$QUENCH_PERF_REPORT/before.conf" || exit 1
         bbr_default_routes > "$QUENCH_PERF_REPORT/routes-before.txt" || exit 1
         if [ -f "$SYSCTL_FILE" ]; then cp "$SYSCTL_FILE" "$QUENCH_PERF_REPORT/saved-before.conf" || exit 1; fi
@@ -640,6 +708,7 @@ bbr_measure_session() (
     fi
     case "$SHAPE" in y) SHAPE=auto ;; n) SHAPE=keep ;; esac
     if [ "$SHAPE" = auto ]; then
+        QUENCH_PERF_STAGE=路径检查与拐点扫描
         info "[2/5] 40% 带宽检查路径"
         bbr_measure_path_check "$BW" || exit 1
         info "[3/5] 实测限速器拐点"
@@ -659,6 +728,7 @@ bbr_measure_session() (
             bbr_calibration_write_result "$STATUS" "$QUENCH_PERF_PEER" "$QUENCH_PERF_PORT" "$FAMILY" "$BW" "$UNSHAPED" || exit 1
         fi
         cp "$BBR_CALIBRATION_RESULT_FILE" "$QUENCH_PERF_REPORT/calibration.state" || exit 1
+        QUENCH_PERF_STAGE=应用整形结果
         info "[4/5] 根据本轮结果处理整形：$STATUS"
         case "$STATUS" in
             KNEE)
@@ -673,14 +743,17 @@ bbr_measure_session() (
                 case "$STATUS" in ABOVE_CAP|OUT_OF_RANGE) sleep 15 ;; esac ;;
         esac
     elif [ "$SHAPE" = off ]; then
+        QUENCH_PERF_STAGE=关闭整形
         info "按选择关闭 Quench 整形，保留 FQ"
         bbr_tc_remove_selected "$QUENCH_PERF_DEV" || exit 1
     elif [ "$SHAPE" != keep ]; then
+        QUENCH_PERF_STAGE=应用指定整形
         bbr_measure_uint "$SHAPE" 1 100000 || exit 1
         bbr_tc_apply_selected_rate "$QUENCH_PERF_DEV" "$SHAPE" || exit 1
         sleep 15
     fi
     if [ "$SKIP_VERIFY" = 0 ]; then
+        QUENCH_PERF_STAGE=最终性能验证
         info "[5/5] 验证最终状态：10 秒单流 + 10 秒四流"
         bbr_measure_pair after || { error "配置已应用，但验证未完成；请查看报告"; exit 1; }
         bbr_measure_verdict
@@ -688,6 +761,7 @@ bbr_measure_session() (
         info "本轮仅应用基础方案，已跳过扫描和验证"
     fi
     if [ "$MODE" = tune ]; then
+        QUENCH_PERF_STAGE=保存参数快照与检查Swap
         bbr_runtime_snapshot "$QUENCH_PERF_REPORT/after.conf" || exit 1
         bbr_measure_swap_advice || exit 1
     fi

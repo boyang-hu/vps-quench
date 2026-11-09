@@ -7,6 +7,7 @@ trap 'rm -rf "$TMP"' EXIT
 export QUENCH_TEST_MODE=1
 source "$ROOT/vps-quench.sh"
 source "$ROOT/tests/lib/harness.sh"
+QUENCH_TEST_REAL_PAUSE=$(declare -f ui_pause)
 
 setup_onboarding() {
     TEST_LOG="$TMP/$1.log"; : > "$TEST_LOG"
@@ -17,7 +18,7 @@ setup_onboarding() {
     menu_pair() { :; }
     menu_group() { :; }
     menu_div() { :; }
-    ui_pause() { :; }
+    ui_pause() { echo pause >> "$TEST_LOG"; }
     bbr_measure_menu() { printf 'measure:%s\n' "$1" >> "$TEST_LOG"; }
     bbr_enable_core() { echo core >> "$TEST_LOG"; }
 }
@@ -86,7 +87,7 @@ t_recommended() {
     setup_recommended "recommended_$1"
     assert_ok first_run_recommended_flow <<< "$(printf 'y\n%s\n' "$1")"
     local EXPECTED=$'preflight\nbackup\nupdates\nnetwork'
-    [ -z "$2" ] || EXPECTED="${EXPECTED}"$'\n'"$2"
+    [ -z "$2" ] || EXPECTED="${EXPECTED}"$'\n'"$2"$'\npause'
     EXPECTED="${EXPECTED}"$'\n''audit'
     assert_eq "$(cat "$TEST_LOG")" "$EXPECTED"
     :
@@ -114,7 +115,7 @@ t_direct_menu() {
     setup_onboarding direct
     first_run_print_status() { :; }
     assert_ok first_run_wizard <<< $'8\n1\n0'
-    assert_eq "$(cat "$TEST_LOG")" measure:tune
+    assert_eq "$(cat "$TEST_LOG")" $'measure:tune\npause'
     :
 }
 run_test 'Standalone onboarding item 8 uses the same three-way entry' t_direct_menu
@@ -131,5 +132,42 @@ t_confirmation() {
     :
 }
 run_test 'Choosing measured onboarding still requires explicit network-test consent' t_confirmation
+
+
+t_pause_failure() {
+    setup_recommended pause_failure
+    bbr_measure_menu() { echo report-failure >> "$TEST_LOG"; return 7; }
+    local RC=0
+    first_run_recommended_flow <<< $'y\n1\n' || RC=$?
+    assert_eq "$RC" 7
+    assert_contains "$(cat "$TEST_LOG")" $'report-failure\npause\naudit'
+}
+run_test 'Failed tuning report pauses before final audit without masking failure' t_pause_failure
+
+t_pause_eof() {
+    setup_recommended pause_eof
+    ui_pause() { echo pause >> "$TEST_LOG"; return 1; }
+    local RC=0
+    first_run_recommended_flow <<< $'y\n1' || RC=$?
+    assert_eq "$RC" 130
+    ! grep -q '^audit$' "$TEST_LOG" || fail 'EOF cleared the report for final audit'
+}
+run_test 'Closed input at the result report stops onboarding before screen redraw' t_pause_eof
+
+t_enter_required() {
+    setup_onboarding enter_required
+    # Exercise the real prompt, not only a pause stub. The trailing sentinel
+    # proves Enter is consumed before returning to the caller.
+    unset -f ui_pause
+    eval "$QUENCH_TEST_REAL_PAUSE"
+    local INPUT_FILE="$TMP/enter-input" NEXT
+    printf '1\n\nafter-report\n' > "$INPUT_FILE"
+    {
+        assert_ok first_run_performance_setup continue
+        read -r NEXT || fail 'missing sentinel after pause'
+    } < "$INPUT_FILE"
+    assert_eq "$NEXT" after-report
+}
+run_test 'Tuning consumes one Enter before continuing onboarding' t_enter_required
 
 test_summary 'Onboarding performance choices'

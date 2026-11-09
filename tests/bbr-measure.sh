@@ -94,7 +94,9 @@ setup_session() {
     bbr_apply_sysctl() { printf '%s\n' "$1" > "$CASE_DIR/applied"; echo "apply $2" >> "$LOG"; }
     bbr_calibration_run() { printf 'calibrate %s %s\n' "$5" "$6" >> "$LOG"; }
     sleep() { :; }
-    tc() { :; }
+    tc() { echo "qdisc fq 7ffd: root"; }
+    sysctl() { case "$2" in *congestion_control) echo cubic ;; *default_qdisc) echo fq ;; *) echo "4096 1048576 16777216" ;; esac; }
+    bbr_tc_rate_display() { echo "585Mbit"; }
     bbr_calibration_measure() {
         MEASURE_N=$((MEASURE_N + 1))
         BBR_CAL_SENDER=620; BBR_CAL_RETRANS=2; BBR_CAL_LOSS=0.0001
@@ -575,5 +577,89 @@ t_no_iperf() {
     ! grep -Eq '^measure|^calibrate' "$LOG" || fail 'basic-only fallback attempted tests'
 }
 run_test 'Without iperf the explicit bandwidth drives base tuning without measurements' t_no_iperf
+
+
+t_summary() {
+    setup_session "summary_$1"
+    local MODE="$1" RC=0 REPORT OUTPUT
+    case "$MODE" in
+        failure) bbr_measure_pair() { return 1; } ;;
+        partial)
+            bbr_measure_pair() {
+                BBR_CAL_SENDER=700; BBR_CAL_RECEIVER=567; BBR_CAL_RETRANS=2; BBR_CAL_LOSS=0.1
+                bbr_measure_record after 1 10
+                return 1
+            } ;;
+        skipped) QUENCH_PERF_HAVE_IPERF=0; ip() { echo 'default dev eth6'; } ;;
+        knee)
+            bbr_sweep_run() { printf 'STATUS=KNEE\nRECOMMEND_MBPS=585\n' > "$BBR_CALIBRATION_RESULT_FILE"; }
+            bbr_tc_apply_selected_rate() { :; } ;;
+        verify) : ;;
+        stale) printf 'STATUS=KNEE\nRECOMMEND_MBPS=999\n' > "$BBR_CALIBRATION_RESULT_FILE" ;;
+    esac
+    if [ "$MODE" = verify ]; then
+        OUTPUT=$(bbr_measure_session verify peer.test 5201 6 '' 150 proxy n keep) || RC=$?
+    elif [ "$MODE" = knee ]; then
+        OUTPUT=$(bbr_measure_session tune peer.test 5201 6 600 150 proxy y auto) || RC=$?
+    else
+        OUTPUT=$(bbr_measure_session tune peer.test 5201 6 400 150 proxy y keep) || RC=$?
+    fi
+    local REPORTS=("$QUENCH_PERF_REPORT_DIR"/run-*)
+    REPORT="${REPORTS[0]}/summary.txt"
+    assert_file_contains "$REPORT" 'TCP 调优结果报告'
+    assert_contains "$OUTPUT" "$(cat "$REPORT")"
+    assert_file_contains "$REPORT" 'tcp_congestion_control = cubic'
+    assert_file_contains "$REPORT" '当前整形：585Mbit'
+    assert_file_contains "$REPORT" 'qdisc fq 7ffd: root'
+    case "$MODE" in
+        failure|partial)
+            assert_ne "$RC" 0
+            assert_file_contains "$REPORT" '流程结果：未完成'
+            assert_file_contains "$REPORT" '四流：无有效验证样本'
+            ! grep -q '流程结果：已完成' "$REPORT" || fail 'failed run called complete'
+            if [ "$MODE" = partial ]; then assert_file_contains "$REPORT" '单流：567 Mbps'; fi
+            ;;
+        skipped)
+            assert_eq "$RC" 0
+            assert_file_contains "$REPORT" '单流：无有效验证样本'
+            assert_file_contains "$REPORT" '四流：无有效验证样本'
+            ;;
+        *)
+            assert_eq "$RC" 0
+            assert_file_contains "$REPORT" '单流：600 Mbps'
+            assert_file_contains "$REPORT" '四流：600 Mbps'
+            ;;
+    esac
+    if [ "$MODE" = knee ]; then
+        assert_file_contains "$REPORT" '建议整形：585 Mbps'
+    else
+        ! grep -q '建议整形' "$REPORT" || fail 'report reused a stale scan recommendation'
+    fi
+    if [ "$MODE" != verify ]; then
+        assert_file_contains "$REPORT" '不是最终测速结果'
+        assert_file_contains "$REPORT" '不是实测延迟'
+    fi
+    assert_file_contains "${REPORTS[0]}/outcome.txt" "exit_code=$RC"
+}
+for MODE in normal failure partial skipped knee verify stale; do
+    run_test "Final tuning report: $MODE" t_summary "$MODE"
+done
+
+t_summary_restoration() {
+    setup_session summary_restoration
+    QUENCH_PERF_REPORT="$QUENCH_PERF_REPORT_DIR/run-fixture"
+    mkdir -p "$QUENCH_PERF_REPORT"
+    printf 'phase\tstreams\n' > "$QUENCH_PERF_REPORT/samples.tsv"
+    QUENCH_PERF_DEV=eth6; BBR_CAL_TC_BIN=tc; QUENCH_PERF_RESTORE=1
+    bbr_calibration_restore_qdisc() { echo restored >> "$LOG"; return 1; }
+    bbr_measure_summary() { assert_eq "$1" 1; assert_file_contains "$LOG" restored; echo 'restoration failed'; }
+    local RC=0
+    (true; bbr_measure_cleanup) || RC=$?
+    assert_eq "$RC" 1
+    assert_file_contains "$QUENCH_PERF_REPORT/summary.txt" 'restoration failed'
+    assert_file_contains "$QUENCH_PERF_REPORT/outcome.txt" exit_code=1
+    assert_file_contains "$LOG" unlock
+}
+run_test 'Report reflects queue restoration failure and cleanup still releases the lock' t_summary_restoration
 
 test_summary 'Measured performance workflow'
