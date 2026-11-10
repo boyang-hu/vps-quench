@@ -875,6 +875,8 @@ t_major_preflight() {
     systemctl() { return 1; }
     df() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted\nfixture 9999999 1 9999998 1%% /\n'; }
     : > "$QUENCH_TEST_UPDATE_CASE/plan"
+    system_update_kernel_meta() { echo linux-image-cloud-amd64; }
+    system_update_bookworm_prepare() { return 0; }
     case "$1" in
         valid) : ;;
         unsupported_arch) dpkg() { echo i386; } ;;
@@ -882,8 +884,8 @@ t_major_preflight() {
         pinning) echo 'Package: *' > "$QUENCH_UPDATE_APT_DIR/preferences" ;;
         backports) echo 'deb https://deb.debian.org/debian bookworm-backports main' >> "$QUENCH_UPDATE_APT_DIR/sources.list" ;;
         foreign) apt() { echo 'vendor/stable 1.0 amd64 [installed]'; } ;;
-        pending) echo 'Inst curl [1.0] (1.1 Debian)' > "$QUENCH_TEST_UPDATE_CASE/plan" ;;
-        kernel) dpkg-query() { return 1; } ;;
+        pending) system_update_bookworm_prepare() { return 1; } ;;
+        kernel) system_update_kernel_meta() { return 1; } ;;
         space) df() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted\nfixture 1024 1 1023 1%% /\n'; } ;;
         container) systemd-detect-virt() { return 0; } ;;
         pending_reboot) system_update_reboot_required() { return 0; } ;;
@@ -1355,5 +1357,175 @@ t_service_standalone() {
     assert_fail system_update_postcheck
 }
 run_test 'Standalone service check does not reuse a stale update baseline' t_service_standalone
+
+t_kernel_matching() {
+    setup_update "kernel_match_$1"
+    local FORM="$1" ARCH=amd64 TEST_KERNEL=6.1.0-44-cloud-amd64 EXPECT=linux-image-cloud-amd64
+    case "$FORM" in
+        generic) TEST_KERNEL=6.1.0-44-amd64; EXPECT=linux-image-amd64 ;;
+        arm64) ARCH=arm64; TEST_KERNEL=6.1.0-44-arm64; EXPECT=linux-image-arm64 ;;
+        cloud-arm64) ARCH=arm64; TEST_KERNEL=6.1.0-44-cloud-arm64; EXPECT=linux-image-cloud-arm64 ;;
+        custom) TEST_KERNEL=6.12.1-xanmod1 ;;
+        arch-mismatch) ARCH=arm64 ;;
+    esac
+    uname() { echo "$TEST_KERNEL"; }
+    dpkg-query() {
+        if [ "$1" = -S ]; then
+            [ "$FORM" != missing ] || return 1
+            if [ "$FORM" = owner ]; then echo "vendor: $2"
+            else echo "linux-image-$TEST_KERNEL: $2"; fi
+        else
+            local STATUS='install ok installed' SOURCE="linux-signed-$ARCH" VERSION=6.1.164-1 MAINT='Debian Kernel Team <debian-kernel@lists.debian.org>'
+            case "$FORM" in source) SOURCE=vendor ;; version) VERSION='6.1.164-1~bpo12+1' ;; maintainer) MAINT=vendor ;; status) STATUS='install ok unpacked' ;; esac
+            printf '%s\t%s\t%s\t%s\n' "$STATUS" "$SOURCE" "$VERSION" "$MAINT"
+        fi
+    }
+    case "$FORM" in
+        cloud|generic|arm64|cloud-arm64) assert_eq "$(system_update_kernel_meta "$ARCH")" "$EXPECT" ;;
+        *) assert_fail system_update_kernel_meta "$ARCH" ;;
+    esac
+}
+for FORM in cloud generic arm64 cloud-arm64 custom arch-mismatch missing owner source version maintainer status; do
+    run_test "Match running Debian kernel to metapackage: $FORM" t_kernel_matching "$FORM"
+done
+
+t_kernel_target() {
+    setup_update "kernel_target_$1"
+    local FORM="$1"
+    system_update_kernel_image_present() { [ "$FORM" != missing-image ]; }
+    dpkg-query() {
+        case "$*" in
+            *'${Depends}'*)
+                case "$FORM" in
+                    missing) echo '' ;;
+                    alternatives) echo 'linux-image-6.1.0-54-cloud-amd64 | linux-image-generic' ;;
+                    wrong-flavour) echo 'linux-image-6.1.0-54-amd64 (= 6.1.170-1)' ;;
+                    *) echo 'linux-image-6.1.0-54-cloud-amd64 (= 6.1.170-1)' ;;
+                esac ;;
+            *)
+                if [ "$FORM" = broken ] && [[ "$*" == *linux-image-6.1.0* ]]; then echo 'install ok unpacked'
+                else echo 'install ok installed'; fi ;;
+        esac
+    }
+    if [ "$FORM" = valid ]; then assert_eq "$(system_update_kernel_boot_target linux-image-cloud-amd64)" 6.1.0-54-cloud-amd64
+    else assert_fail system_update_kernel_boot_target linux-image-cloud-amd64; fi
+}
+for FORM in valid missing alternatives wrong-flavour broken missing-image; do
+    run_test "Installed kernel metapackage boot target: $FORM" t_kernel_target "$FORM"
+done
+
+t_bookworm_prepare() {
+    setup_update "bookworm_prepare_$1"
+    local FORM="$1" RC=0 TEST_BOOT_TARGET=6.1.0-54-cloud-amd64 OUT
+    uname() { echo 6.1.0-54-cloud-amd64; }
+    system_update_kernel_boot_target() { [ "$FORM" != target-fail ] || return 1; echo "$TEST_BOOT_TARGET"; }
+    system_update_sources() { echo sources-check >> "$QUENCH_TEST_UPDATE_CASE/calls"; [ "$FORM" != changed-source ]; }
+    system_update_backports_guard() { return 0; }
+    system_update_reboot_required() { [ "$FORM" = reboot-marker ]; }
+    if [ "$FORM" = new-kernel ]; then TEST_BOOT_TARGET=6.1.0-55-cloud-amd64; fi
+    case "$FORM" in missing-meta|install-fail|cancel|meta-critical) touch "$QUENCH_TEST_UPDATE_CASE/no-meta" ;; esac
+    case "$FORM" in ready|reboot-marker|target-fail) touch "$QUENCH_TEST_UPDATE_CASE/updated" ;; esac
+    if [ "$FORM" = config-race ]; then
+        confirm_change_preview() { echo '# external change' >> "$QUENCH_UPDATE_APT_DIR/sources.list"; return 0; }
+    fi
+    [ "$FORM" != cancel ] || touch "$QUENCH_TEST_UPDATE_CASE/cancel"
+    [ "$FORM" != post-fail ] || touch "$QUENCH_TEST_UPDATE_CASE/post-fail"
+    dpkg-query() {
+        [ ! -f "$QUENCH_TEST_UPDATE_CASE/no-meta" ] || return 1
+        echo 'install ok installed'
+    }
+    apt-get() {
+        printf 'apt-get %s\n' "$*" >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        if [[ " $* " == *' -s '* ]]; then
+            [ "$FORM" != simulation-fail ] || return 1
+            case "$*" in
+                *install*)
+                    if [ "$FORM" = meta-critical ]; then echo 'Remv openssh-server [1.0]'
+                    else echo 'Inst linux-image-cloud-amd64 (6.1.170-1 Debian:12.0/bookworm [amd64])'; fi ;;
+                *)
+                    if [ "$FORM" = critical ]; then echo 'Remv linux-image-6.1.0-44-cloud-amd64 [6.1.164-1]'
+                    elif [ "$FORM" = backports-plan ]; then echo 'Inst foo (1~bpo12+1 Debian)'
+                    elif [ ! -f "$QUENCH_TEST_UPDATE_CASE/updated" ]; then echo 'Inst sudo [1.0] (1.1 Debian:12.0/bookworm [amd64])'; fi ;;
+            esac
+            return 0
+        fi
+        [ "$FORM" != install-fail ] && [ "$FORM" != full-fail ] || return 100
+        case "$*" in
+            *install*) rm -f "$QUENCH_TEST_UPDATE_CASE/no-meta" ;;
+            *dist-upgrade*) [ "$FORM" = remaining ] || touch "$QUENCH_TEST_UPDATE_CASE/updated" ;;
+        esac
+        return 0
+    }
+    OUT=$(system_update_bookworm_prepare linux-image-cloud-amd64) || RC=$?
+    case "$FORM" in
+        ready|missing-meta|updates) assert_eq "$RC" 0 ;;
+        cancel) assert_eq "$RC" 2 ;;
+        new-kernel|reboot-marker) assert_eq "$RC" 3; assert_contains "$OUT" '等待你手动重启' ;;
+        *) assert_eq "$RC" 1 ;;
+    esac
+    assert_file_contains "$QUENCH_UPDATE_RUN/bookworm-preparation/result.txt" "exit_code=$RC"
+    assert_file_contains "$QUENCH_UPDATE_APT_DIR/sources.list" bookworm
+    ! grep -Eq ' -y |reboot|autoremove|trixie' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'unsafe preparation operation'
+    case "$FORM" in
+        ready|cancel|critical|meta-critical|simulation-fail|backports-plan|changed-source|config-race)
+            ! grep -q 'Lock::Timeout' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'applied an unapproved/invalid package plan' ;;
+        missing-meta) assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" '--no-remove install linux-image-cloud-amd64'; assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" '60 dist-upgrade' ;;
+        updates) assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" '60 dist-upgrade' ;;
+    esac
+}
+for FORM in ready missing-meta updates cancel new-kernel reboot-marker target-fail install-fail full-fail critical meta-critical simulation-fail backports-plan changed-source config-race remaining post-fail; do
+    run_test "Bookworm automatic preparation: $FORM" t_bookworm_prepare "$FORM"
+done
+
+t_major_preparation_stop() {
+    setup_update "major_prepare_stop_$1"
+    local RESULT="$1"
+    system_update_major_preflight() { return "$RESULT"; }
+    assert_ok system_update_debian_major
+    ! grep -q 'apt-get' "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'entered trixie after preparation stopped'
+    assert_eq "$(tail -1 "$QUENCH_TEST_UPDATE_CASE/calls")" unlock
+    local RUN
+    for RUN in "$QUENCH_UPDATE_STATE_DIR"/run-*; do :; done
+    assert_file_contains "$RUN/result.txt" status=not-started
+    ! grep -q SUCCESS "$QUENCH_TEST_UPDATE_CASE/audit" || fail 'preparation stop audited as major-upgrade success'
+}
+for RESULT in 2 3; do run_test "Preparation cancellation/reboot does not start major upgrade: $RESULT" t_major_preparation_stop "$RESULT"; done
+
+t_major_preparation_order() {
+    setup_update "major_prepare_order_$1"
+    local FORM="$1" RC=0
+    dpkg() { echo amd64; }
+    apt-mark() { :; }
+    systemd_available() { return 0; }
+    systemd-detect-virt() { return 1; }
+    systemctl() { return 1; }
+    system_update_kernel_meta() { echo linux-image-cloud-amd64; }
+    df() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted\nfixture 9999999 1 9999998 1%% /\n'; }
+    system_update_bookworm_prepare() {
+        echo prepare >> "$QUENCH_TEST_UPDATE_CASE/calls"
+        case "$FORM" in
+            reboot) return 3 ;;
+            fail) return 1 ;;
+            source-race) echo 'deb https://example.invalid bookworm main' >> "$QUENCH_UPDATE_APT_DIR/sources.list" ;;
+        esac
+        return 0
+    }
+    system_update_foreign_guard() {
+        assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" prepare
+        echo foreign-after >> "$QUENCH_TEST_UPDATE_CASE/calls"
+    }
+    system_update_major_preflight || RC=$?
+    case "$FORM" in
+        success) assert_eq "$RC" 0; assert_file_contains "$QUENCH_TEST_UPDATE_CASE/calls" foreign-after ;;
+        reboot) assert_eq "$RC" 3 ;;
+        *) assert_eq "$RC" 1 ;;
+    esac
+    if [ "$FORM" != success ]; then
+        ! grep -q foreign-after "$QUENCH_TEST_UPDATE_CASE/calls" || fail 'continued major preflight after failed preparation'
+    fi
+}
+for FORM in success reboot fail source-race; do
+    run_test "Major preparation ordering and post-preparation source check: $FORM" t_major_preparation_order "$FORM"
+done
 
 test_summary 'System and software updates'

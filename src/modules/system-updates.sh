@@ -1243,10 +1243,147 @@ system_update_foreign_guard() {
     [ "$BLOCKED" -eq 0 ]
 }
 
+# Identify the running Debian 12 kernel before installing a matching metapackage.
+# Local package metadata is a compatibility check, not a provenance attestation.
+system_update_kernel_meta() {
+    local ARCH="$1" RUNNING PACKAGE OWNER DATA STATUS SOURCE VERSION MAINTAINER FLAVOUR
+    RUNNING=$(uname -r) || return 1
+    [[ "$RUNNING" =~ ^6\.1\.0-[0-9]+-(cloud-)?${ARCH}$ ]] || {
+        error "运行内核 $RUNNING 不是支持的 Debian 12 标准类型；不会自动替换自定义内核" >&2; return 1;
+    }
+    PACKAGE="linux-image-$RUNNING"
+    OWNER=$(dpkg-query -S "/boot/vmlinuz-$RUNNING" 2>/dev/null) || return 1
+    case "$OWNER" in "$PACKAGE: /boot/vmlinuz-$RUNNING"|"$PACKAGE:$ARCH: /boot/vmlinuz-$RUNNING") : ;;
+        *) error "当前内核文件与软件包归属不匹配" >&2; return 1 ;; esac
+    DATA=$(dpkg-query -W -f='${Status}\t${source:Package}\t${Version}\t${Maintainer}\n' "$PACKAGE") || return 1
+    IFS=$'\t' read -r STATUS SOURCE VERSION MAINTAINER <<< "$DATA"
+    [ "$STATUS" = 'install ok installed' ] && [ "$MAINTAINER" = 'Debian Kernel Team <debian-kernel@lists.debian.org>' ] || {
+        error "当前内核包状态或维护者无法确认，不自动补装内核" >&2; return 1;
+    }
+    case "$SOURCE" in linux|"linux-signed-$ARCH") : ;; *) error "当前内核不是标准 Debian 源包" >&2; return 1 ;; esac
+    [[ "$VERSION" =~ ^6\.1\.[0-9]+(-[0-9]+(\+deb12u[0-9]+)?|\+[0-9]+)$ ]] || {
+        error "当前内核版本不在标准 bookworm 范围内" >&2; return 1;
+    }
+    FLAVOUR=${RUNNING#6.1.0-}; FLAVOUR=${FLAVOUR#*-}
+    printf 'linux-image-%s\n' "$FLAVOUR"
+}
+
+system_update_kernel_image_present() {
+    [ -s "/boot/vmlinuz-$1" ]
+}
+
+system_update_kernel_boot_target() {
+    local META="$1" DEP TARGET STATUS
+    STATUS=$(dpkg-query -W -f='${Status}' "$META" 2>/dev/null) || return 1
+    [ "$STATUS" = 'install ok installed' ] || return 1
+    DEP=$(dpkg-query -W -f='${Depends}' "$META") || return 1
+    [[ "$DEP" != *'|'* ]] || return 1
+    TARGET=$(printf '%s\n' "$DEP" | grep -oE "linux-image-6\.1\.0-[0-9]+-${META#linux-image-}([[:space:],]|$)" | sed 's/[[:space:],]*$//') || return 1
+    [ -n "$TARGET" ] && [[ "$TARGET" != *$'\n'* ]] || return 1
+    [[ "$TARGET" =~ ^linux-image-6\.1\.0-[0-9]+-(cloud-)?(amd64|arm64)$ ]] || return 1
+    STATUS=$(dpkg-query -W -f='${Status}' "$TARGET" 2>/dev/null) || return 1
+    [ "$STATUS" = 'install ok installed' ] || return 1
+    system_update_kernel_image_present "${TARGET#linux-image-}" || return 1
+    printf '%s\n' "${TARGET#linux-image-}"
+}
+
+system_update_bookworm_plan_guard() {
+    [ -f "$1" ] && [ -r "$1" ] || return 1
+    if grep -Eq '^Remv (openssh-server|sudo|systemd|systemd-sysv|apt|dpkg|libc6|linux-image[^ ]*|grub[^ ]*|initramfs-tools[^ ]*)( |:)|^Inst .*~bpo12' "$1"; then
+        error "准备计划涉及删除访问/引导/包管理关键包或安装 backports，已停止"
+        return 1
+    fi
+}
+
+# Called under the major-upgrade transaction lock. Separate evidence/backup
+# directory prevents the later trixie phase from overwriting bookworm evidence.
+# 2 = declined, 3 = preparation complete but a manual reboot is required.
+system_update_bookworm_prepare() {
+    local QUENCH_UPDATE_RUN="$QUENCH_UPDATE_RUN/bookworm-preparation"
+    system_update_bookworm_prepare_locked "$1"
+}
+
+system_update_bookworm_result() {
+    local RESULT="$1"
+    printf 'operation=bookworm-preparation\nexit_code=%s\n' "$RESULT" > "$QUENCH_UPDATE_RUN/result.txt" || RESULT=1
+    return "$RESULT"
+}
+
+system_update_bookworm_prepare_locked() (
+    local META="$1" NEED_META=no NEED_UPDATE=no STATUS TARGET
+    umask 077
+    mkdir -p "$QUENCH_UPDATE_RUN" || return 1
+    trap 'QUENCH_BOOKWORM_RESULT=$?; trap - EXIT; system_update_bookworm_result "$QUENCH_BOOKWORM_RESULT"; exit $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    # Record both configuration and the exact source layout before confirmation.
+    # Repository/pinning changes while the user reviews the plan require a retry.
+    cp -a "$QUENCH_UPDATE_APT_DIR" "$QUENCH_UPDATE_RUN/apt-plan" || return 1
+    STATUS=$(dpkg-query -W -f='${Status}' "$META" 2>/dev/null || true)
+    if [ "$STATUS" != 'install ok installed' ]; then
+        NEED_META=yes
+        info "将补齐与当前内核匹配的元包：$META"
+        LC_ALL=C apt-get -s --no-remove install "$META" > "$QUENCH_UPDATE_RUN/kernel-plan.txt" 2>&1 || { cat "$QUENCH_UPDATE_RUN/kernel-plan.txt"; return 1; }
+        cat "$QUENCH_UPDATE_RUN/kernel-plan.txt"
+        system_update_bookworm_plan_guard "$QUENCH_UPDATE_RUN/kernel-plan.txt" || return 1
+    fi
+    LC_ALL=C apt-get -s dist-upgrade > "$QUENCH_UPDATE_RUN/full-plan.txt" 2>&1 || { cat "$QUENCH_UPDATE_RUN/full-plan.txt"; return 1; }
+    system_update_bookworm_plan_guard "$QUENCH_UPDATE_RUN/full-plan.txt" || return 1
+    if grep -Eq '^(Inst|Remv) ' "$QUENCH_UPDATE_RUN/full-plan.txt"; then
+        NEED_UPDATE=yes
+        cat "$QUENCH_UPDATE_RUN/full-plan.txt"
+    fi
+    if [ "$NEED_META:$NEED_UPDATE" != no:no ]; then
+        confirm_change_preview "先准备 Debian 12，再升级到 13" \
+            "按以上计划补齐 $META 并完成 bookworm 全部更新；APT 仍会展示最终计划并确认" \
+            "此阶段不切换软件源、不删除旧内核、不自动重启；配置冲突由你选择" \
+            "请确认已有供应商快照、业务备份和可用控制台；包更新可能重启服务，Quench 不能回滚软件包" || return 2
+        system_update_backup || return 1
+        diff -qr "$QUENCH_UPDATE_RUN/apt-plan" "$QUENCH_UPDATE_APT_DIR" >/dev/null || {
+            error "确认期间 APT 配置发生变化，请重新进入向导生成计划"; return 1;
+        }
+        system_update_apt_preflight || return 1
+        system_update_sources major bookworm >/dev/null || return 1
+        system_update_backports_guard || return 1
+        if [ "$NEED_META" = yes ]; then
+            LC_ALL=C apt-get -s --no-remove install "$META" > "$QUENCH_UPDATE_RUN/kernel-plan-final.txt" 2>&1 || return 1
+            system_update_bookworm_plan_guard "$QUENCH_UPDATE_RUN/kernel-plan-final.txt" || return 1
+            system_update_logged env LC_ALL=C NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=60 --no-remove install "$META" || return 1
+        fi
+        # The metapackage may change the dependency plan: regenerate before use.
+        system_update_sources major bookworm >/dev/null || return 1
+        system_update_apt_health || return 1
+        LC_ALL=C apt-get -s dist-upgrade > "$QUENCH_UPDATE_RUN/full-plan.txt" 2>&1 || return 1
+        system_update_bookworm_plan_guard "$QUENCH_UPDATE_RUN/full-plan.txt" || return 1
+        if grep -Eq '^(Inst|Remv) ' "$QUENCH_UPDATE_RUN/full-plan.txt"; then
+            system_update_logged env LC_ALL=C NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=60 dist-upgrade || return 1
+        fi
+        system_update_postcheck || return 1
+    fi
+    system_update_apt_health || return 1
+    LC_ALL=C apt-get -s dist-upgrade > "$QUENCH_UPDATE_RUN/remaining.txt" 2>&1 || return 1
+    if grep -Eq '^(Inst|Remv) ' "$QUENCH_UPDATE_RUN/remaining.txt"; then
+        cat "$QUENCH_UPDATE_RUN/remaining.txt"
+        error "Debian 12 仍有待更新软件包，未进入 Debian 13 升级"; return 1
+    fi
+    system_update_backports_guard || return 1
+    TARGET=$(system_update_kernel_boot_target "$META") || {
+        error "无法确认 $META 对应的内核已安装完整；请检查 $QUENCH_UPDATE_RUN"; return 1;
+    }
+    printf 'metapackage=%s\nboot_target=%s\nrunning=%s\n' "$META" "$TARGET" "$(uname -r)" > "$QUENCH_UPDATE_RUN/kernel.txt" || return 1
+    if [ "$TARGET" != "$(uname -r)" ] || system_update_reboot_required; then
+        warn "Debian 12 准备已完成，等待你手动重启；当前 $(uname -r)，目标内核 $TARGET"
+        info "重启并确认 SSH/业务正常后，重新进入 Debian 12 → 13 向导，将自动复检后继续"
+        info "尚未切换 trixie 软件源；记录：$QUENCH_UPDATE_RUN"
+        return 3
+    fi
+    info "Debian 12 软件包与运行内核已就绪，继续大版本预检"
+)
+
 # Complex hosts stay on the official manual path. Common cloud-image source
 # formats are normalized only in the reviewed candidate, not during preflight.
 system_update_major_preflight() {
-    local ARCH HELD PREF FREE PATH_CHECK STATUS META PACKAGE
+    local ARCH HELD PREF FREE PATH_CHECK STATUS META
     [ "$(system_update_debian_code)" = bookworm ] || { error "此向导只支持 Debian 12 → 13；13 的日常更新请选择 2"; return 1; }
     system_update_session_ready || return 1
     system_update_apt_preflight || return 1
@@ -1266,14 +1403,7 @@ system_update_major_preflight() {
     done
     # We never remove/rewrite third-party repositories on the user's behalf.
     QUENCH_UPDATE_MAJOR_SOURCE=$(system_update_sources major bookworm) || return 1
-    META=""
-    for PACKAGE in "linux-image-$ARCH" "linux-image-cloud-$ARCH"; do
-        STATUS=$(dpkg-query -W -f='${Status}' "$PACKAGE" 2>/dev/null || true)
-        [ "$STATUS" != 'install ok installed' ] || META="$PACKAGE"
-    done
-    [ -n "$META" ] || { error "没有标准内核元包；自定义/厂商内核请人工升级"; return 1; }
-    dpkg-query -S "/boot/vmlinuz-$(uname -r)" >/dev/null 2>&1 \
-        || { error "当前运行内核无法追溯到 dpkg 软件包，请人工确认引导环境"; return 1; }
+    META=$(system_update_kernel_meta "$ARCH") || return 1
     for PATH_CHECK in / /var /boot; do
         [ -d "$PATH_CHECK" ] || continue
         FREE=$(df -Pk "$PATH_CHECK" | awk 'NR==2 {print $4}')
@@ -1282,15 +1412,17 @@ system_update_major_preflight() {
             error "$PATH_CHECK 空间不足（/ 与 /var 至少 2GiB，/boot 至少 256MiB）；实际需求仍由 APT 检查"; return 1
         fi
     done
+    for STATUS in apt-daily.service apt-daily-upgrade.service; do
+        if systemctl is-active --quiet "$STATUS"; then error "$STATUS 正在运行，请等其完成"; return 1; fi
+    done
     system_update_logged env LC_ALL=C apt-get -o APT::Update::Error-Mode=any update || return 1
     system_update_apt_origins_guard bookworm || return 1
     system_update_backports_guard || return 1
+    system_update_bookworm_prepare "$META" || return $?
+    # Package hooks may have changed repository configuration during preparation.
+    system_update_apt_preflight || return 1
+    QUENCH_UPDATE_MAJOR_SOURCE=$(system_update_sources major bookworm) || return 1
     system_update_foreign_guard || return 1
-    LC_ALL=C apt-get -s dist-upgrade > "$QUENCH_UPDATE_RUN/bookworm-plan.txt" 2>&1 || return 1
-    if grep -Eq '^(Inst|Remv) ' "$QUENCH_UPDATE_RUN/bookworm-plan.txt"; then
-        cat "$QUENCH_UPDATE_RUN/bookworm-plan.txt"
-        error "请先完成 Debian 12 当前版本更新并检查重启需求，再执行跨版本升级"; return 1
-    fi
     if system_update_reboot_required; then
         error "当前系统已要求重启，请先重启并验证服务正常"; return 1
     fi
@@ -1357,8 +1489,16 @@ system_update_debian_major() (
     trap 'txn_write_end' EXIT
     system_update_run_prepare || return 1
     system_update_require_python || return $?
-    system_update_major_preflight || return 1
-    local ANSWER TIMER DIFF_RC=0
+    local ANSWER TIMER DIFF_RC=0 PREP_RC=0
+    system_update_major_preflight || PREP_RC=$?
+    case "$PREP_RC" in
+        0) : ;;
+        2|3)
+            printf 'operation=debian-12-to-13\npreparation_exit_code=%s\nstatus=not-started\n' "$PREP_RC" > "$QUENCH_UPDATE_RUN/result.txt" || return 1
+            if [ "$PREP_RC" = 2 ]; then info "已取消准备，尚未开始 Debian 13 升级"; fi
+            return 0 ;;
+        *) return "$PREP_RC" ;;
+    esac
     # Freeze the exact candidate before asking. A changed live source must not
     # be silently re-staged after the user approved a different plan.
     cp -p "$QUENCH_UPDATE_MAJOR_SOURCE" "$QUENCH_UPDATE_RUN/source-before" || return 1

@@ -12,6 +12,16 @@ source "$ROOT/vps-quench.sh"
 CODE=$(system_update_debian_code)
 system_update_apt_preflight
 system_update_apt_origins_guard "$CODE"
+if [ "$CODE" = bookworm ]; then
+    # Validate the real APT dependency plan for both supported kernel flavours;
+    # simulation only: this container must never install a kernel or reboot.
+    ARCH=$(dpkg --print-architecture)
+    for META in "linux-image-$ARCH" "linux-image-cloud-$ARCH"; do
+        LC_ALL=C apt-get -s --no-remove install "$META" > "$QUENCH_TEST_APT_ROOT/$META.plan"
+        system_update_bookworm_plan_guard "$QUENCH_TEST_APT_ROOT/$META.plan"
+        grep -q '^Inst linux-image-6\.1\.' "$QUENCH_TEST_APT_ROOT/$META.plan"
+    done
+fi
 system_update_security_config "$QUENCH_TEST_APT_ROOT/security.conf" "$CODE"
 APT_CONFIG="$QUENCH_TEST_APT_ROOT/security.conf" python3 - "$CODE" <<'PY'
 import apt_pkg, sys

@@ -1,4 +1,4 @@
-# Quench — VPS 初始化与管理工具 V0.1.13
+# Quench — VPS 初始化与管理工具 V0.1.14
 
 > 首次开荒 · 用户与 SSH · Fail2ban · Firewall · BBR/FQ · DNS · Caddy 网站入口 · 系统与服务管理
 
@@ -28,24 +28,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 适合不能访问 GitHub 的中国内地 VPS。先在一台可以访问 GitHub 的电脑或跳板机下载：
 
 ```bash
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.13/quench-offline-V0.1.13.tar.gz
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.13/quench-offline-V0.1.13.tar.gz.sha256
-sha256sum -c quench-offline-V0.1.13.tar.gz.sha256
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.14/quench-offline-V0.1.14.tar.gz
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.14/quench-offline-V0.1.14.tar.gz.sha256
+sha256sum -c quench-offline-V0.1.14.tar.gz.sha256
 ```
 
 再通过 `scp`、SFTP 或 WinSCP 将两个文件传到 VPS。Linux/macOS 示例：
 
 ```bash
-scp quench-offline-V0.1.13.tar.gz* root@你的VPS地址:/root/
+scp quench-offline-V0.1.14.tar.gz* root@你的VPS地址:/root/
 ```
 
 登录 VPS 后离线安装：
 
 ```bash
 cd /root
-sha256sum -c quench-offline-V0.1.13.tar.gz.sha256
-tar -xzf quench-offline-V0.1.13.tar.gz
-cd quench-offline-V0.1.13
+sha256sum -c quench-offline-V0.1.14.tar.gz.sha256
+tar -xzf quench-offline-V0.1.14.tar.gz
+cd quench-offline-V0.1.14
 bash install.sh
 v
 ```
@@ -115,7 +115,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
  ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.13  ·  Boyang
+  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.14  ·  Boyang
 ────────────────────────────────────────────────────────────────
   SSH · BBR · DNS · Caddy · Firewall · NFT · Docker
 
@@ -578,7 +578,11 @@ Debian 日常更新及开荒更新会在安装依赖前记录 systemd 失败单�
 
 确认后暂停 timer、按需安装 `unattended-upgrades`，写入并验证仅安全更新策略后才解除列出的屏蔽，最后启用调度；成功要求配置有效、服务可加载且 timer 已启用并处于运行状态。依赖安装期间暂保留屏蔽，安装器可能显示 `masked` 提示，脚本会说明这是待处理状态。失败会尝试恢复配置和原屏蔽/调度状态，保留 `/var/lib/quench/updates/run-*` 下的备份；不卸载本次已安装的软件包。若 APT 已开始执行或状态不明，则只暂停后续 timer，不打断任务、不强行回写配置，并提示人工核对。启用调度后可能很快安装安全补丁并重启相关服务，但不自动重启服务器。
 
-**Debian 12 → 13 的支持边界：** 当前只接管 amd64/arm64、systemd、标准内核元包的非容器 Debian 12；启用的 Debian 源需集中在一个普通文件，支持传统 `.list` 和 deb822 `.sources`。需先完成 Debian 12 的更新，并确认供应商快照、独立业务备份、控制台和维护窗口，核对 1Panel、Docker、数据库等兼容性。
+**Debian 12 → 13 的支持边界：** 当前只接管 amd64/arm64、systemd、运行标准 Debian 12 内核的非容器系统；启用的 Debian 源需集中在一个普通文件，支持传统 `.list` 和 deb822 `.sources`。确认供应商快照、独立业务备份、控制台和维护窗口，核对 1Panel、Docker、数据库等兼容性后，可由向导先准备 Debian 12，再进行跨版本升级。
+
+**自动准备 Debian 12：** 向导按运行内核的版本、软件包归属及元数据识别普通版/cloud 版，缺少匹配的 `linux-image-amd64`、`linux-image-cloud-amd64` 或对应 arm64 元包时，在展示计划并确认后补装；随后执行 bookworm 的完整更新（`apt-get dist-upgrade`），APT 保留最终计划确认与配置文件选择。准备阶段不切换软件源，不删除旧内核，不自动安装 backports 或更换自定义内核。先完成当前版本更新，再检查剩余包的来源，避免旧版本退出仓库索引导致提前阻断。包管理异常、关键包删除计划、状态检查失败或仍有待更新包会停止流程。
+
+准备结束会读取元包实际依赖的内核并核对软件包安装状态与内核文件。新内核尚未启动或系统要求重启时，显示“等待手动重启”，此时 Debian 13 升级尚未开始；重启并确认 SSH/业务正常后重新进入同一向导，会从当前实际状态复检，已完成的准备无需重复执行。若仍启动旧内核，需要检查引导设置，不会绕过检查继续。准备日志、计划、配置与软件包状态备份保存在本次更新目录的 `bookworm-preparation/` 中；它们不是可撤销软件包升级的系统快照。
 
 向导会处理常见云镜像的以下情况，预检本身不改动系统源或卸载软件包：
 
@@ -588,7 +592,7 @@ Debian 日常更新及开荒更新会在安装依赖前记录 systemd 失败单�
 
 第三方源、APT pinning、锁定包、自定义内核及未完成的 dpkg 事务仍会拦截，不替你自动卸载或迁移。源变更保留组件、签名设置、`deb-src`、注释和原本禁用的条目。
 
-向导按[Debian 官方升级说明](https://www.debian.org/releases/trixie/release-notes/upgrading.en.html)分阶段执行：预检与源差异预览 → 确认并备份 → 原子切换 trixie → 刷新并预览软件包计划 → 再确认 → 最小升级 → 完整升级 → 健康检查。确认期间源文件变化会停止操作。开始软件包升级前取消/失败，只在文件未被外部改动时恢复原源（包括原镜像列表引用和 backports 设置）；开始后失败不切回旧源，不尝试降级，保留记录并暂停已由本次停止的自动更新 timer，等待人工恢复。成功后恢复原先活动的 timer，重启仍需你自行安排。
+向导按[Debian 官方升级说明](https://www.debian.org/releases/trixie/release-notes/upgrading.en.html)分阶段执行：环境与源检查 → 确认并准备 Debian 12 → 必要时重启后复检 → 源差异预览 → 确认并备份 → 原子切换 trixie → 刷新并预览软件包计划 → 再确认 → 最小升级 → 完整升级 → 健康检查。确认期间源文件变化会停止操作。切源后但尚未开始 Debian 13 软件包升级时取消/失败，只在文件未被外部改动时恢复原源（包括原镜像列表引用和 backports 设置）；开始后失败不切回旧源，不尝试降级，保留记录并暂停已由本次停止的自动更新 timer，等待人工恢复。成功后恢复原先活动的 timer，重启仍需你自行安排。
 
 记录及配置/包状态备份保存在 `/var/lib/quench/updates/run-*`（仅 root 可访问）。**这不是完整系统快照，不能用 Quench 的配置回滚或 180 秒防断联保护撤销系统升级。** 真正的跨版本失败恢复依赖供应商快照/救援控制台；大版本路径仍应先在可丢弃的 VPS 克隆上演练。
 
@@ -756,6 +760,7 @@ BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-me
 
 | 版本 | Quench 主要变更 |
 |------|----------------|
+| **V0.1.14** | Debian 12→13 向导新增自动准备：匹配并补齐普通/cloud 内核元包，确认后完成 bookworm 全部更新；新内核尚未启动时等待手动重启，重新进入后复检继续；更新后再检查剩余包来源，保留独立准备日志与备份；新增失败路径和内核识别测试。 |
 | **V0.1.13** | TCP 调优、独立校准及性能验证结束显示结果汇总并保存 summary.txt；开荒性能步骤按 Enter 后才进入最终体检，独立菜单保持一次确认；区分估计带宽与实测结果，失败或未验证明确标记；新增报告和暂停流程回归测试。 |
 | **V0.1.12** | 日常及开荒更新记录并对比 systemd 失败单元；已有故障明确警告但不误判本次更新失败，新增故障、状态读取异常及 APT/dpkg、SSH 配置错误仍阻止继续；独立健康检查和大版本升级保持严格检查；新增 20 项回归测试。 |
 | **V0.1.11** | 开荒软件更新改为当前终端直接执行，不强制安装或进入 tmux；精简 Debian 镜像在流程内补齐 Python 依赖后继续原操作；独立更新中心保留会话保护，在线启动时可校验下载私有续接脚本；增加全新 Debian 镜像与更新入口边界测试。 |
