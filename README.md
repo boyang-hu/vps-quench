@@ -1,4 +1,4 @@
-# Quench — VPS 初始化与管理工具 V0.1.14
+# Quench — VPS 初始化与管理工具 V0.1.15
 
 > 首次开荒 · 用户与 SSH · Fail2ban · Firewall · BBR/FQ · DNS · Caddy 网站入口 · 系统与服务管理
 
@@ -28,24 +28,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 适合不能访问 GitHub 的中国内地 VPS。先在一台可以访问 GitHub 的电脑或跳板机下载：
 
 ```bash
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.14/quench-offline-V0.1.14.tar.gz
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.14/quench-offline-V0.1.14.tar.gz.sha256
-sha256sum -c quench-offline-V0.1.14.tar.gz.sha256
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.15/quench-offline-V0.1.15.tar.gz
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.15/quench-offline-V0.1.15.tar.gz.sha256
+sha256sum -c quench-offline-V0.1.15.tar.gz.sha256
 ```
 
 再通过 `scp`、SFTP 或 WinSCP 将两个文件传到 VPS。Linux/macOS 示例：
 
 ```bash
-scp quench-offline-V0.1.14.tar.gz* root@你的VPS地址:/root/
+scp quench-offline-V0.1.15.tar.gz* root@你的VPS地址:/root/
 ```
 
 登录 VPS 后离线安装：
 
 ```bash
 cd /root
-sha256sum -c quench-offline-V0.1.14.tar.gz.sha256
-tar -xzf quench-offline-V0.1.14.tar.gz
-cd quench-offline-V0.1.14
+sha256sum -c quench-offline-V0.1.15.tar.gz.sha256
+tar -xzf quench-offline-V0.1.15.tar.gz
+cd quench-offline-V0.1.15
 bash install.sh
 v
 ```
@@ -115,7 +115,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
  ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.14  ·  Boyang
+  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.15  ·  Boyang
 ────────────────────────────────────────────────────────────────
   SSH · BBR · DNS · Caddy · Firewall · NFT · Docker
 
@@ -205,7 +205,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 - 厂商只提供一个管理员：选 `2` 准备 `quench-maint-*` 临时账号，粘贴公钥。临时账号无密码、具有免密 sudo（等同完整 root 权限），3 天后到期但**不会自动删除**，不会开放 root SSH/密码认证。新开窗口测试临时账号登录和 `sudo -n true`，退出原用户会话，再运行 `sudo v → 1 → r → 1` 改名。
 - 用新用户名重新登录，验证 sudo 后，从这个账号执行 `sudo v → 1 → r → 3`。确认后删除本向导创建的临时账号、独占组、家目录（含公钥）、邮箱及专属 sudo 授权。发现活跃进程、挂载点、身份变化、配置引用或家目录外的 UID/GID 遗留文件时停止，**不会按 UID 全盘删除**；遗留文件检查覆盖支持的本地文件系统及 tmpfs，不保证扫描远程挂载或 ACL。原账号 UID 不变；删除的临时 UID 不会因审计日志而永久占用。
 
-改名前预览；`/home/旧名` 可选择迁移到 `/home/新名`（同文件系统 rename，不跟随家目录符号链接或移动挂载点）；共享组不改名。同名私有组改名但 GID 不变。简单的按用户全权限 sudo 规则、Quench 免密 sudo 文件、cloud-init `default_user.name`、`subuid/subgid` 的用户名分配会一起迁移，标准 `/var/mail` 下归属正确的空邮箱可同步改名。自定义 sudo include/复杂授权、SSH Match/用户组限制/非标准公钥来源、用户 crontab/非空或自定义邮箱/linger、已扫描服务或 cloud-init 自定义用户列表中的旧用户名引用，需要先人工处理。不会修改发行版名或软件源 URL；也不能保证发现应用数据库、远程配置、ACL 或任意自定义脚本中的所有引用，已部署业务的机器必须先人工核对。
+改名前预览；`/home/旧名` 可选择迁移到 `/home/新名`（同文件系统 rename，不跟随家目录符号链接或移动挂载点）；共享组不改名。同名私有组改名但 GID 不变。简单的按用户全权限 sudo 规则、Quench 免密 sudo 文件、cloud-init `default_user.name`、`subuid/subgid` 的用户名分配会一起迁移，标准 `/var/mail` 下归属正确的空邮箱可同步改名。自定义 sudo include/复杂授权、SSH Match/用户组限制/非标准公钥来源、用户 crontab/非空或自定义邮箱/linger、已扫描服务或 cloud-init 自定义用户列表中的旧用户名引用，需要先人工处理。不会修改发行版名或软件源 URL；cloud-init 中明确的 argv 格式 LVM 扩容命令（如 `- [ lvextend, -l, +100%FREE, /dev/debian/root ]`）保持原样，设备路径中的卷组名不当成账号名。额外参数、shell 命令及其他用户名引用仍需人工核对；也不能保证发现应用数据库、远程配置、ACL 或任意自定义脚本中的所有引用，已部署业务的机器必须先人工核对。
+
+改名向导要求被改名账号事先具备有效 SSH 公钥；文件缺失、为空或校验失败时，提示目标账号、路径及“用户管理 → 5 管理用户公钥”入口。添加自己的公钥并验证该账号登录后，退出它的全部会话，再从独立维护账号执行改名。向导不会自动复制 root/临时维护账号的公钥，也不会为此开启密码登录。
 
 执行时暂时设置账户过期以阻止新的 PAM 登录，结束后恢复原过期策略；失败尝试逆向恢复并核对，不会整份覆盖 passwd/shadow 数据库。记录和敏感备份位于仅 root 可访问的 `/var/lib/quench/user-rename`；恢复未确认/进程被强杀时保留现场并阻止新的改名，在菜单 `4` 查看、`5` 从独立维护会话尝试恢复。没有计时自动回滚，不替代供应商快照与救援控制台；请保留独立维护连接，直至新账号验证成功。临时账号用于迁移而非运行业务，日志和审计记录会保留。
 
@@ -760,6 +762,7 @@ BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-me
 
 | 版本 | Quench 主要变更 |
 |------|----------------|
+| **V0.1.15** | 修复用户改名将 cloud-init LVM 扩容设备路径误判为旧用户名的问题，磁盘配置保持原样；公钥缺失、为空或校验失败时提示目标账号、路径和处理入口；新增真实公钥解析及改名回归测试。 |
 | **V0.1.14** | Debian 12→13 向导新增自动准备：匹配并补齐普通/cloud 内核元包，确认后完成 bookworm 全部更新；新内核尚未启动时等待手动重启，重新进入后复检继续；更新后再检查剩余包来源，保留独立准备日志与备份；新增失败路径和内核识别测试。 |
 | **V0.1.13** | TCP 调优、独立校准及性能验证结束显示结果汇总并保存 summary.txt；开荒性能步骤按 Enter 后才进入最终体检，独立菜单保持一次确认；区分估计带宽与实测结果，失败或未验证明确标记；新增报告和暂停流程回归测试。 |
 | **V0.1.12** | 日常及开荒更新记录并对比 systemd 失败单元；已有故障明确警告但不误判本次更新失败，新增故障、状态读取异常及 APT/dpkg、SSH 配置错误仍阻止继续；独立健康检查和大版本升级保持严格检查；新增 20 项回归测试。 |

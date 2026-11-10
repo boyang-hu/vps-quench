@@ -2,7 +2,7 @@
 # 由 build.sh 从 src/ 生成；请修改模块源码后重新构建发行脚本。
 
 # ============================================================
-#  Quench V0.1.14 — VPS 初始化与管理工具
+#  Quench V0.1.15 — VPS 初始化与管理工具
 #  作者：Boyang
 #
 #  项目说明：
@@ -13,6 +13,7 @@
 #  - 提供受控的系统/软件包更新与独立 Debian 大版本升级向导（不自动重启）
 #
 #  发布版本：
+#  V0.1.15: 修复用户改名将 cloud-init LVM 扩容设备路径误判为旧用户名的问题，保留磁盘配置；公钥缺失、为空或校验失败时给出明确修复入口；补充真实公钥解析及改名回归测试。
 #  V0.1.14: Debian 12→13 向导自动准备 bookworm：识别并补齐匹配内核元包、确认后执行完整更新；核对目标内核与运行状态，等待手动重启后复检继续；更新后再检查剩余包来源，保留分阶段日志及备份。
 #  V0.1.13: TCP 调优结束显示并保存结果报告，汇总吞吐、重传、扫描结论和运行参数；开荒性能步骤按 Enter 后继续，失败/未验证明确标记，补充报告与暂停流程回归测试。
 #  V0.1.12: 日常及开荒更新对比更新前后 systemd 失败单元，已有故障保留警告但不误判本次升级失败；新增故障和状态读取异常仍阻止继续，保留 APT/dpkg 与 SSH 检查；补充 20 项服务状态回归测试。
@@ -619,7 +620,7 @@ vis_len() {
 BOX_W=64
 UI_COMPACT=0
 APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
-APP_VERSION="V0.1.14"
+APP_VERSION="V0.1.15"
 APP_AUTHOR="Boyang"
 
 # 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、
@@ -2904,11 +2905,26 @@ class Rename:
     def keys(self, account):
         home = self.p(account['home'])
         self.plain(home, directory=True)
-        self.plain(home / '.ssh', directory=True)
+        sshdir = home / '.ssh'
         key = home / '.ssh/authorized_keys'
+        hint = ('本改名向导要求目标账号已有可用公钥。请返回“用户管理 → 5 管理用户公钥”，'
+                '为 %s 添加你自己的公钥，用该账号另开 SSH 会话验证登录后退出，再从独立维护账号重试；'
+                '不会自动复制 root/临时账号的公钥或开启密码登录。' % account['name'])
+        if (not sshdir.exists() and not sshdir.is_symlink()) or (not key.exists() and not key.is_symlink()):
+            raise RenameError('目标账号 %s 缺少公钥文件 %s。%s' % (account['name'], key, hint))
+        self.plain(sshdir, directory=True)
         self.plain(key)
-        self.run('ssh-keygen', '-l', '-f', str(key))
-        return hashlib.sha256(key.read_bytes()).hexdigest()
+        data = key.read_bytes()
+        if not any(line.strip() and not line.lstrip().startswith(b'#') for line in data.splitlines()):
+            raise RenameError('目标账号 %s 的公钥文件为空或只有注释：%s。%s' % (account['name'], key, hint))
+        try:
+            self.run('ssh-keygen', '-l', '-f', str(key))
+        except RenameError:
+            raise RenameError('无法校验目标账号 %s 的有效 SSH 公钥：%s；请检查公钥是否完整、格式是否正确以及文件是否可读。%s'
+                              % (account['name'], key, hint)) from None
+        if key.read_bytes() != data:
+            raise RenameError('校验期间公钥文件发生变化，请重新检查后重试：' + str(key))
+        return hashlib.sha256(data).hexdigest()
 
     def home_owner(self, home, uid):
         s = self.plain(self.p(home), directory=True)
@@ -2970,6 +2986,27 @@ class Rename:
             raise RenameError('邮箱发生变化，请人工处理，不会覆盖邮件')
         if paths[0] == source:
             os.rename(source, target)
+
+    @staticmethod
+    def cloud_storage_command(line):
+        # Recognize only an argv-style LVM expansion. Do not exempt arbitrary
+        # lines containing /dev/<old>/..., shell commands or additional argv.
+        match = re.fullmatch(r'\s*-\s*\[([^\[\]\r\n]*)\]\s*(?:#.*)?', line.rstrip('\r\n'))
+        if not match:
+            return False
+        args = []
+        for field in match[1].split(','):
+            value = field.strip()
+            if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+                value = value[1:-1]
+            # No YAML escapes, shell expansion, tags or nested structures.
+            if not re.fullmatch(r'[A-Za-z0-9_./+%=-]+', value):
+                return False
+            args.append(value)
+        return (len(args) == 4 and args[0] in ('lvextend', '/sbin/lvextend', '/usr/sbin/lvextend')
+                and args[1:3] == ['-l', '+100%FREE']
+                and bool(re.fullmatch(r'/dev/[A-Za-z0-9_+.-]+/[A-Za-z0-9_+.-]+', args[3]))
+                and all(part not in ('.', '..') for part in args[3].split('/')[2:]))
 
     def references(self, old, new, group=False, skip=None):
         """Only simple ALL sudo rules and cloud-init default_user.name migrate.
@@ -3050,7 +3087,10 @@ class Rename:
                 distro_value = rel.startswith('/etc/cloud/') and old == 'debian' and (
                     re.fullmatch(r'distro:\s*[\'\"]?debian[\'\"]?\s*(?:#.*)?', stripped) or
                     re.fullmatch(r'(?:-\s*)?(?:uri|primary|security):\s*[\'\"]?https?://(?:deb|security|archive)\.debian\.org/debian(?:-security)?/?[\'\"]?\s*(?:#.*)?', stripped))
-                if active and token.search(line) and changed == line and not distro_value:
+                cloud_file = rel.startswith('/etc/cloud/') or rel in (
+                    '/var/lib/cloud/instance/user-data.txt', '/var/lib/cloud/instance/vendor-data.txt')
+                storage_command = cloud_file and self.cloud_storage_command(line)
+                if active and token.search(line) and changed == line and not distro_value and not storage_command:
                     blocked.append('%s:%s 引用了旧用户名' % (rel, number))
                 output.append(changed)
             candidate = ''.join(output).encode()
@@ -3540,6 +3580,7 @@ quench_user_rename_menu() {
     while true; do
         print_header "用户改名向导 · 保留 UID/GID"
         ui_hint "无 root SSH：2 准备临时账号 → 切换登录 → 1 改名 → 用新名字登录 → 3 清理"
+        ui_hint "被改名账号须先有可用 SSH 公钥；可在用户管理 → 5 管理用户公钥中添加并验证登录"
         ui_hint "不修改 root，不强杀进程，不开启 root SSH 或密码登录；备份/记录：/var/lib/quench/user-rename"
         menu_item 1 "修改用户名（独立维护会话）"
         menu_item 2 "准备临时维护账号"

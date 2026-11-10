@@ -6,6 +6,7 @@ import io
 import os
 import pathlib
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -198,6 +199,60 @@ class Tests(unittest.TestCase):
         self.e.apply(ident, 'root')
         self.assertEqual(self.e.account('boyang')['home'], '/home/alice')
 
+    def test_missing_or_empty_keys_explain_next_step_without_mutation(self):
+        key = self.e.p('/home/alice/.ssh/authorized_keys')
+        for content in (None, '', '\n # comment only\n\t\n'):
+            with self.subTest(content=content):
+                if content is None:
+                    key.unlink()
+                else:
+                    key.write_text(content)
+                with self.assertRaisesRegex(RenameError, '管理用户公钥'):
+                    self.plan()
+                self.assertIsNone(self.e.entry('boyang'))
+                self.assertEqual(self.e.records(), [])
+        key.unlink()
+        key.parent.rmdir()
+        with self.assertRaisesRegex(RenameError, '缺少公钥文件'):
+            self.plan()
+
+    @unittest.skipUnless(shutil.which('ssh-keygen'), 'needs real OpenSSH parser')
+    def test_real_key_parser_and_actionable_invalid_key_message(self):
+        pair = pathlib.Path(self.tmp.name) / 'test-key'
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(pair)], check=True)
+        original = self.e.fake_run
+        def real_parser(args):
+            if args[0] == 'ssh-keygen':
+                return Rename.run(self.e, *args)
+            return original(args)
+        key = self.e.p('/home/alice/.ssh/authorized_keys')
+        with patch.object(self.e, 'fake_run', side_effect=real_parser):
+            for data in (pair.with_suffix('.pub').read_text(),
+                         'restrict,command="echo hello" ' + pair.with_suffix('.pub').read_text()):
+                key.write_text(data)
+                self.e.keys(self.e.account('alice'))
+            key.write_text('not-a-public-key\n')
+            with self.assertRaisesRegex(RenameError, '公钥是否完整') as caught:
+                self.plan()
+            self.assertNotIn('not-a-public-key', str(caught.exception))
+            self.assertIsNone(self.e.entry('boyang'))
+
+    def test_linked_key_is_still_rejected(self):
+        key = self.e.p('/home/alice/.ssh/authorized_keys')
+        key.unlink()
+        key.symlink_to(self.e.p('/etc/passwd'))
+        with self.assertRaisesRegex(RenameError, '符号链接'):
+            self.plan()
+
+    def test_key_change_during_validation_refused(self):
+        def replace_key(args):
+            if args[0] == 'ssh-keygen':
+                self.e.put('/home/alice/.ssh/authorized_keys', 'changed while validating\n', 0o600)
+        self.e.hook = replace_key
+        with self.assertRaisesRegex(RenameError, '校验期间公钥文件发生变化'):
+            self.plan()
+        self.assertEqual(self.e.records(), [])
+
     def test_shared_primary_group_not_renamed(self):
         rows = self.e.rows('group')
         next(r for r in rows if r[0] == 'alice')[3] = 'someone'
@@ -340,6 +395,51 @@ class Tests(unittest.TestCase):
         self.assertIn('name: boyang', text)
         self.assertIn('distro: debian', text)
         self.assertIn('https://deb.debian.org/debian', text)
+
+    def test_cloud_lvm_device_name_is_not_a_user_reference(self):
+        for rel in ('/var/lib/cloud/instance/user-data.txt', '/var/lib/cloud/instance/vendor-data.txt',
+                    '/etc/cloud/cloud.cfg.d/disk.cfg'):
+            for command in ('- [ lvextend, -l, +100%FREE, /dev/debian/root ]',
+                            '- [ "lvextend", "-l", "+100%FREE", "/dev/debian/root" ]',
+                            "- [ '/sbin/lvextend', '-l', '+100%FREE', '/dev/debian/root' ]"):
+                with self.subTest(rel=rel, command=command):
+                    data = '#cloud-config\nbootcmd:\n  ' + command + '\n'
+                    self.e.put(rel, data)
+                    patches, inventory = self.e.references('debian', 'boyang')
+                    self.assertFalse(any(p['path'] == rel for p in patches))
+                    self.assertIn(rel, inventory)
+                    self.assertEqual(self.e.p(rel).read_text(), data)
+
+    def test_lvm_exception_does_not_hide_real_user_references(self):
+        rel = '/var/lib/cloud/instance/user-data.txt'
+        for line in ('- [ su, debian, -c, /dev/debian/root ]',
+                     '- lvextend -l +100%FREE /dev/debian/root; su debian',
+                     '- [ lvextend, -l, +100%FREE, /dev/debian/root, debian ]',
+                     '- [ lvextend, -l, +100%FREE, /dev/debian/root/../../home/debian ]',
+                     '- [ lvextend, -l, +100%FREE, /home/debian/root ]',
+                     '- [ lvextend, -l, +100%FREE, "/dev/debian/$(id)" ]',
+                     '- name: debian', 'owner: debian:debian', 'path: /home/debian/start.sh'):
+            with self.subTest(line=line):
+                self.e.put(rel, 'bootcmd:\n  - [ lvextend, -l, +100%FREE, /dev/debian/root ]\n  ' + line + '\n')
+                with self.assertRaisesRegex(RenameError, '引用了旧用户名'):
+                    self.e.references('debian', 'boyang')
+
+    def test_lvm_command_not_exempt_outside_cloud_config(self):
+        self.e.put('/etc/cron.d/storage', '- [ lvextend, -l, +100%FREE, /dev/alice/root ]\n')
+        with self.assertRaisesRegex(RenameError, '引用了旧用户名'):
+            self.plan()
+
+    def test_lvm_record_is_preserved_and_edits_invalidate_plan(self):
+        rel = '/var/lib/cloud/instance/user-data.txt'
+        data = '#cloud-config\nbootcmd:\n  - [ lvextend, -l, +100%FREE, /dev/alice/root ]\n'
+        self.e.put(rel, data)
+        ident = self.plan()
+        self.e.put(rel, data + '# changed during confirmation\n')
+        with self.assertRaisesRegex(RenameError, '配置变化'):
+            self.e.apply(ident, 'root')
+        self.e.put(rel, data)
+        self.e.apply(ident, 'root')
+        self.assertEqual(self.e.p(rel).read_text(), data)
 
     def test_subid_lock_not_stolen(self):
         ident = self.plan()
