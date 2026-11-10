@@ -2587,17 +2587,23 @@ t_review_010() {
     review_setup stop_during_restore
     eval "$REAL_STOP"
     QUENCH_RESTORE_WAIT=15
-    SCRIPT="$PROBE/rollback.sh"; : > "$SCRIPT"; : > "$SCRIPT.restoring"
-    ( bash -c 'trap "" TERM; sleep 6; : > "$1"' _ "$PROBE/done" >/dev/null 2>&1 & echo $! > "$PROBE/pid" )
+    SCRIPT="$PROBE/rollback.sh"; : > "$SCRIPT"
+    # Publish readiness from the child only after its TERM trap is installed,
+    # matching the real rollback protocol. The parent must not race startup.
+    ( bash -c 'trap "" TERM; : > "$2"; sleep 6; : > "$1"' _ "$PROBE/done" "$SCRIPT.restoring" >/dev/null 2>&1 & echo $! > "$PROBE/pid" )
     PID=$(cat "$PROBE/pid")
+    for I in $(seq 1 100); do [ ! -e "$SCRIPT.restoring" ] || break; sleep 0.1; done
+    [ -e "$SCRIPT.restoring" ] || { echo "restore fixture never became ready" >&2; exit 1; }
     RC=0
     safety_stop_timer_process "" "$PID" "$SCRIPT" || RC=$?
     [ "$RC" -eq 0 ] || { echo "stop returned $RC for a process that finished on its own" >&2; exit 1; }
     [ -e "$PROBE/done" ] || { echo "the restoring process was killed instead of waited for" >&2; exit 1; }
     # 没有标记 = 还在倒计时：照旧可以强制停止
     rm -f "$SCRIPT.restoring" "$PROBE/done"
-    ( bash -c 'trap "" TERM; sleep 6; : > "$1"' _ "$PROBE/done" >/dev/null 2>&1 & echo $! > "$PROBE/pid" )
+    ( bash -c 'trap "" TERM; : > "$2"; sleep 6; : > "$1"' _ "$PROBE/done" "$PROBE/countdown-ready" >/dev/null 2>&1 & echo $! > "$PROBE/pid" )
     PID=$(cat "$PROBE/pid")
+    for I in $(seq 1 100); do [ ! -e "$PROBE/countdown-ready" ] || break; sleep 0.1; done
+    [ -e "$PROBE/countdown-ready" ] || { echo "countdown fixture never became ready" >&2; exit 1; }
     RC=0
     safety_stop_timer_process "" "$PID" "$SCRIPT" || RC=$?
     [ "$RC" -eq 0 ] || { echo "stop returned $RC for a countdown process" >&2; exit 1; }
