@@ -633,7 +633,7 @@ sys.exit(1 if problems else 0)
 }
 
 # Discover by content, not vendor filename. Only whole, regular files containing
-# flat disabling switches (and optional no-reboot policy) can be taken over.
+# flat disabling switches (and optional no-reboot/root-zero entries) can be taken over.
 # Unknown syntax, includes and mixed administrator settings stay untouched;
 # real APT candidate validation remains authoritative about effective policy.
 system_update_auto_templates_scan() {
@@ -642,6 +642,10 @@ import pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 periodic = re.compile(r'APT::Periodic::(Enable|Update-Package-Lists|Download-Upgradeable-Packages|Unattended-Upgrade|AutocleanInterval)\s+"0"\s*;\s*(?://.*)?', re.I)
 no_reboot = re.compile(r'Unattended-Upgrade::Automatic-Reboot\s+"(?:false|no|0)"\s*;\s*(?://.*)?', re.I)
+# Some image templates append this scalar. It is not the periodic switch and
+# does not disable its child options. Permit it only alongside real disabling
+# settings; a standalone root value never makes a file eligible for removal.
+root_zero = re.compile(r'Unattended-Upgrade\s+"0"\s*;\s*(?://.*)?', re.I)
 required = {'enable', 'update-package-lists', 'unattended-upgrade'}
 try:
     parts = root / 'apt.conf.d'
@@ -666,7 +670,7 @@ try:
             match = periodic.fullmatch(line)
             if match:
                 disables_required |= match[1].lower() in required
-            elif not no_reboot.fullmatch(line):
+            elif not (no_reboot.fullmatch(line) or root_zero.fullmatch(line)):
                 other.append(number)
         # Download/cleanup disabled alone, or no-reboot alone, is not a
         # conflicting template. Never discard it just because it looks familiar.

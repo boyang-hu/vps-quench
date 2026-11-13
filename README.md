@@ -1,4 +1,4 @@
-# Quench — VPS 初始化与管理工具 V0.1.15
+# Quench — VPS 初始化与管理工具 V0.1.16
 
 > 首次开荒 · 用户与 SSH · Fail2ban · Firewall · BBR/FQ · DNS · Caddy 网站入口 · 系统与服务管理
 
@@ -28,24 +28,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 适合不能访问 GitHub 的中国内地 VPS。先在一台可以访问 GitHub 的电脑或跳板机下载：
 
 ```bash
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.15/quench-offline-V0.1.15.tar.gz
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.15/quench-offline-V0.1.15.tar.gz.sha256
-sha256sum -c quench-offline-V0.1.15.tar.gz.sha256
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.16/quench-offline-V0.1.16.tar.gz
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.16/quench-offline-V0.1.16.tar.gz.sha256
+sha256sum -c quench-offline-V0.1.16.tar.gz.sha256
 ```
 
 再通过 `scp`、SFTP 或 WinSCP 将两个文件传到 VPS。Linux/macOS 示例：
 
 ```bash
-scp quench-offline-V0.1.15.tar.gz* root@你的VPS地址:/root/
+scp quench-offline-V0.1.16.tar.gz* root@你的VPS地址:/root/
 ```
 
 登录 VPS 后离线安装：
 
 ```bash
 cd /root
-sha256sum -c quench-offline-V0.1.15.tar.gz.sha256
-tar -xzf quench-offline-V0.1.15.tar.gz
-cd quench-offline-V0.1.15
+sha256sum -c quench-offline-V0.1.16.tar.gz.sha256
+tar -xzf quench-offline-V0.1.16.tar.gz
+cd quench-offline-V0.1.16
 bash install.sh
 v
 ```
@@ -115,7 +115,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
  ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.15  ·  Boyang
+  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.16  ·  Boyang
 ────────────────────────────────────────────────────────────────
   SSH · BBR · DNS · Caddy · Firewall · NFT · Docker
 
@@ -574,7 +574,7 @@ Debian 日常更新及开荒更新会在安装依赖前记录 systemd 失败单�
 
 软件包安装可能重启服务，配置文件冲突由管理员选择，正式升级不全局使用 `-y` 或强制覆盖现有配置。不会自动重启服务器；没有 `reboot-required` 标记也不代表一定无需重启。容器镜像、1Panel 自身、Quench 脚本以及手动安装的二进制不属于 APT 包更新范围，请使用各自管理入口。
 
-**自动安全更新的配置冲突处理（Debian/systemd）：** 启用前按内容扫描 `apt.conf.d` 下符合 APT 文件名规则的配置及主配置 `apt.conf`，不依赖厂商文件名（包括 `99-template-no-auto-upgrades`、`99zz-ppflight-no-auto-upgrades` 等）。只有普通文件、仅包含已识别的平铺式 `APT::Periodic::* "0";` 禁用开关及可选的禁止自动重启设置，并且确实关闭周期总开关、索引刷新或自动更新之一，才会列入接管清单；确认后备份到本次记录的 `templates-before/` 并移出生效配置。仅禁止重启/自动清理的文件保留；混有代理、安装钩子、其他策略的文件不自动移除，符号链接和未知语法不接管。确认期间或安装依赖后，清单或文件内容有变化则停止，要求重新预览。
+**自动安全更新的配置冲突处理（Debian/systemd）：** 启用前按内容扫描 `apt.conf.d` 下符合 APT 文件名规则的配置及主配置 `apt.conf`，不依赖厂商文件名（包括 `99-template-no-auto-upgrades`、`99zz-ppflight-no-auto-upgrades` 等）。只有普通文件、仅包含已识别的平铺式 `APT::Periodic::* "0";` 禁用开关及可选的禁止自动重启设置、`Unattended-Upgrade "0";` 根节点赋值，并且确实关闭周期总开关、索引刷新或自动更新之一，才会列入接管清单；确认后备份到本次记录的 `templates-before/` 并移出生效配置。根节点赋值本身不是定时更新开关，单独出现时不会触发接管。仅禁止重启/自动清理的文件保留；混有代理、安装钩子、其他策略的文件不自动移除，符号链接和未知语法不接管。确认期间或安装依赖后，清单或文件内容有变化则停止，要求重新预览。
 
 候选配置由 APT 实际加载验证，检查周期总开关、索引刷新、安全更新来源、禁止重启与自动清理策略；错误列出具体键值及相关文件。同时检查 `unattended-upgrades.service`、两个 `apt-daily*` service 和 timer 的屏蔽状态。上述变更需再次确认，取消不会安装依赖或改服务状态；失败时尝试恢复本次配置及服务变更，不覆盖外部改动，不终止运行中的 APT/dpkg 任务，也不卸载本次安装的软件包。
 
@@ -762,6 +762,7 @@ BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-me
 
 | 版本 | Quench 主要变更 |
 |------|----------------|
+| **V0.1.16** | 自动安全更新兼容禁用模板中的 `Unattended-Upgrade "0";` 根节点赋值，确认后备份接管；单独根节点赋值及混有其他策略的文件保留；补充识别边界、失败恢复与真实 APT 候选配置测试。 |
 | **V0.1.15** | 修复用户改名将 cloud-init LVM 扩容设备路径误判为旧用户名的问题，磁盘配置保持原样；公钥缺失、为空或校验失败时提示目标账号、路径和处理入口；新增真实公钥解析及改名回归测试。 |
 | **V0.1.14** | Debian 12→13 向导新增自动准备：匹配并补齐普通/cloud 内核元包，确认后完成 bookworm 全部更新；新内核尚未启动时等待手动重启，重新进入后复检继续；更新后再检查剩余包来源，保留独立准备日志与备份；新增失败路径和内核识别测试。 |
 | **V0.1.13** | TCP 调优、独立校准及性能验证结束显示结果汇总并保存 summary.txt；开荒性能步骤按 Enter 后才进入最终体检，独立菜单保持一次确认；区分估计带宽与实测结果，失败或未验证明确标记；新增报告和暂停流程回归测试。 |

@@ -400,6 +400,13 @@ t_auto_templates_scan() {
         'APT::Periodic::Unattended-Upgrade "0";' 'Unattended-Upgrade::Automatic-Reboot "false";' > "$FILE"
     case "$1" in
         vendor) : ;;
+        root_zero) echo 'Unattended-Upgrade "0";' >> "$FILE" ;;
+        root_zero_comments) echo '  unattended-upgrade  "0" ; // image template' >> "$FILE" ;;
+        root_zero_only) echo 'Unattended-Upgrade "0";' > "$FILE" ;;
+        root_one) echo 'Unattended-Upgrade "1";' >> "$FILE" ;;
+        root_false) echo 'Unattended-Upgrade "false";' >> "$FILE" ;;
+        root_zero_hook) printf '%s\n' 'Unattended-Upgrade "0";' 'DPkg::Post-Invoke { "echo keep"; };' >> "$FILE" ;;
+        root_zero_inline) echo 'Unattended-Upgrade "0"; Acquire::Retries "3";' >> "$FILE" ;;
         multiple)
             cp "$FILE" "$PARTS/80-image.conf"
             cp "$FILE" "$QUENCH_UPDATE_APT_DIR/apt.conf" ;;
@@ -430,19 +437,19 @@ t_auto_templates_scan() {
             ln -s "$QUENCH_TEST_UPDATE_CASE/parts" "$PARTS" ;;
     esac
     case "$1" in
-        mixed|hook|include|clear|reboot_true|enable_true|linked_dir)
+        mixed|hook|include|clear|reboot_true|enable_true|linked_dir|root_one|root_false|root_zero_hook|root_zero_inline)
             assert_fail system_update_auto_templates_scan ;;
         *)
             OUT=$(system_update_auto_templates_scan) || fail 'scan failed'
             case "$1" in
-                vendor|comments) assert_eq "$OUT" 'apt.conf.d/99zz-ppflight-no-auto-upgrades' ;;
+                vendor|comments|root_zero|root_zero_comments) assert_eq "$OUT" 'apt.conf.d/99zz-ppflight-no-auto-upgrades' ;;
                 multiple) assert_eq "$OUT" $'apt.conf.d/80-image.conf\napt.conf.d/99zz-ppflight-no-auto-upgrades\napt.conf' ;;
                 *) assert_eq "$OUT" '' ;;
             esac ;;
     esac
     :
 }
-for CASE in vendor multiple comments no_reboot_only optional_only mixed hook include clear reboot_true enable_true nested ignored managed symlink linked_dir; do
+for CASE in vendor root_zero root_zero_comments root_zero_only root_one root_false root_zero_hook root_zero_inline multiple comments no_reboot_only optional_only mixed hook include clear reboot_true enable_true nested ignored managed symlink linked_dir; do
     run_test "Automatic update template discovery: $CASE" t_auto_templates_scan "$CASE"
 done
 
@@ -495,7 +502,7 @@ t_auto_enable() {
     local PARTS="$QUENCH_UPDATE_APT_DIR/apt.conf.d" UNIT STATE FILE RC=0
     printf '%s\n' 'APT::Periodic::Enable "0";' 'APT::Periodic::Update-Package-Lists "0";' \
         'APT::Periodic::Unattended-Upgrade "0";' 'APT::Periodic::Download-Upgradeable-Packages "0";' \
-        'APT::Periodic::AutocleanInterval "0";' > "$PARTS/99-template-no-auto-upgrades"
+        'APT::Periodic::AutocleanInterval "0";' 'Unattended-Upgrade "0";' > "$PARTS/99-template-no-auto-upgrades"
     echo '// original periodic' > "$PARTS/20auto-upgrades"
     echo '// original quench policy' > "$PARTS/52quench-unattended-upgrades"
     for UNIT in apt-daily.service apt-daily-upgrade.service unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer; do

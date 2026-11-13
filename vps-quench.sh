@@ -2,7 +2,7 @@
 # 由 build.sh 从 src/ 生成；请修改模块源码后重新构建发行脚本。
 
 # ============================================================
-#  Quench V0.1.15 — VPS 初始化与管理工具
+#  Quench V0.1.16 — VPS 初始化与管理工具
 #  作者：Boyang
 #
 #  项目说明：
@@ -13,6 +13,7 @@
 #  - 提供受控的系统/软件包更新与独立 Debian 大版本升级向导（不自动重启）
 #
 #  发布版本：
+#  V0.1.16: 自动安全更新兼容禁用模板中的 Unattended-Upgrade 根节点零值，确认后按原流程备份接管；单独根节点赋值及混合策略仍保留；补充识别、恢复与真实 APT 候选配置测试。
 #  V0.1.15: 修复用户改名将 cloud-init LVM 扩容设备路径误判为旧用户名的问题，保留磁盘配置；公钥缺失、为空或校验失败时给出明确修复入口；补充真实公钥解析及改名回归测试。
 #  V0.1.14: Debian 12→13 向导自动准备 bookworm：识别并补齐匹配内核元包、确认后执行完整更新；核对目标内核与运行状态，等待手动重启后复检继续；更新后再检查剩余包来源，保留分阶段日志及备份。
 #  V0.1.13: TCP 调优结束显示并保存结果报告，汇总吞吐、重传、扫描结论和运行参数；开荒性能步骤按 Enter 后继续，失败/未验证明确标记，补充报告与暂停流程回归测试。
@@ -620,7 +621,7 @@ vis_len() {
 BOX_W=64
 UI_COMPACT=0
 APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
-APP_VERSION="V0.1.15"
+APP_VERSION="V0.1.16"
 APP_AUTHOR="Boyang"
 
 # 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、
@@ -17757,7 +17758,7 @@ sys.exit(1 if problems else 0)
 }
 
 # Discover by content, not vendor filename. Only whole, regular files containing
-# flat disabling switches (and optional no-reboot policy) can be taken over.
+# flat disabling switches (and optional no-reboot/root-zero entries) can be taken over.
 # Unknown syntax, includes and mixed administrator settings stay untouched;
 # real APT candidate validation remains authoritative about effective policy.
 system_update_auto_templates_scan() {
@@ -17766,6 +17767,10 @@ import pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 periodic = re.compile(r'APT::Periodic::(Enable|Update-Package-Lists|Download-Upgradeable-Packages|Unattended-Upgrade|AutocleanInterval)\s+"0"\s*;\s*(?://.*)?', re.I)
 no_reboot = re.compile(r'Unattended-Upgrade::Automatic-Reboot\s+"(?:false|no|0)"\s*;\s*(?://.*)?', re.I)
+# Some image templates append this scalar. It is not the periodic switch and
+# does not disable its child options. Permit it only alongside real disabling
+# settings; a standalone root value never makes a file eligible for removal.
+root_zero = re.compile(r'Unattended-Upgrade\s+"0"\s*;\s*(?://.*)?', re.I)
 required = {'enable', 'update-package-lists', 'unattended-upgrade'}
 try:
     parts = root / 'apt.conf.d'
@@ -17790,7 +17795,7 @@ try:
             match = periodic.fullmatch(line)
             if match:
                 disables_required |= match[1].lower() in required
-            elif not no_reboot.fullmatch(line):
+            elif not (no_reboot.fullmatch(line) or root_zero.fullmatch(line)):
                 other.append(number)
         # Download/cleanup disabled alone, or no-reboot alone, is not a
         # conflicting template. Never discard it just because it looks familiar.

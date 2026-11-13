@@ -70,9 +70,20 @@ grep -q '/dists/trixie-security/' "$QUENCH_TEST_APT_ROOT/cloud-uris"
 # not merely grep the two files Quench writes. Nothing is written to host /etc.
 mkdir -p "$QUENCH_UPDATE_APT_DIR/apt.conf.d"
 printf '%s\n' 'APT::Periodic::Enable "0";' 'APT::Periodic::Update-Package-Lists "0";' \
-    'APT::Periodic::Unattended-Upgrade "0";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
+    'APT::Periodic::Download-Upgradeable-Packages "0";' 'APT::Periodic::Unattended-Upgrade "0";' \
+    'APT::Periodic::AutocleanInterval "0";' 'Unattended-Upgrade "0";' > "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
+cp "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades" "$QUENCH_TEST_APT_ROOT/template-before"
 system_update_auto_templates_scan > "$QUENCH_TEST_APT_ROOT/templates.list"
 system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-good" "$QUENCH_TEST_APT_ROOT/templates.list"
+cmp "$QUENCH_TEST_APT_ROOT/template-before" "$QUENCH_UPDATE_APT_DIR/apt.conf.d/99-template-no-auto-upgrades"
+APT_CONFIG="$QUENCH_TEST_APT_ROOT/auto-good/bootstrap" python3 - <<'PY'
+import apt_pkg
+apt_pkg.init_config()
+assert apt_pkg.config.find('Unattended-Upgrade') != '0'
+assert apt_pkg.config.find('APT::Periodic::Enable') == '1'
+assert apt_pkg.config.find('APT::Periodic::Unattended-Upgrade') == '1'
+assert not apt_pkg.config.find_b('Unattended-Upgrade::Automatic-Reboot', True)
+PY
 : > "$QUENCH_TEST_APT_ROOT/no-templates.list"
 if system_update_auto_candidate_check "$QUENCH_TEST_APT_ROOT/auto-disabled" "$QUENCH_TEST_APT_ROOT/no-templates.list"; then
     echo 'Real APT ignored the late template override' >&2; exit 1
