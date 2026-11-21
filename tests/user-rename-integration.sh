@@ -22,9 +22,14 @@ chmod 440 /etc/sudoers.d/90-quench-test-original
 printf '%s\n' 'system_info:' '  distro: debian' '  default_user:' '    name: quench-original' > /etc/cloud/cloud.cfg
 # This cloud-init cache is only scanned, never executed. Its device path must
 # survive a real account rename byte-for-byte even when the VG matches the user.
-mkdir -p /var/lib/cloud/instance
+mkdir -p /var/lib/cloud/instances/i-quench-test
+ln -s instances/i-quench-test /var/lib/cloud/instance
 printf '%s\n' '#cloud-config' 'bootcmd:' '  - [ lvextend, -l, +100%FREE, /dev/quench-original/root ]' > "$WORK/user-data.txt"
 cp "$WORK/user-data.txt" /var/lib/cloud/instance/user-data.txt
+printf '%s\n' '#cloud-config' 'chpasswd:' '  expire: false' '  users:' \
+    '    - name: quench-original' '      password: "fixture-only-not-applied"' '      type: text' > "$WORK/vendor-data.txt"
+cp "$WORK/vendor-data.txt" /var/lib/cloud/instance/vendor-data.txt
+chmod 600 /var/lib/cloud/instance/vendor-data.txt
 ORIGINAL_UID=$(id -u quench-original)
 ORIGINAL_GID=$(id -g quench-original)
 ORIGINAL_SHADOW=$(getent shadow quench-original | cut -d: -f2-)
@@ -47,6 +52,9 @@ cmp "$WORK/key.pub" /home/quench-renamed/.ssh/authorized_keys
 runuser -u quench-renamed -- sudo -n true
 grep -q 'name: quench-renamed' /etc/cloud/cloud.cfg
 cmp "$WORK/user-data.txt" /var/lib/cloud/instance/user-data.txt
+test -L /var/lib/cloud/instance
+sed 's/name: quench-original/name: quench-renamed/' "$WORK/vendor-data.txt" > "$WORK/vendor-expected.txt"
+cmp "$WORK/vendor-expected.txt" /var/lib/cloud/instance/vendor-data.txt
 quench_rename_engine temp-clean "$MAINT_RECORD" quench-renamed
 if getent passwd "$MAINT_USER" >/dev/null; then echo 'Temporary user survived cleanup' >&2; exit 1; fi
 if getent group "$MAINT_USER" >/dev/null; then echo 'Temporary group survived cleanup' >&2; exit 1; fi

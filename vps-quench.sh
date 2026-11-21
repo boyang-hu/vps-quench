@@ -2,7 +2,7 @@
 # 由 build.sh 从 src/ 生成；请修改模块源码后重新构建发行脚本。
 
 # ============================================================
-#  Quench V0.1.16 — VPS 初始化与管理工具
+#  Quench V0.1.17 — VPS 初始化与管理工具
 #  作者：Boyang
 #
 #  项目说明：
@@ -13,6 +13,7 @@
 #  - 提供受控的系统/软件包更新与独立 Debian 大版本升级向导（不自动重启）
 #
 #  发布版本：
+#  V0.1.17: 用户改名支持 cloud-init chpasswd.users[].name，同步用户名并保留密码与原格式；支持标准实例目录链接且复核真实目标；补充脱敏、冲突、外部修改与失败恢复测试。
 #  V0.1.16: 自动安全更新兼容禁用模板中的 Unattended-Upgrade 根节点零值，确认后按原流程备份接管；单独根节点赋值及混合策略仍保留；补充识别、恢复与真实 APT 候选配置测试。
 #  V0.1.15: 修复用户改名将 cloud-init LVM 扩容设备路径误判为旧用户名的问题，保留磁盘配置；公钥缺失、为空或校验失败时给出明确修复入口；补充真实公钥解析及改名回归测试。
 #  V0.1.14: Debian 12→13 向导自动准备 bookworm：识别并补齐匹配内核元包、确认后执行完整更新；核对目标内核与运行状态，等待手动重启后复检继续；更新后再检查剩余包来源，保留分阶段日志及备份。
@@ -621,7 +622,7 @@ vis_len() {
 BOX_W=64
 UI_COMPACT=0
 APP_UI_TITLE="VPS INIT/MANAGEMENT TOOLS"
-APP_VERSION="V0.1.16"
+APP_VERSION="V0.1.17"
 APP_AUTHOR="Boyang"
 
 # 一屏菜单会调用本函数约 20 次。原来每次都 fork 一个 grep 判断格式、
@@ -3009,8 +3010,85 @@ class Rename:
                 and bool(re.fullmatch(r'/dev/[A-Za-z0-9_+.-]+/[A-Za-z0-9_+.-]+', args[3]))
                 and all(part not in ('.', '..') for part in args[3].split('/')[2:]))
 
+    def cloud_cache_path(self, path):
+        """Allow only cloud-init's instance -> instances/<id> directory alias."""
+        instance = self.p('/var/lib/cloud/instance')
+        if not instance.is_symlink():
+            self.plain(instance, directory=True, owned=True)
+            self.plain(path, owned=True)
+            return path
+        self.plain(instance.parent, directory=True, owned=True)
+        if instance.lstat().st_uid != self.owner:
+            raise RenameError('cloud-init 实例链接属主不安全')
+        target = instance.resolve(strict=True)
+        if target.parent != self.p('/var/lib/cloud/instances'):
+            raise RenameError('cloud-init 实例链接不在标准 instances 目录内')
+        self.plain(target.parent, directory=True, owned=True)
+        self.plain(target, directory=True, owned=True)
+        resolved = target / path.name
+        self.plain(resolved, owned=True)
+        return resolved
+
+    @staticmethod
+    def cloud_chpasswd_names(text, old, new, rel):
+        # Parse only files that might need this migration. PyYAML normally comes
+        # with cloud-init; ordinary renames do not acquire a new dependency.
+        if not re.search(r'\bchpasswd\s*:', text) or old not in text:
+            return {}
+        try:
+            import yaml
+        except ImportError:
+            raise RenameError('解析 cloud-init chpasswd 需要 python3-yaml；请安装后重试') from None
+        try:
+            # Aliases/merges can make one scalar affect multiple consumers.
+            # Never emit YAML exception text: it can contain password lines.
+            if any(isinstance(t, (yaml.tokens.AnchorToken, yaml.tokens.AliasToken)) for t in yaml.scan(text)):
+                raise ValueError()
+            root = yaml.compose(text, Loader=yaml.SafeLoader)
+            def mapping(node):
+                if not isinstance(node, yaml.MappingNode) or node.tag != 'tag:yaml.org,2002:map':
+                    raise ValueError()
+                values = {}
+                for key, value in node.value:
+                    if not isinstance(key, yaml.ScalarNode) or key.tag != 'tag:yaml.org,2002:str' or key.value in values or key.value == '<<':
+                        raise ValueError()
+                    values[key.value] = value
+                return values
+            top = mapping(root)
+            if 'chpasswd' not in top:
+                return {}
+            passwd = mapping(top['chpasswd'])
+            if 'users' not in passwd:
+                return {}
+            users = passwd['users']
+            if not isinstance(users, yaml.SequenceNode) or users.tag != 'tag:yaml.org,2002:seq':
+                raise ValueError()
+            changes, names = {}, set()
+            for entry in users.value:
+                fields = mapping(entry)
+                name = fields.get('name')
+                if not isinstance(name, yaml.ScalarNode) or name.tag != 'tag:yaml.org,2002:str':
+                    raise ValueError()
+                if name.value in names or (old != new and name.value == new):
+                    raise ValueError()
+                names.add(name.value)
+                if name.value != old:
+                    continue
+                if set(fields) - {'name', 'password', 'type'} or name.style not in (None, "'", '"'):
+                    raise ValueError()
+                if name.start_mark.line != name.end_mark.line:
+                    raise ValueError()
+                quote = name.style or ''
+                # Edits use the original scalar marks; no password is decoded,
+                # rewritten, printed or passed to chpasswd.
+                changes.setdefault(name.start_mark.line + 1, []).append(
+                    (name.start_mark.column, name.end_mark.column, quote + new + quote))
+            return changes
+        except (yaml.YAMLError, ValueError, RecursionError):
+            raise RenameError('无法安全迁移 cloud-init chpasswd.users：%s；请检查 YAML 结构、重复字段、锚点/别名或目标账号冲突（不输出敏感内容）' % rel) from None
+
     def references(self, old, new, group=False, skip=None):
-        """Only simple ALL sudo rules and cloud-init default_user.name migrate.
+        """Simple ALL sudo rules, default_user.name and chpasswd.users[].name migrate.
         Everything else naming the account in these known locations blocks.
         This is deliberately not a promise to discover arbitrary app databases.
         """
@@ -3044,6 +3122,10 @@ class Rename:
                 if path.is_symlink():
                     continue  # disabled/dangling systemd aliases
                 raise RenameError('引用扫描期间文件消失：' + rel)
+            cloud_cache = rel in ('/var/lib/cloud/instance/user-data.txt', '/var/lib/cloud/instance/vendor-data.txt')
+            if cloud_cache:
+                path = self.cloud_cache_path(path)
+                inventory['cloud-target:' + rel] = '/' + str(path.relative_to(self.root))
             if not path.is_file():
                 raise RenameError('无法扫描非普通配置：' + rel)
             if path.stat().st_size > 2 * 1024 * 1024:
@@ -3051,6 +3133,8 @@ class Rename:
             data = path.read_bytes()
             inventory[rel] = hashlib.sha256(data).hexdigest()
             text = data.decode('utf-8', errors='replace')
+            cloud_file = rel.startswith('/etc/cloud/') or cloud_cache
+            name_changes = self.cloud_chpasswd_names(text, old, new, rel) if cloud_file else {}
             if rel in ('/etc/subuid', '/etc/subgid') and old != new and any(l.split(':')[0] == new for l in text.splitlines()):
                 raise RenameError('目标名字已有 subordinate ID 分配：' + rel)
             output, cloud_indent = [], None
@@ -3068,6 +3152,8 @@ class Rename:
                     if re.match(r'(?i)^include\s', stripped) and stripped.lower() != 'include /etc/ssh/sshd_config.d/*.conf':
                         blocked.append('%s:%s 自定义 SSH Include' % (rel, number))
                 changed = line
+                for start, end, replacement in sorted(name_changes.get(number, []), reverse=True):
+                    changed = changed[:start] + replacement + changed[end:]
                 if rel in ('/etc/subuid', '/etc/subgid') and re.fullmatch(re.escape(old) + r':\d+:\d+\n?', line):
                     changed = new + line[len(old):]
                 if rel.startswith('/etc/cloud/') and active:
@@ -3088,14 +3174,19 @@ class Rename:
                 distro_value = rel.startswith('/etc/cloud/') and old == 'debian' and (
                     re.fullmatch(r'distro:\s*[\'\"]?debian[\'\"]?\s*(?:#.*)?', stripped) or
                     re.fullmatch(r'(?:-\s*)?(?:uri|primary|security):\s*[\'\"]?https?://(?:deb|security|archive)\.debian\.org/debian(?:-security)?/?[\'\"]?\s*(?:#.*)?', stripped))
-                cloud_file = rel.startswith('/etc/cloud/') or rel in (
-                    '/var/lib/cloud/instance/user-data.txt', '/var/lib/cloud/instance/vendor-data.txt')
                 storage_command = cloud_file and self.cloud_storage_command(line)
+                if number in name_changes and old != new and token.search(changed):
+                    # A flow-style line may also contain another real reference.
+                    blocked.append('%s:%s 用户名字段之外仍有旧名引用' % (rel, number))
                 if active and token.search(line) and changed == line and not distro_value and not storage_command:
                     blocked.append('%s:%s 引用了旧用户名' % (rel, number))
                 output.append(changed)
             candidate = ''.join(output).encode()
             if candidate != data:
+                try:
+                    data.decode('utf-8')
+                except UnicodeError:
+                    raise RenameError('待迁移配置不是有效 UTF-8，保留原件：' + rel) from None
                 s = self.plain(path, owned=True)
                 target = rel
                 if rel == '/etc/sudoers.d/91-quench-nopasswd-' + old:
@@ -3105,6 +3196,8 @@ class Rename:
                 patches.append({'path': rel, 'target': target, 'before': base64.b64encode(data).decode(),
                                 'after': base64.b64encode(candidate).decode(), 'mode': stat.S_IMODE(s.st_mode),
                                 'uid': s.st_uid, 'gid': s.st_gid})
+                if cloud_cache:
+                    patches[-1]['cloud_path'] = '/' + str(path.relative_to(self.root))
         for name in ('/var/spool/cron/crontabs/', '/var/lib/systemd/linger/'):
             if self.p(name + old).exists() or self.p(name + old).is_symlink():
                 blocked.append(name + old + ' 需要先人工迁移/清理')
@@ -3166,6 +3259,8 @@ class Rename:
               (account['uid'], account['gid'], account['home'], home, '是' if private else '否'))
         for patch in patches:
             print('迁移配置：%s → %s' % (patch['path'], patch['target']))
+        if any('cloud_path' in patch for patch in patches):
+            print('仅同步本机 cloud-init 缓存；供应商原始模板/seed 不会随之改动，重新初始化前需同步核对。')
         print('记录：' + rec['id'])
         return rec['id']
 
@@ -3195,8 +3290,19 @@ class Rename:
             with self.subid_lock(self.p(patch['path'])):
                 self.write_patch(patch, restore)
 
-    def write_patch(self, patch, restore=False):
+    def patch_paths(self, patch):
         src, dst = self.p(patch['path']), self.p(patch['target'])
+        if 'cloud_path' in patch:
+            if patch['path'] not in ('/var/lib/cloud/instance/user-data.txt', '/var/lib/cloud/instance/vendor-data.txt') or src != dst:
+                raise RenameError('cloud-init 配置记录路径不合法')
+            resolved = self.cloud_cache_path(src)
+            if resolved != self.p(patch['cloud_path']):
+                raise RenameError('cloud-init 实例目标已变化，保留现场')
+            src = dst = resolved
+        return src, dst
+
+    def write_patch(self, patch, restore=False):
+        src, dst = self.patch_paths(patch)
         before, after = (base64.b64decode(patch[k]) for k in ('before', 'after'))
         for path in {src, dst}:
             if path.exists() or path.is_symlink():
@@ -3226,7 +3332,8 @@ class Rename:
         if self.mailbox(expected['name'], other, expected['uid']) != rec.get('mail'):
             raise RenameError('邮箱状态验证失败')
         for patch in rec['patches']:
-            path = self.p(patch['path'] if restored else patch['target'])
+            src, dst = self.patch_paths(patch)
+            path = src if restored else dst
             wanted = base64.b64decode(patch['before'] if restored else patch['after'])
             if not path.is_file() or path.read_bytes() != wanted:
                 raise RenameError('迁移配置验证失败：' + str(path))

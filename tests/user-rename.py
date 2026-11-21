@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MODULE = (ROOT / 'src/modules/user-rename.sh').read_text()
@@ -386,6 +387,133 @@ class Tests(unittest.TestCase):
     def test_cloud_custom_user_list(self):
         self.e.put('/etc/cloud/cloud.cfg.d/custom.cfg', 'users:\n  - name: alice\n')
         with self.assertRaises(RenameError): self.plan()
+
+    def chpasswd_fixture(self, text=None, linked=False):
+        rel = '/var/lib/cloud/instance/vendor-data.txt'
+        if linked:
+            directory = self.e.p('/var/lib/cloud/instances/i-quench-test')
+            directory.mkdir(parents=True)
+            self.e.p('/var/lib/cloud/instance').symlink_to('instances/i-quench-test')
+        if text is None:
+            text = ('#cloud-config\nchpasswd:\n  expire: false\n  users:\n'
+                    '    - name: alice\n      password: "fixture-secret-do-not-log"\n      type: text\n'
+                    '    - name: someone\n      password: "unrelated-secret"\n      type: text\n')
+        self.e.put(rel, text, 0o600)
+        return rel, text
+
+    def test_chpasswd_username_only_migrates_preserving_bytes(self):
+        for linked in (False, True):
+            with self.subTest(linked=linked):
+                if linked:
+                    self.e.p('/var/lib/cloud/instance/vendor-data.txt').unlink()
+                    self.e.p('/var/lib/cloud/instance').rmdir()
+                    # Previous subtest restored the original account.
+                rel, before = self.chpasswd_fixture(linked=linked)
+                ident = self.plan()
+                self.e.apply(ident, 'root')
+                self.assertEqual(self.e.p(rel).read_text(), before.replace('name: alice', 'name: boyang'))
+                self.assertNotIn('fixture-secret', self.out.getvalue())
+                if linked:
+                    self.assertTrue(self.e.p('/var/lib/cloud/instance').is_symlink())
+                self.e.restore(self.e.load(ident))
+                self.assertEqual(self.e.p(rel).read_text(), before)
+
+    def test_chpasswd_style_variants_and_sibling_users_preserved(self):
+        for text in (
+            '#cloud-config\nchpasswd:\n  users:\n  - name: "alice" # login\n    password: "hash"\n',
+            "#cloud-config\nchpasswd: {users: [{name: 'alice', password: 'hash'}], expire: false}\n",
+            '#cloud-config\r\nchpasswd:\r\n  users:\r\n    - name: alice\r\n      password: "hash"\r\n',
+        ):
+            with self.subTest(text=text):
+                rel, _ = self.chpasswd_fixture(text)
+                ident = self.plan()
+                self.e.apply(ident, 'root')
+                self.assertEqual(self.e.p(rel).read_bytes(), text.replace('alice', 'boyang').encode())
+                self.e.restore(self.e.load(ident))
+
+    def test_chpasswd_unsafe_yaml_is_redacted_and_not_applied(self):
+        for value in (
+            'chpasswd:\n  users: [{name: alice, name: someone, password: "secret"}]\n',
+            'chpasswd:\n  users: [{name: alice}, {name: boyang}]\n',
+            'chpasswd:\n  users: [{name: alice}, {name: alice}]\n',
+            'chpasswd:\n  users: [{name: &n alice}]\nruncmd: [*n]\n',
+            'chpasswd:\n  users: [{name: alice, unsupported: secret}]\n',
+            'chpasswd:\n  users: [ {name: alice, password: "secret}\n',
+            'chpasswd: {users: [{name: alice}]}\nchpasswd: {users: []}\n',
+        ):
+            with self.subTest(value=value):
+                rel, before = self.chpasswd_fixture('#cloud-config\n' + value)
+                with self.assertRaises(RenameError) as caught:
+                    self.plan()
+                self.assertNotIn('secret', str(caught.exception))
+                self.assertEqual(self.e.p(rel).read_text(), before)
+                self.assertIsNone(self.e.entry('boyang'))
+
+    def test_chpasswd_nested_text_and_other_username_references_not_migrated(self):
+        for text in (
+            'write_files:\n- path: /tmp/test\n  content: |\n    chpasswd:\n      users:\n        - name: alice\n',
+            'chpasswd: {users: [{name: alice, password: hash}]}\nusers: [{name: alice}]\n',
+            'chpasswd: {users: [{name: alice, password: /home/alice/secret}]}\n',
+        ):
+            with self.subTest(text=text):
+                rel, before = self.chpasswd_fixture(text)
+                with self.assertRaises(RenameError): self.plan()
+                self.assertEqual(self.e.p(rel).read_text(), before)
+
+    def test_chpasswd_external_edit_or_instance_retarget_stops_before_rename(self):
+        rel, before = self.chpasswd_fixture(linked=True)
+        ident = self.plan()
+        self.e.put(rel, before + '# external edit\n')
+        with self.assertRaises(RenameError): self.e.apply(ident, 'root')
+        self.e.put(rel, before)
+        other = self.e.p('/var/lib/cloud/instances/i-quench-other')
+        other.mkdir()
+        (other / 'vendor-data.txt').write_text(before)
+        instance = self.e.p('/var/lib/cloud/instance')
+        instance.unlink()
+        instance.symlink_to('instances/i-quench-other')
+        with self.assertRaises(RenameError): self.e.apply(ident, 'root')
+        self.assertIsNone(self.e.entry('boyang'))
+
+    def test_chpasswd_escape_link_is_not_followed(self):
+        target = self.e.p('/outside-cloud')
+        target.mkdir()
+        (target / 'vendor-data.txt').write_text('chpasswd: {users: [{name: alice}]}\n')
+        link = self.e.p('/var/lib/cloud/instance')
+        link.parent.mkdir(parents=True)
+        link.symlink_to(target)
+        with self.assertRaisesRegex(RenameError, '标准 instances'):
+            self.plan()
+
+    def test_chpasswd_missing_parser_stops_with_dependency_hint(self):
+        self.chpasswd_fixture()
+        with patch.dict('sys.modules', {'yaml': None}):
+            with self.assertRaisesRegex(RenameError, 'python3-yaml'):
+                self.plan()
+        self.assertIsNone(self.e.entry('boyang'))
+
+    def test_chpasswd_rollback_preserves_original_cache_and_password(self):
+        rel, before = self.chpasswd_fixture(linked=True)
+        ident = self.plan()
+        self.e.failure = ('usermod', '-e', self.e.load(ident)['account']['shadow'][6], 'boyang')
+        with self.assertRaises(RenameError): self.e.apply(ident, 'root')
+        self.assert_original(ident)
+        self.assertEqual(self.e.p(rel).read_text(), before)
+        self.assertTrue(self.e.p('/var/lib/cloud/instance').is_symlink())
+
+    def test_chpasswd_retarget_after_apply_does_not_overwrite_other_instance(self):
+        rel, before = self.chpasswd_fixture(linked=True)
+        ident = self.plan()
+        self.e.apply(ident, 'root')
+        other = self.e.p('/var/lib/cloud/instances/i-another')
+        other.mkdir()
+        (other / 'vendor-data.txt').write_text(before)
+        link = self.e.p('/var/lib/cloud/instance')
+        link.unlink()
+        link.symlink_to('instances/i-another')
+        with self.assertRaisesRegex(RenameError, '实例目标已变化'):
+            self.e.write_patches(self.e.load(ident), restore=True)
+        self.assertEqual((other / 'vendor-data.txt').read_text(), before)
 
     def test_cloud_debian_name_does_not_change_distro(self):
         self.e.put('/etc/cloud/cloud.cfg', 'system_info:\n  distro: debian\n  default_user:\n    name: debian\n  package_mirrors:\n    - uri: https://deb.debian.org/debian\n')

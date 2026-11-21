@@ -77,7 +77,9 @@ jobs:
         run: bash tests/system-updates.sh
 
       - name: Test user rename and temporary-account failure paths
-        run: python3 tests/user-rename.py
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3-yaml
+          python3 tests/user-rename.py
 
       - name: Test real tmux upgrade handoff and reconnect
         run: |

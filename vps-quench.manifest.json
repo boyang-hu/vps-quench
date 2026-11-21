@@ -1,9 +1,9 @@
 {
   "name": "vps-quench",
-  "version": "V0.1.16",
+  "version": "V0.1.17",
   "file": "vps-quench.sh",
-  "sha256": "be6992f7ed01651de7cfffa7fa53de0924358c0c202e78f041468d9ad2642fd9",
-  "generated_at": "2026-11-13T19:09:46Z",
+  "sha256": "ad59ed61f986439e04f781a18f42048c678e3402ad15a16eb6bce9f10117b202",
+  "generated_at": "2026-11-21T18:59:27Z",
   "urls": [
     "https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/heads/main/vps-quench.sh",
     "https://github.com/boyang-hu/vps-quench/raw/refs/heads/main/vps-quench.sh",

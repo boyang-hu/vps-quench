@@ -1,4 +1,4 @@
-# Quench — VPS 初始化与管理工具 V0.1.16
+# Quench — VPS 初始化与管理工具 V0.1.17
 
 > 首次开荒 · 用户与 SSH · Fail2ban · Firewall · BBR/FQ · DNS · Caddy 网站入口 · 系统与服务管理
 
@@ -28,24 +28,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 适合不能访问 GitHub 的中国内地 VPS。先在一台可以访问 GitHub 的电脑或跳板机下载：
 
 ```bash
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.16/quench-offline-V0.1.16.tar.gz
-curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.16/quench-offline-V0.1.16.tar.gz.sha256
-sha256sum -c quench-offline-V0.1.16.tar.gz.sha256
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.17/quench-offline-V0.1.17.tar.gz
+curl -fLO https://github.com/boyang-hu/vps-quench/releases/download/v0.1.17/quench-offline-V0.1.17.tar.gz.sha256
+sha256sum -c quench-offline-V0.1.17.tar.gz.sha256
 ```
 
 再通过 `scp`、SFTP 或 WinSCP 将两个文件传到 VPS。Linux/macOS 示例：
 
 ```bash
-scp quench-offline-V0.1.16.tar.gz* root@你的VPS地址:/root/
+scp quench-offline-V0.1.17.tar.gz* root@你的VPS地址:/root/
 ```
 
 登录 VPS 后离线安装：
 
 ```bash
 cd /root
-sha256sum -c quench-offline-V0.1.16.tar.gz.sha256
-tar -xzf quench-offline-V0.1.16.tar.gz
-cd quench-offline-V0.1.16
+sha256sum -c quench-offline-V0.1.17.tar.gz.sha256
+tar -xzf quench-offline-V0.1.17.tar.gz
+cd quench-offline-V0.1.17
 bash install.sh
 v
 ```
@@ -115,7 +115,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
  ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.16  ·  Boyang
+  VPS INIT/MANAGEMENT TOOLS  ·  V0.1.17  ·  Boyang
 ────────────────────────────────────────────────────────────────
   SSH · BBR · DNS · Caddy · Firewall · NFT · Docker
 
@@ -208,6 +208,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/boyang-hu/vps-quench/refs/he
 改名前预览；`/home/旧名` 可选择迁移到 `/home/新名`（同文件系统 rename，不跟随家目录符号链接或移动挂载点）；共享组不改名。同名私有组改名但 GID 不变。简单的按用户全权限 sudo 规则、Quench 免密 sudo 文件、cloud-init `default_user.name`、`subuid/subgid` 的用户名分配会一起迁移，标准 `/var/mail` 下归属正确的空邮箱可同步改名。自定义 sudo include/复杂授权、SSH Match/用户组限制/非标准公钥来源、用户 crontab/非空或自定义邮箱/linger、已扫描服务或 cloud-init 自定义用户列表中的旧用户名引用，需要先人工处理。不会修改发行版名或软件源 URL；cloud-init 中明确的 argv 格式 LVM 扩容命令（如 `- [ lvextend, -l, +100%FREE, /dev/debian/root ]`）保持原样，设备路径中的卷组名不当成账号名。额外参数、shell 命令及其他用户名引用仍需人工核对；也不能保证发现应用数据库、远程配置、ACL 或任意自定义脚本中的所有引用，已部署业务的机器必须先人工核对。
 
 改名向导要求被改名账号事先具备有效 SSH 公钥；文件缺失、为空或校验失败时，提示目标账号、路径及“用户管理 → 5 管理用户公钥”入口。添加自己的公钥并验证该账号登录后，退出它的全部会话，再从独立维护账号执行改名。向导不会自动复制 root/临时维护账号的公钥，也不会为此开启密码登录。
+
+cloud-init 的 `chpasswd.users[].name` 密码策略引用也可同步迁移：使用 YAML 结构解析，只替换目标账号的名字，密码、`type`、`expire`、其他用户、注释及排版保持原样，不运行 `chpasswd` 或重新执行 cloud-init。此项需要 `python3-yaml`（cloud-init 环境通常已有）；缺少时在修改账号前停止并提示。重复字段/账号、目标名冲突、锚点/别名和不支持的结构仍需人工核对，报错不输出密码内容。允许标准的 `/var/lib/cloud/instance → instances/<实例ID>` 目录链接，在预览中记录真实目标，确认或恢复期间目标/内容变化时停止；其他符号链接不自动接管。本机缓存修改不会更新供应商原始模板或 seed，重新初始化/重建前仍需同步核对。顶层 `users:` 创建账号列表不在这项密码策略迁移范围内。
 
 执行时暂时设置账户过期以阻止新的 PAM 登录，结束后恢复原过期策略；失败尝试逆向恢复并核对，不会整份覆盖 passwd/shadow 数据库。记录和敏感备份位于仅 root 可访问的 `/var/lib/quench/user-rename`；恢复未确认/进程被强杀时保留现场并阻止新的改名，在菜单 `4` 查看、`5` 从独立维护会话尝试恢复。没有计时自动回滚，不替代供应商快照与救援控制台；请保留独立维护连接，直至新账号验证成功。临时账号用于迁移而非运行业务，日志和审计记录会保留。
 
@@ -762,6 +764,7 @@ BBR、FQ、tc 与 initcwnd 由 `src/modules/bbr.sh` 管理；`src/modules/bbr-me
 
 | 版本 | Quench 主要变更 |
 |------|----------------|
+| **V0.1.17** | 用户改名同步 cloud-init `chpasswd.users[].name`，密码、其他账号和格式保持原样；支持标准实例目录链接并复核真实目标；增加 YAML 结构、敏感内容保护、外部修改和失败恢复测试。 |
 | **V0.1.16** | 自动安全更新兼容禁用模板中的 `Unattended-Upgrade "0";` 根节点赋值，确认后备份接管；单独根节点赋值及混有其他策略的文件保留；补充识别边界、失败恢复与真实 APT 候选配置测试。 |
 | **V0.1.15** | 修复用户改名将 cloud-init LVM 扩容设备路径误判为旧用户名的问题，磁盘配置保持原样；公钥缺失、为空或校验失败时提示目标账号、路径和处理入口；新增真实公钥解析及改名回归测试。 |
 | **V0.1.14** | Debian 12→13 向导新增自动准备：匹配并补齐普通/cloud 内核元包，确认后完成 bookworm 全部更新；新内核尚未启动时等待手动重启，重新进入后复检继续；更新后再检查剩余包来源，保留独立准备日志与备份；新增失败路径和内核识别测试。 |
